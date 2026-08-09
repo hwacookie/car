@@ -138,15 +138,22 @@ Roads are drawn with **real-world widths** (in meters). Zoom controls how many p
 
 ```
 car/
-├── SPEC.md
-├── main.py              # Entry point
-├── osm_loader.py        # Overpass API queries
-├── road_network.py      # Graph data structure + projection
-├── renderer.py          # Pygame drawing
-├── car.py               # Car entity + physics
-├── config.py            # Settings (colors, speeds, etc.)
+├── docs/
+│   └── SPEC.md
+├── src/
+│   ├── __init__.py
+│   ├── main.py              # Entry point
+│   ├── config.py            # Settings (colors, speeds, etc.)
+│   ├── osm_loader.py        # Overpass API queries
+│   ├── road_network.py      # Graph data structure + projection
+│   ├── renderer.py          # Pygame drawing
+│   ├── car.py               # Car entity + physics
+│   └── camera.py            # Camera / viewport logic
+├── tests/
+│   └── __init__.py
+├── assets/                  # Images, fonts
 ├── requirements.txt
-└── assets/              # Images, fonts
+└── .gitignore
 ```
 
 ## Decisions
