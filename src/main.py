@@ -75,9 +75,8 @@ def main():
 
         # Render
         screen.fill(BG_COLOR)
-        renderer.draw_roads(screen)
+        renderer.draw(screen, car.speed)
         car.draw(screen, camera.zoom)
-        renderer.draw_minimap_with_car(screen, car.x, car.y)
 
         pygame.display.flip()
 
