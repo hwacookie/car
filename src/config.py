@@ -35,14 +35,21 @@ CAR_WIDTH = 1.8         # meters
 # --- Road rendering ---
 # Real-world widths in meters (2-way / 1-way)
 ROAD_TYPES = {
-    "motorway":     {"color": (68, 68, 68),     "width_2way": 14, "width_1way": 7},
-    "trunk":        {"color": (85, 85, 85),     "width_2way": 10, "width_1way": 7},
-    "primary":      {"color": (102, 102, 102),  "width_2way": 10, "width_1way": 7},
-    "secondary":    {"color": (136, 136, 136),  "width_2way": 7,  "width_1way": 3.5},
-    "tertiary":     {"color": (153, 153, 153),  "width_2way": 7,  "width_1way": 3.5},
-    "residential":  {"color": (170, 170, 170),  "width_2way": 7,  "width_1way": 3.5},
-    "unclassified": {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
-    "service":      {"color": (204, 204, 204),  "width_2way": 7,  "width_1way": 3.5},
+    "motorway":      {"color": (68, 68, 68),     "width_2way": 14, "width_1way": 7},
+    "motorway_link": {"color": (68, 68, 68),     "width_2way": 7,  "width_1way": 3.5},
+    "trunk":         {"color": (85, 85, 85),     "width_2way": 10, "width_1way": 7},
+    "trunk_link":    {"color": (85, 85, 85),     "width_2way": 7,  "width_1way": 3.5},
+    "primary":       {"color": (102, 102, 102),  "width_2way": 10, "width_1way": 7},
+    "primary_link":  {"color": (102, 102, 102),  "width_2way": 7,  "width_1way": 3.5},
+    "secondary":     {"color": (136, 136, 136),  "width_2way": 7,  "width_1way": 3.5},
+    "secondary_link":{"color": (136, 136, 136),  "width_2way": 7,  "width_1way": 3.5},
+    "tertiary":      {"color": (153, 153, 153),  "width_2way": 7,  "width_1way": 3.5},
+    "tertiary_link": {"color": (153, 153, 153),  "width_2way": 7,  "width_1way": 3.5},
+    "residential":   {"color": (170, 170, 170),  "width_2way": 7,  "width_1way": 3.5},
+    "unclassified":  {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
+    "living_street": {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
+    "road":          {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
+    "service":       {"color": (204, 204, 204),  "width_2way": 7,  "width_1way": 3.5},
 }
 
 # Drivable highway tags (subset)
