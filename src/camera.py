@@ -28,7 +28,7 @@ class Camera:
 
     def world_to_screen(self, wx: float, wy: float) -> tuple[float, float]:
         sx = (wx - self.x) * self.zoom + self.width / 2
-        sy = (wy - self.y) * self.zoom + self.height / 2
+        sy = (self.y - wy) * self.zoom + self.height / 2   # north = up
         return sx, sy
 
     def zoom_in(self):

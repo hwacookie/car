@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Car Game — Entry Point"""
 
+import os
 import sys
 import pygame
 
@@ -20,6 +21,16 @@ def main(smoke_test_frames: int = 0):
     pygame.display.set_caption("Car Game — Bremen")
     clock = pygame.time.Clock()
 
+    # macOS: bring the window to the foreground (it may open behind the terminal
+    # or on another Space/display)
+    if sys.platform == "darwin":
+        import subprocess
+        subprocess.run([
+            "osascript", "-e",
+            f'tell application "System Events" to set frontmost of '
+            f'(first process whose unix id is {os.getpid()}) to true',
+        ], capture_output=True)
+
     # --- Load road data ---
     print("Loading OSM data…")
     bb = BOUNDING_BOX
@@ -35,6 +46,7 @@ def main(smoke_test_frames: int = 0):
 
     # --- Camera + Renderer ---
     camera = Camera(WINDOW_WIDTH, WINDOW_HEIGHT)
+    camera.x, camera.y = car.x, car.y   # snap to car at start
     renderer = Renderer(network, camera)
 
     # --- Game loop ---
@@ -88,10 +100,15 @@ def main(smoke_test_frames: int = 0):
 
         # Render
         screen.fill(BG_COLOR)
-        renderer.draw(screen, car.speed)
-        car.draw(screen, camera.zoom)
+        renderer.draw(screen, car)
+        car.draw(screen, camera)
 
         pygame.display.flip()
+
+        # Debug: dump framebuffer after a few frames
+        if "--dump" in sys.argv and frame == 30:
+            pygame.image.save(screen, "/tmp/car_frame.bmp")
+            print("Dumped frame to /tmp/car_frame.bmp")
 
     if smoke_test_frames:
         print(f"Smoke test OK: {frame} frames, car at ({car.x:.0f}, {car.y:.0f}), "

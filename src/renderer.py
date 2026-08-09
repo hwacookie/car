@@ -24,10 +24,10 @@ class Renderer:
 
     # --- Full scene ---
 
-    def draw(self, surface: pygame.Surface, car_speed: float):
+    def draw(self, surface: pygame.Surface, car):
         """Draw the full game scene."""
         self.draw_roads(surface)
-        self.draw_minimap(surface, car_speed)
+        self.draw_minimap(surface, car)
 
     # --- Roads ---
 
@@ -54,7 +54,7 @@ class Renderer:
 
     # --- Minimap ---
 
-    def draw_minimap(self, surface: pygame.Surface, car_speed: float):
+    def draw_minimap(self, surface: pygame.Surface, car):
         """Draw minimap in top-right corner with roads + car dot."""
         mm_w = config.MINIMAP_SIZE
         mm_h = config.MINIMAP_SIZE
@@ -66,7 +66,7 @@ class Renderer:
         pygame.draw.rect(surface, config.MINIMAP_BG, mm_rect)
         pygame.draw.rect(surface, config.MINIMAP_BORDER, mm_rect, 2)
 
-        # Scale world → minimap
+        # Scale world -> minimap
         bounds = self.network.bounds
         sx = mm_w / bounds[2]
         sy = mm_h / bounds[3]
@@ -81,13 +81,12 @@ class Renderer:
             pygame.draw.line(surface, color, (x1, y1), (x2, y2), 1)
 
         # Car dot
-        car_x, car_y = self.camera.x, self.camera.y
-        cx = mm_x + car_x * sx
-        cy = mm_y + car_y * sy
+        cx = mm_x + car.x * sx
+        cy = mm_y + car.y * sy
         pygame.draw.circle(surface, config.MINIMAP_CAR_COLOR, (int(cx), int(cy)), 3)
 
         # Speed text
         if self._font is not None:
-            speed_kmh = int(car_speed * 3.6)
+            speed_kmh = int(car.speed * 3.6)
             txt = self._font.render(f"{speed_kmh} km/h", True, (255, 255, 255))
             surface.blit(txt, (mm_x + 6, mm_y + mm_h - 22))

@@ -58,20 +58,20 @@ class Car:
                 self.heading += turn_rate
             self.heading = self.heading % 360
 
-        # Move forward
+        # Move forward (world coords: x=east, y=north; heading 0 = north)
         rad = math.radians(self.heading)
         dx = math.sin(rad) * self.speed * dt * config.PIXELS_PER_METER
-        dy = -math.cos(rad) * self.speed * dt * config.PIXELS_PER_METER
+        dy = math.cos(rad) * self.speed * dt * config.PIXELS_PER_METER
         self.x += dx
         self.y += dy
 
     # --- Visuals ---
 
-    def draw(self, surface: pygame.Surface, zoom: float):
-        """Draw the car sprite centred on screen (camera follows car)."""
-        sx = surface.get_width() // 2
-        sy = surface.get_height() // 2
-        scale = zoom
+    def draw(self, surface: pygame.Surface, camera: Camera):
+        """Draw the car sprite at its projected screen position."""
+        sx, sy = camera.world_to_screen(self.x, self.y)
+        sx, sy = int(sx), int(sy)
+        scale = camera.zoom
 
         half_len = (config.CAR_LENGTH / 2) * config.PIXELS_PER_METER * scale
         half_wid = (config.CAR_WIDTH / 2) * config.PIXELS_PER_METER * scale

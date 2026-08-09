@@ -107,7 +107,7 @@ class RoadNetwork:
         t = random.random()
         x = seg.x1 + t * (seg.x2 - seg.x1)
         y = seg.y1 + t * (seg.y2 - seg.y1)
-        heading = math.degrees(math.atan2(seg.x2 - seg.x1, -(seg.y2 - seg.y1)))
+        heading = math.degrees(math.atan2(seg.x2 - seg.x1, seg.y2 - seg.y1))
         return x, y, heading
 
     # --- Bounds ---
