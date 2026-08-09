@@ -51,6 +51,8 @@ class RoadNetwork:
         segments = []
         # Track widest road at each node (for junction circles): node -> (half_width_px, highway)
         node_info: dict[str, tuple[float, str]] = {}
+        # Count how many segments touch each node (to detect real intersections)
+        node_degree: dict[str, int] = {}
         for way in data["ways"]:
             way_nodes = way["nodes"]
             highway = way["highway"]
@@ -83,9 +85,18 @@ class RoadNetwork:
                 half = (width / 2) * pppm
                 for nid in (n1, n2):
                     if nid in nodes:
+                        node_degree[nid] = node_degree.get(nid, 0) + 1
                         cur = node_info.get(nid)
                         if cur is None or half > cur[0]:
                             node_info[nid] = (half, highway)
+
+        # Only keep junction info for real intersections (degree >= 3) and
+        # dead ends (degree == 1, for rounded caps). Intermediate nodes along
+        # a single road (degree == 2) would create ugly bulges.
+        node_info = {
+            nid: info for nid, info in node_info.items()
+            if node_degree.get(nid, 0) != 2
+        }
 
         world_width = latlon_to_world(south, east, south, west, pppm)[0]
         world_height = latlon_to_world(north, west, south, west, pppm)[1]
