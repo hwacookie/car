@@ -44,20 +44,37 @@ def _connect():
     return psycopg.connect(**DB_CONFIG, row_factory=dict_row)
 
 
-def _get_map_schema(conn) -> str:
-    """Detect which schema holds the imported road_geometry table."""
+def _get_map_schema(conn, west: float, south: float, east: float, north: float) -> str:
+    """Detect which schema has road data in the given bounding box."""
     rows = conn.execute(
         "SELECT table_schema FROM information_schema.tables "
         "WHERE table_name = 'road_geometry' "
-        "AND table_schema NOT IN ('public', 'pg_catalog', 'information_schema')"
+        "AND table_schema NOT IN ('public', 'pg_catalog', 'information_schema', 'osm_wars')"
     ).fetchall()
     if not rows:
-        raise RuntimeError("No imported map schema found. Import a map into the OSM-Wars DB first.")
+        raise RuntimeError("No imported map schema found.")
+
+    # Test each schema for data in the bounding box
     for row in rows:
         schema = row["table_schema"]
-        if schema != "osm_wars":
+        result = conn.execute(f"""
+            SELECT COUNT(*) FROM "{schema}".road_geometry
+            WHERE geom && ST_Transform(
+                ST_MakeEnvelope(%s, %s, %s, %s, 4326), 3857)
+        """, (west, south, east, north)).fetchone()
+        cnt = list(result.values())[0] if result else 0
+        if cnt > 0:
             return schema
-    return rows[0]["table_schema"]
+
+    # Fallback: first schema with any data
+    for row in rows:
+        schema = row["table_schema"]
+        result = conn.execute(f'SELECT COUNT(*) FROM "{schema}".road_geometry').fetchone()
+        cnt = list(result.values())[0] if result else 0
+        if cnt > 0:
+            return schema
+
+    raise RuntimeError("No schema has data in the requested bounding box.")
 
 
 def fetch_osm_data(
@@ -79,7 +96,7 @@ def fetch_osm_data(
     """
     conn = _connect()
     try:
-        map_schema = _get_map_schema(conn)
+        map_schema = _get_map_schema(conn, west, south, east, north)
         print(f"  Using map schema: {map_schema}")
 
         ids = ",".join(str(i) for i in DRIVABLE_HIGHWAY_IDS)

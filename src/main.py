@@ -18,7 +18,7 @@ def main(smoke_test_frames: int = 0):
     # --- Init ---
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption("Car Game — Bremen")
+    pygame.display.set_caption("Car Game — Kleinmachnow")
     clock = pygame.time.Clock()
 
     # macOS: bring the window to the foreground (it may open behind the terminal

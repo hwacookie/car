@@ -6,13 +6,13 @@ import pygame
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 
-# --- Target area: Bremen city center (~3 x 3 km around Marktplatz) ---
+# --- Target area: Kleinmachnow (south of Berlin) ---
 # Bounding box (lat, lon)
 BOUNDING_BOX = {
-    "north": 53.0893,
-    "south": 53.0623,
-    "west": 8.7848,
-    "east": 8.8296,
+    "north": 52.42382,
+    "west": 13.21831,
+    "south": 52.40714,
+    "east": 13.25033,
 }
 
 # --- Projection ---
