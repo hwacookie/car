@@ -24,13 +24,13 @@ class Car:
     def handle_input(self, keys: dict, dt: float):
         """Process keyboard input and update physics.
 
-        keys: dict mapping pygame key constants to bool.
+        keys: pygame.key.ScancodeWrapper from pygame.key.get_pressed().
         dt: delta time in seconds.
         """
-        accel = keys.get(pygame.K_UP, False) or keys.get(pygame.K_w, False)
-        brake = keys.get(pygame.K_DOWN, False) or keys.get(pygame.K_s, False)
-        left  = keys.get(pygame.K_LEFT, False) or keys.get(pygame.K_a, False)
-        right = keys.get(pygame.K_RIGHT, False) or keys.get(pygame.K_d, False)
+        accel = keys[pygame.K_UP] or keys[pygame.K_w]
+        brake = keys[pygame.K_DOWN] or keys[pygame.K_s]
+        left  = keys[pygame.K_LEFT] or keys[pygame.K_a]
+        right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
 
         prev_speed = self.speed
 
@@ -76,21 +76,18 @@ class Car:
         half_len = (config.CAR_LENGTH / 2) * config.PIXELS_PER_METER * scale
         half_wid = (config.CAR_WIDTH / 2) * config.PIXELS_PER_METER * scale
 
-        # Car body (rotated rectangle)
-        body = pygame.Rect(-half_wid, -half_len, half_wid * 2, half_len * 2)
-        rotated = pygame.transform.rotozoom(body, -self.heading, 1)
-        body_surface = pygame.Surface(rotated.size, pygame.SRCALPHA)
-        body_surface.fill((180, 30, 30))  # red body
+        # Build an unrotated car surface, then rotate it
+        src = pygame.Surface((half_wid * 2 + 2, half_len * 2 + 2), pygame.SRCALPHA)
+        # Body
+        pygame.draw.rect(src, (180, 30, 30),
+                         pygame.Rect(1, 1, half_wid * 2, half_len * 2))
+        # Front strip (lighter, at the top = front)
+        pygame.draw.rect(src, (215, 60, 60),
+                         pygame.Rect(1 + half_wid * 0.3, 1, half_wid * 1.4, half_len * 0.35))
 
-        # Front strip (slightly lighter)
-        front_strip = pygame.Rect(-half_wid * 0.7, -half_len, half_wid * 1.4, half_len * 0.35)
-        rotated_front = pygame.transform.rotozoom(front_strip, -self.heading, 1)
-        front_surface = pygame.Surface(rotated_front.size, pygame.SRCALPHA)
-        front_surface.fill((210, 60, 60))
-        body_surface.blit(front_surface, (rotated_front.centerx - body.width // 2,
-                                          rotated_front.centery - body.height // 2))
-
-        surface.blit(body_surface, (sx - rotated.width // 2, sy - rotated.height // 2))
+        rotated = pygame.transform.rotozoom(src, -self.heading, 1)
+        surface.blit(rotated, (sx - rotated.get_width() // 2,
+                               sy - rotated.get_height() // 2))
 
         # Lights
         self._draw_headlights(surface, sx, sy, scale)

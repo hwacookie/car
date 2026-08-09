@@ -12,7 +12,8 @@ from .renderer import Renderer
 from .car import Car
 
 
-def main():
+def main(smoke_test_frames: int = 0):
+    """Run the game. If smoke_test_frames > 0, run headless for that many frames."""
     # --- Init ---
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
@@ -37,9 +38,16 @@ def main():
     renderer = Renderer(network, camera)
 
     # --- Game loop ---
+    frame = 0
     running = True
+    dt_fixed = 1 / 60
     while running:
-        dt = clock.tick(60) / 1000.0
+        frame += 1
+        if smoke_test_frames and frame > smoke_test_frames:
+            running = False
+            break
+
+        dt = clock.tick(60) / 1000.0 if not smoke_test_frames else dt_fixed
 
         # Events
         for event in pygame.event.get():
@@ -51,10 +59,15 @@ def main():
         keys = pygame.key.get_pressed()
 
         # Zoom with +/- keys
-        if keys.get(pygame.K_EQUALS, False) or keys.get(pygame.K_PLUS, False):
+        if keys[pygame.K_EQUALS] or keys[pygame.K_PLUS]:
             camera.zoom_in()
-        if keys.get(pygame.K_MINUS, False):
+        if keys[pygame.K_MINUS]:
             camera.zoom_out()
+
+        # In smoke test, simulate driving inputs
+        if smoke_test_frames:
+            # accelerate for first half, then steer
+            keys = _FakeKeys(accel=True, right=(frame > smoke_test_frames // 2))
 
         # Car physics
         car.handle_input(keys, dt)
@@ -80,9 +93,36 @@ def main():
 
         pygame.display.flip()
 
+    if smoke_test_frames:
+        print(f"Smoke test OK: {frame} frames, car at ({car.x:.0f}, {car.y:.0f}), "
+              f"speed={car.speed:.1f} m/s, zoom={camera.zoom:.2f}")
+        pygame.quit()
+        return
+
     pygame.quit()
     sys.exit()
 
 
+class _FakeKeys:
+    """Simulates pygame.key.get_pressed() for smoke testing."""
+    def __init__(self, accel=False, brake=False, left=False, right=False):
+        self._pressed = set()
+        if accel:
+            self._pressed.add(pygame.K_UP)
+        if brake:
+            self._pressed.add(pygame.K_DOWN)
+        if left:
+            self._pressed.add(pygame.K_LEFT)
+        if right:
+            self._pressed.add(pygame.K_RIGHT)
+
+    def __getitem__(self, key):
+        return key in self._pressed
+
+
 if __name__ == "__main__":
-    main()
+    frames = 0
+    if "--smoke" in sys.argv:
+        idx = sys.argv.index("--smoke")
+        frames = int(sys.argv[idx + 1]) if idx + 1 < len(sys.argv) else 300
+    main(smoke_test_frames=frames)

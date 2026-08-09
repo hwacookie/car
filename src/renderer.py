@@ -15,6 +15,12 @@ class Renderer:
     def __init__(self, network: RoadNetwork, camera: Camera):
         self.network = network
         self.camera = camera
+        self._font: pygame.font.Font | None = None
+        try:
+            pygame.font.init()
+            self._font = pygame.font.SysFont("monospace", 14, bold=True)
+        except Exception:
+            self._font = None  # fonts unavailable (e.g. headless); skip text
 
     # --- Full scene ---
 
@@ -81,7 +87,7 @@ class Renderer:
         pygame.draw.circle(surface, config.MINIMAP_CAR_COLOR, (int(cx), int(cy)), 3)
 
         # Speed text
-        speed_kmh = int(car_speed * 3.6)
-        font = pygame.font.SysFont("monospace", 14, bold=True)
-        txt = font.render(f"{speed_kmh} km/h", True, (255, 255, 255))
-        surface.blit(txt, (mm_x + 6, mm_y + mm_h - 22))
+        if self._font is not None:
+            speed_kmh = int(car_speed * 3.6)
+            txt = self._font.render(f"{speed_kmh} km/h", True, (255, 255, 255))
+            surface.blit(txt, (mm_x + 6, mm_y + mm_h - 22))
