@@ -126,9 +126,9 @@ def latlon_to_world(lat: float, lon: float, ref_lat: float, ref_lon: float, pppm
     origin is bottom-left (ref_lat, ref_lon).
     x increases east, y increases north.
     """
-    # Approximate metres-per-degree at equator
-    meters_per_lon_deg = 111320
+    # Approximate metres-per-degree, adjusted for latitude
     meters_per_lat_deg = 111132.9 - 566.0 * math.cos(2 * math.radians(lat)) + 1.2 * math.cos(4 * math.radians(lat))
+    meters_per_lon_deg = 111320 * math.cos(math.radians(lat))
 
     dx_m = (lon - ref_lon) * meters_per_lon_deg
     dy_m = (lat - ref_lat) * meters_per_lat_deg

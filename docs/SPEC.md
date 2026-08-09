@@ -6,7 +6,7 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 
 ## Core Concept
 
-- Download a region's road network from OSM via the **Overpass API**
+- Load the road network from the **OSM-Wars PostgreSQL database** (PostGIS, `road_geometry` table)
 - Parse the data into a graph of **nodes** (intersections/points) and **ways** (road segments)
 - Render the road network as a 2D map in Pygame
 - Place a controllable car that can drive along the roads
@@ -16,8 +16,8 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 | Layer | Technology |
 |-------|-----------|
 | Game engine | **Pygame** |
-| OSM data fetching | **overpass** (Python library) or direct Overpass API HTTP calls |
-| OSM parsing | **ox** (OSMnx) or **lxml** / raw XML/JSON parsing |
+| OSM data source | **OSM-Wars PostgreSQL DB** (PostGIS, `road_geometry` table) |
+| DB access | **psycopg** |
 | Language | **Python 3** |
 
 ## Architecture
@@ -49,8 +49,8 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 
 ## Data Flow
 
-1. **Load**: User picks a location (lat/lon + radius or bounding box)
-2. **Fetch**: Query Overpass API for `highway=*` ways + nodes in that area
+1. **Load**: Bounding box defined in `config.py` (lat/lon)
+2. **Fetch**: Query `road_geometry` from the OSM-Wars DB (PostGIS, EPSG:3857)
 3. **Parse**: Build an internal graph — list of road segments with coordinates
 4. **Transform**: Project lat/lon → pixel coordinates (simple equirectangular or mercator)
 5. **Render**: Draw each segment as a colored line; line width varies by road type
@@ -58,8 +58,8 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 ## Key Components
 
 ### 1. OSM Data Loader (`osm_loader.py`)
-- Query Overpass API for a bounding box
-- Filter for road elements (`highway=*`)
+- Query the OSM-Wars PostgreSQL DB for a bounding box
+- Filter for drivable roads only
 - Return structured data: nodes `{id: (lat, lon)}` and ways `[node_id, ...]`
 
 ### 2. Road Network (`road_network.py`)
@@ -160,9 +160,12 @@ car/
 
 ### Target Area
 
-Bounding box (Kleinmachnow, south of Berlin):
-- Upper-left:  `52.42382, 13.21831`
-- Lower-right: `52.40714, 13.25033`
+Currently: **Bremen city center** (~3 × 3 km around Marktplatz), served from the OSM-Wars PostgreSQL DB.
+- Upper-left:  `53.0893, 8.7848`
+- Lower-right: `53.0623, 8.8296`
+
+Later (once imported): Kleinmachnow, south of Berlin
+(`52.42382, 13.21831` → `52.40714, 13.25033`)
 
 ### Car
 - **Controls**: Both arrow keys **and** WASD

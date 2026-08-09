@@ -6,22 +6,24 @@ import pygame
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 
-# --- Target area: Kleinmachnow (south of Berlin) ---
+# --- Target area: Bremen city center (~3 x 3 km around Marktplatz) ---
 # Bounding box (lat, lon)
 BOUNDING_BOX = {
-    "north": 52.42382,
-    "west": 13.21831,
-    "south": 52.40714,
-    "east": 13.25033,
+    "north": 53.0893,
+    "south": 53.0623,
+    "west": 8.7848,
+    "east": 8.8296,
 }
 
 # --- Projection ---
 # Pixels per meter at zoom level 1.0
 PIXELS_PER_METER = 2
 
-# Zoom
-MIN_ZOOM = 0.1    # ~1000m viewport
-MAX_ZOOM = 2.0   # ~40m viewport
+# Zoom limits: viewport width = WINDOW_WIDTH / (zoom * PIXELS_PER_METER)
+# MAX_ZOOM  -> ~40 m viewport (zoomed in)
+# MIN_ZOOM  -> ~1000 m viewport (zoomed out)
+MAX_ZOOM = 16.0
+MIN_ZOOM = 0.64
 ZOOM_STEP = 1.15
 
 # --- Car ---

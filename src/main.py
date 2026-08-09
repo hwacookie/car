@@ -16,7 +16,7 @@ def main():
     # --- Init ---
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption("Car Game — Kleinmachnow")
+    pygame.display.set_caption("Car Game — Bremen")
     clock = pygame.time.Clock()
 
     # --- Load road data ---
