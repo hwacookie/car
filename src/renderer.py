@@ -32,25 +32,62 @@ class Renderer:
     # --- Roads ---
 
     def draw_roads(self, surface: pygame.Surface):
-        """Draw all road segments in world coordinates, transformed via camera."""
-        w, h = surface.get_size()
-        for seg in self.network.segments:
-            color = config.ROAD_TYPES.get(seg.highway, {}).get("color", (150, 150, 150))
-            width = seg.width * config.PIXELS_PER_METER * self.camera.zoom
-            width = max(1, int(width))
+        """Draw all road segments with casing + junction circles.
 
+        Two passes: first a dark casing (outline) for every segment and node,
+        then the road-coloured fill on top. This makes junctions look smooth
+        and road-like instead of butted line ends.
+        """
+        w, h = surface.get_size()
+        zoom = self.camera.zoom
+        pppm = config.PIXELS_PER_METER
+
+        # --- Pass 1: casing (dark outline) ---
+        for seg in self.network.segments:
+            width = max(1, int(seg.width * pppm * zoom)) + 2
             sx1, sy1 = self.camera.world_to_screen(seg.x1, seg.y1)
             sx2, sy2 = self.camera.world_to_screen(seg.x2, seg.y2)
-
-            # Cull segments completely off-screen
-            margin = width + 2
-            if (sx1 < -margin and sx2 < -margin or
-                sx1 > w + margin and sx2 > w + margin or
-                sy1 < -margin and sy2 < -margin or
-                sy1 > h + margin and sy2 > h + margin):
+            if self._offscreen(sx1, sy1, sx2, sy2, w, h, width):
                 continue
+            pygame.draw.line(surface, config.ROAD_EDGE_COLOR,
+                             (int(sx1), int(sy1)), (int(sx2), int(sy2)), width)
 
-            pygame.draw.line(surface, color, (int(sx1), int(sy1)), (int(sx2), int(sy2)), width)
+        # Junction circles (casing colour)
+        for nid, (half, _hw) in self.network.node_max_width.items():
+            nx, ny = self.network.nodes[nid]
+            sx, sy = self.camera.world_to_screen(nx, ny)
+            r = int(half * zoom) + 1
+            if sx < -r or sx > w + r or sy < -r or sy > h + r:
+                continue
+            pygame.draw.circle(surface, config.ROAD_EDGE_COLOR, (int(sx), int(sy)), r)
+
+        # --- Pass 2: road fill ---
+        for seg in self.network.segments:
+            color = config.ROAD_TYPES.get(seg.highway, {}).get("color", (150, 150, 150))
+            width = max(1, int(seg.width * pppm * zoom))
+            sx1, sy1 = self.camera.world_to_screen(seg.x1, seg.y1)
+            sx2, sy2 = self.camera.world_to_screen(seg.x2, seg.y2)
+            if self._offscreen(sx1, sy1, sx2, sy2, w, h, width):
+                continue
+            pygame.draw.line(surface, color,
+                             (int(sx1), int(sy1)), (int(sx2), int(sy2)), width)
+
+        # Junction circles (fill colour of widest road at node)
+        for nid, (half, highway) in self.network.node_max_width.items():
+            nx, ny = self.network.nodes[nid]
+            sx, sy = self.camera.world_to_screen(nx, ny)
+            r = int(half * zoom)
+            if r < 1 or sx < -r or sx > w + r or sy < -r or sy > h + r:
+                continue
+            color = config.ROAD_TYPES.get(highway, {}).get("color", (170, 170, 170))
+            pygame.draw.circle(surface, color, (int(sx), int(sy)), r)
+
+    @staticmethod
+    def _offscreen(x1, y1, x2, y2, w, h, margin) -> bool:
+        return (x1 < -margin and x2 < -margin or
+                x1 > w + margin and x2 > w + margin or
+                y1 < -margin and y2 < -margin or
+                y1 > h + margin and y2 > h + margin)
 
     # --- Minimap ---
 

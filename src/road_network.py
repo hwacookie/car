@@ -32,6 +32,7 @@ class RoadNetwork:
     origin_lon: float          # south-west corner lon
     world_width: float         # total world pixels (lon span * scale)
     world_height: float        # total world pixels (lat span * scale)
+    node_max_width: dict = field(default_factory=dict)  # node id -> (half_width_px, highway)
 
     # --- Construction ---
 
@@ -48,6 +49,8 @@ class RoadNetwork:
 
         # Build segments
         segments = []
+        # Track widest road at each node (for junction circles): node -> (half_width_px, highway)
+        node_info: dict[str, tuple[float, str]] = {}
         for way in data["ways"]:
             way_nodes = way["nodes"]
             highway = way["highway"]
@@ -76,6 +79,14 @@ class RoadNetwork:
                     width=width,
                 ))
 
+                # Record widest road touching each endpoint node
+                half = (width / 2) * pppm
+                for nid in (n1, n2):
+                    if nid in nodes:
+                        cur = node_info.get(nid)
+                        if cur is None or half > cur[0]:
+                            node_info[nid] = (half, highway)
+
         world_width = latlon_to_world(south, east, south, west, pppm)[0]
         world_height = latlon_to_world(north, west, south, west, pppm)[1]
 
@@ -86,6 +97,7 @@ class RoadNetwork:
             origin_lon=west,
             world_width=world_width,
             world_height=world_height,
+            node_max_width=node_info,
         )
 
     # --- Spatial queries ---
