@@ -49,10 +49,7 @@ class RoadNetwork:
 
         # Build segments
         segments = []
-        # Track widest road at each node (for junction circles): node -> (half_width_px, highway)
-        node_info: dict[str, tuple[float, str]] = {}
-        # Count how many segments touch each node (to detect real intersections)
-        node_degree: dict[str, int] = {}
+        seg_node_ids: list[tuple[str, str]] = []   # parallel to segments
         for way in data["ways"]:
             way_nodes = way["nodes"]
             highway = way["highway"]
@@ -80,15 +77,35 @@ class RoadNetwork:
                     oneway=oneway,
                     width=width,
                 ))
+                seg_node_ids.append((n1, n2))
 
-                # Record widest road touching each endpoint node
-                half = (width / 2) * pppm
-                for nid in (n1, n2):
-                    if nid in nodes:
-                        node_degree[nid] = node_degree.get(nid, 0) + 1
-                        cur = node_info.get(nid)
-                        if cur is None or half > cur[0]:
-                            node_info[nid] = (half, highway)
+        # Snap dangling endpoints onto nearby roads (closes OSM mapping gaps)
+        snapped = snap_endpoints(segments, pppm)
+        if snapped:
+            print(f"  Snapped {snapped} dangling endpoints")
+
+        # Recompute node positions from snapped segment endpoints
+        # (average position for nodes shared by several segments)
+        node_sum: dict[str, list[float]] = {}
+        node_degree: dict[str, int] = {}
+        for seg, (n1, n2) in zip(segments, seg_node_ids):
+            for nid, x, y in ((n1, seg.x1, seg.y1), (n2, seg.x2, seg.y2)):
+                s = node_sum.setdefault(nid, [0.0, 0.0, 0.0])
+                s[0] += x
+                s[1] += y
+                s[2] += 1
+                node_degree[nid] = node_degree.get(nid, 0) + 1
+        for nid, (sx, sy, c) in node_sum.items():
+            nodes[nid] = (sx / c, sy / c)
+
+        # Junction info: widest road at each node
+        node_info: dict[str, tuple[float, str]] = {}
+        for seg, (n1, n2) in zip(segments, seg_node_ids):
+            half = (seg.width / 2) * pppm
+            for nid in (n1, n2):
+                cur = node_info.get(nid)
+                if cur is None or half > cur[0]:
+                    node_info[nid] = (half, seg.highway)
 
         # Only keep junction info for real intersections (degree >= 3) and
         # dead ends (degree == 1, for rounded caps). Intermediate nodes along
@@ -159,19 +176,66 @@ def latlon_to_world(lat: float, lon: float, ref_lat: float, ref_lon: float, pppm
     return dx_m * pppm, dy_m * pppm
 
 
-def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
-    """Shortest distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+def point_to_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> tuple[float, float, float]:
+    """Return (distance, proj_x, proj_y) from point to line segment."""
     dx = x2 - x1
     dy = y2 - y1
     length_sq = dx * dx + dy * dy
 
     if length_sq == 0:
-        # Degenerate segment
-        return math.hypot(px - x1, py - y1)
+        return math.hypot(px - x1, py - y1), x1, y1
 
-    # Project point onto line, clamp to segment
     t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
     proj_x = x1 + t * dx
     proj_y = y1 + t * dy
 
-    return math.hypot(px - proj_x, py - proj_y)
+    return math.hypot(px - proj_x, py - proj_y), proj_x, proj_y
+
+
+def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """Shortest distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+    d, _, _ = point_to_segment(px, py, x1, y1, x2, y2)
+    return d
+
+
+def snap_endpoints(segments: list[RoadSegment], pppm: float, snap_m: float = 8.0) -> int:
+    """Snap dangling segment endpoints onto nearby roads.
+
+    OSM ways often end a few metres short of the road they should connect to.
+    This moves such endpoints onto the nearest point of another segment within
+    snap_m metres, closing visual gaps. Returns the number of snapped endpoints.
+    """
+    snap_px = snap_m * pppm
+    cell = max(snap_px, 1.0)
+    grid: dict[tuple[int, int], list[int]] = {}
+
+    for i, seg in enumerate(segments):
+        minx, maxx = sorted((seg.x1, seg.x2))
+        miny, maxy = sorted((seg.y1, seg.y2))
+        for cx in range(int(minx // cell), int(maxx // cell) + 1):
+            for cy in range(int(miny // cell), int(maxy // cell) + 1):
+                grid.setdefault((cx, cy), []).append(i)
+
+    snapped = 0
+    for i, seg in enumerate(segments):
+        for xa, ya in (("x1", "y1"), ("x2", "y2")):
+            px, py = getattr(seg, xa), getattr(seg, ya)
+            cx, cy = int(px // cell), int(py // cell)
+            best_d = snap_px
+            best_pt = None
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for j in grid.get((gx, gy), ()):
+                        if j == i:
+                            continue
+                        o = segments[j]
+                        d, qx, qy = point_to_segment(px, py, o.x1, o.y1, o.x2, o.y2)
+                        if d < best_d:
+                            best_d = d
+                            best_pt = (qx, qy)
+            if best_pt is not None and best_d > 0.5:  # don't touch already-connected ends
+                setattr(seg, xa, best_pt[0])
+                setattr(seg, ya, best_pt[1])
+                snapped += 1
+
+    return snapped
