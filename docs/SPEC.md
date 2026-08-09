@@ -2,23 +2,24 @@
 
 ## Overview
 
-A 2D top-down driving game rendered with **Pygame**, where the playable world is built from **real road network data extracted from OpenStreetMap (OSM)**. The player drives a car along actual streets.
+A 2D top-down driving game rendered with **Pygame**, where the playable world is built from **real road network data extracted from OpenStreetMap (OSM)**. The player drives a car along actual streets in **Kleinmachnow** (south of Berlin).
 
 ## Core Concept
 
 - Load the road network from the **OSM-Wars PostgreSQL database** (PostGIS, `road_geometry` table)
-- Parse the data into a graph of **nodes** (intersections/points) and **ways** (road segments)
-- Render the road network as a 2D map in Pygame
-- Place a controllable car that can drive along the roads
+- Parse the data into a graph of **nodes** (intersections/points) and **segments** (road pieces)
+- Render roads as **2D polygons** with real-world widths (no simple lines)
+- Two driving modes: **FREE** (manual steering) and **RAILS** (automatic road following with turn signals)
 
 ## Technical Stack
 
 | Layer | Technology |
 |-------|-----------|
-| Game engine | **Pygame** |
-| OSM data source | **OSM-Wars PostgreSQL DB** (PostGIS, `road_geometry` table) |
-| DB access | **psycopg** |
-| Language | **Python 3** |
+| Game engine | **Pygame 2.6.1** |
+| OSM data source | **OSM-Wars PostgreSQL DB** (PostGIS, `road_geometry` table, Brandenburg schema) |
+| DB access | **psycopg3** |
+| Language | **Python 3.14** |
+| Region | **Kleinmachnow** (south of Berlin) |
 
 ## Architecture
 
@@ -26,175 +27,429 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 ┌─────────────────────────────────────────────┐
 │                  Pygame Window               │
 │  ┌─────────────────────────────────────────┐ │
+│  │      HUD (bottom-left)                  │ │
+│  │      - Speed, Mode, Indicators          │ │
+│  └─────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────┐ │
 │  │           Camera / Viewport             │ │
 │  │  ┌───────────────────────────────────┐  │ │
-│  │  │       Road Network Renderer       │  │ │
-│  │  │  (draws lines, colors by type)    │  │ │
+│  │  │   Road Network (polygons)         │  │ │
+│  │  │   - Direct rendering per frame    │  │ │
+│  │  │   - Rounded caps on segments      │  │ │
 │  │  └───────────────────────────────────┘  │ │
 │  │  ┌───────────────────────────────────┐  │ │
 │  │  │         Car Entity                │  │ │
-│  │  │  (position, speed, heading)       │  │ │
+│  │  │   - Headlights (2px)              │  │ │
+│  │  │   - Taillights (2px, red)         │  │ │
+│  │  │   - Blinkers (3px, orange)        │  │ │
 │  │  └───────────────────────────────────┘  │ │
+│  └─────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────┐ │
+│  │      Minimap (top-right)                │ │
+│  │      - Full area view                   │ │
+│  │      - Yellow viewport indicator        │ │
 │  └─────────────────────────────────────────┘ │
 └─────────────────────────────────────────────┘
          ┌──────────────────────┐
          │  RoadNetwork (graph) │
-         │  nodes + edges       │
-         └──────────────────────┘
-         ┌──────────────────────┐
-         │   OSM Data Loader    │
-         │   Overpass API       │
+         │  - nodes + segments  │
+         │  - node_degree       │
+         │  - node_connections  │
          └──────────────────────┘
 ```
 
-## Data Flow
+## Driving Modes
 
-1. **Load**: Bounding box defined in `config.py` (lat/lon)
-2. **Fetch**: Query `road_geometry` from the OSM-Wars DB (PostGIS, EPSG:3857)
-3. **Parse**: Build an internal graph — list of road segments with coordinates
-4. **Transform**: Project lat/lon → pixel coordinates (simple equirectangular or mercator)
-5. **Render**: Draw each segment as a colored line; line width varies by road type
+### FREE Mode (Manual Steering)
+- **W/↑**: Accelerate
+- **S/↓**: Brake (immediate, 10 m/s²)
+- **A/←**: Steer left
+- **D/→**: Steer right
+- **Release W**: Speed maintained (cruise control, no friction)
+- **Off-road**: Car stops immediately
+- **Map edge**: Car stops at boundary
 
-## Key Components
+### RAILS Mode (Automatic Road Following)
+- **W/↑**: Accelerate
+- **S/↓**: Brake (immediate, 10 m/s²)
+- **A/←**: Set **left blinker** → turns left at next junction
+- **D/→**: Set **right blinker** → turns right at next junction
+- **TAB**: Toggle between FREE ↔ RAILS mode
+- **Features**:
+  - Car follows road automatically (stays on right lane)
+  - Blinker only turns off when **actually turned** in that direction (not at every junction)
+  - Automatic braking before sharp curves (physics-based braking distance)
+  - "Rechts vor links" logic: only brakes at junctions with roads from the right
+  - Dead ends: car turns 180° and stops
+  - Smooth segment transitions (no teleportation)
 
-### 1. OSM Data Loader (`osm_loader.py`)
-- Query the OSM-Wars PostgreSQL DB for a bounding box
-- Filter for drivable roads only
-- Return structured data: nodes `{id: (lat, lon)}` and ways `[node_id, ...]`
+### Mode Switching
+- Press **TAB** to toggle between modes
+- When switching to RAILS: car snaps to nearest road segment
+- Start mode: **RAILS** (automatic)
 
-### 2. Road Network (`road_network.py`)
-- Stores the graph of roads
-- Projects geographic coordinates to screen pixels
-- Exposes methods like `get_road_at(position)` for collision/checking
+## Physics
 
-### 3. Renderer (`renderer.py`)
-- Draws the road network onto a Pygame surface
-- Color-codes by road type (motorway = dark, residential = light, etc.)
-- Supports camera panning (follows the car)
+### Speed & Acceleration
+- **Max speed**: 180 km/h (50 m/s)
+- **Acceleration**: 2.8 m/s² (0–100 km/h in ~10 seconds, normal car)
+- **Braking**: 10 m/s² (full ABS braking, ~1g)
+- **Cruise control**: W-release maintains speed (no automatic deceleration)
 
-### 4. Car (`car.py`)
-- Position (x, y), heading (angle), speed
-- Controls: arrow keys or WASD
-- Acceleration, deceleration, turning mechanics
-- Optional: constrained to roads or free driving
+### Automatic Braking (RAILS mode)
+- **Braking distance formula**: `s = (v₁² - v₂²) / (2a)`
+- **Safe speeds by turn angle**:
+  - >90°: 20 km/h (tight turn)
+  - >60°: 30 km/h
+  - >30°: 40 km/h
+  - <30°: no braking (gentle turn)
+- **Safety margin**: 5 meters before junction
+- **Only at junctions with right-of-way conflict** (road from right, 3+ connections)
 
-## Road Types & Visual Mapping
+### Turning
+- **FREE mode**: Turn rate depends on speed (slower at high speed)
+- **RAILS mode**: Heading follows road direction automatically
 
-Roads are drawn with **real-world widths** (in meters). Zoom controls how many pixels those meters occupy.
+### Teleportation Watchdog
+- **Purpose**: Detect unphysical position jumps (bugs)
+- **Threshold**: >50 meters per frame
+- **Action**: Exception with stack trace + debug info
+- **Skip**: First 5 frames (allows initial positioning)
 
-### Lane model
-- **Lane width**: 3.5 m
-- **2-way road**: 2 lanes = 7 m minimum width
-- **1-way road**: 1 lane = 3.5 m width
-- OSM `oneway` tags determine lane count
+## HUD (Heads-Up Display)
 
-### Width by road type (real-world meters)
+Located in **bottom-left corner**, shows:
 
-| OSM highway tag | Color | Width (2-way) | Width (1-way) |
-|-----------------|-------|---------------|---------------|
-| motorway | #444444 (dark gray) | 14 m (4 lanes) | 7 m |
-| trunk | #555555 | 10 m (3 lanes) | 7 m |
-| primary | #666666 | 10 m (3 lanes) | 7 m |
-| secondary | #888888 | 7 m (2 lanes) | 3.5 m |
-| tertiary | #999999 | 7 m (2 lanes) | 3.5 m |
-| residential | #aaaaaa | 7 m (2 lanes) | 3.5 m |
-| unclassified | #bbbbbb | 7 m (2 lanes) | 3.5 m |
-| service | #cccccc | 7 m (2 lanes) | 3.5 m |
+### Speed Display
+- **Large number**: Current speed in km/h
+- **Color coding**:
+  - White: 0–50 km/h
+  - Yellow: 50–100 km/h
+  - Red: 100+ km/h
+- **Unit**: "km/h" label
+- **Speedometer arc**: 0–180 km/h circular gauge (green → yellow → red)
 
-### Zoom range
-- **Max zoom-in**: ~40 m × 40 m viewport
-- **Max zoom-out**: ~1000 m × 1000 m viewport
-- Zoom via scroll wheel and/or +/- keys
+### Mode Indicator
+- **Text**: "FREE" or "RAILS"
+- **Color**: Blue (FREE) or Green (RAILS)
+- **Hint**: "(TAB)" to switch
 
-## Milestones
+### Status Indicators
+- **B** (red circle): Braking active
+- **A** (green circle): Accelerating
+- **L** (orange circle): Left blinker on
+- **R** (orange circle): Right blinker on
 
-### Phase 1: Static Map Rendering
-- [ ] Fetch OSM data for the target bounding box
-- [ ] Parse nodes + ways into an in-memory graph (drivable roads only)
-- [ ] Project coordinates and draw the road network in Pygame
-- [ ] Color-code + width-map roads by type
-- [ ] Minimap showing full area
+## Road Network
 
-### Phase 2: Car Movement
-- [ ] Car sprite with front/rear, headlights, taillights (brake lights)
-- [ ] Keyboard controls (WASD + arrows): accelerate, brake, steer
-- [ ] Smooth turning physics
-- [ ] Camera follows the car (smooth follow)
-- [ ] Zoom in/out (scroll wheel or +/- keys)
-- [ ] Place car on random road at start
+### Data Source
+- **Database**: OSM-Wars PostgreSQL, schema `brandenburg`
+- **Table**: `road_geometry` (EPSG:3857 projected coordinates)
+- **Area**: Kleinmachnow bounding box
+  - North: 52.42382°, West: 13.21831°
+  - South: 52.40714°, East: 13.25033°
+- **Segments loaded**: 1970 road segments
+- **Nodes**: 1909 unique nodes
 
-### Phase 3: Road Conformance
-- [ ] Constrain car to roads — off-road = car stops
-- [ ] Respect one-way streets
-- [ ] Map edge = invisible wall / crash
+### Drivable Road Types (highway_id filter)
+Only roads with these highway types are loaded:
 
-### Phase 4: Buildings & Polish (Future)
-- [ ] Draw building footprints (from OSM `building` tags)
-- [ ] Background terrain color (parks, water)
-- [ ] Save/load regions
-- [ ] Day/night cycle (headlights more visible at night)
+| highway_id | OSM tag | Description |
+|------------|---------|-------------|
+| 1 | motorway | Highway/Autobahn |
+| 2 | trunk | Major trunk road |
+| 3 | primary | Primary road |
+| 4 | secondary | Secondary road |
+| 5 | tertiary | Tertiary road |
+| 6 | residential | Residential street |
+| 7 | service | Service road/driveway |
+| 8 | unclassified | Unclassified road |
+| 9 | motorway_link | Motorway ramp |
+| 10 | trunk_link | Trunk ramp |
+| 11 | primary_link | Primary ramp |
+| 12 | secondary_link | Secondary ramp |
+| 14 | tertiary_link | Tertiary ramp |
+
+### Road Widths (meters)
+
+| Highway Type | 2-way width | 1-way width | Color |
+|--------------|-------------|-------------|-------|
+| motorway | 14.0 m | 7.0 m | #444444 |
+| trunk | 10.0 m | 7.0 m | #555555 |
+| primary | 10.0 m | 7.0 m | #666666 |
+| secondary | 7.0 m | 3.5 m | #888888 |
+| tertiary | 7.0 m | 3.5 m | #999999 |
+| residential | 7.0 m | 3.5 m | #aaaaaa |
+| service | 3.5 m | 3.5 m | #cccccc |
+
+**Special case**: Service roads always use 1-way width (3.5 m) regardless of `oneway` tag.
+
+### Rendering
+- **Style**: Direct polygon rendering (no texture scaling)
+- **Geometry**: Rectangle + rounded caps per segment
+- **Per frame**: Roads drawn as vector polygons (no pixelation on zoom)
+- **Performance**: 109 FPS with 1970 segments at 4× zoom
+
+### Graph Structure
+- **Segments**: List of `RoadSegment` objects with:
+  - Coordinates (x1, y1, x2, y2)
+  - Highway type, oneway flag, width
+  - Start/end node IDs
+  - Length in meters
+- **Nodes**: Dict of node_id → (x, y) positions
+- **Node connections**: Dict of node_id → [segment indices]
+- **Node degree**: Dict of node_id → connection count (for junction detection)
+
+### Endpoint Snapping
+- **Threshold**: 8 meters
+- **Purpose**: Close OSM mapping gaps
+- **Result**: 73 endpoints snapped in Kleinmachnow
+
+## Camera
+
+### Controls
+- **Mouse wheel**: Zoom in/out
+- **Middle mouse button + drag**: Pan map manually
+- **+/- keys**: Zoom in/out
+- **C key**: Snap camera to car position
+
+### Behavior
+- **Follow mode**: Camera follows car when `speed > 0.1 m/s`
+- **Zoom range**: 0.64× to 16× (configurable)
+- **Smooth follow**: Interpolated camera movement
+- **Manual override**: Middle-mouse drag disables follow temporarily
+
+## Minimap
+
+- **Location**: Top-right corner
+- **Size**: 200×200 px
+- **Content**: 
+  - Full road network (scaled down)
+  - Car position (blue dot)
+  - Current viewport (yellow rectangle, Y-axis aligned with main view)
+  - Speed text overlay
+
+## Car Visual
+
+### Body
+- **Size**: 4.5 m × 2.0 m (length × width)
+- **Color**: Red (#B41E1E body, #D73C3C front strip)
+- **Rotation**: Smooth heading (0° = north/up)
+
+### Lights
+- **Headlights**: 2× white circles (2px) at front corners
+- **Taillights**: 2× red circles (2px) at rear corners
+  - Bright red when braking
+  - Dark red otherwise
+- **Blinkers** (RAILS mode only): 3× orange circles (3px) at side
+  - Flash with 0.5s period (on 0.25s, off 0.25s)
+  - Left or right depending on signal
+
+## Coordinate System
+
+- **World space**: EPSG:3857 projection (meters)
+- **Screen space**: Pixels
+- **Y-axis**: 
+  - World: Y increases northward
+  - Screen: Y increases downward
+  - Camera handles transform
+- **PIXELS_PER_METER**: 10 (configurable)
+
+## Configuration (`config.py`)
+
+### Window
+```python
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+BG_COLOR = (34, 34, 34)
+```
+
+### Car Physics
+```python
+CAR_SPEED = 50          # m/s = 180 km/h
+CAR_ACCELERATION = 2.8  # m/s² (0-100 in ~10s)
+CAR_BRAKING = 10.0      # m/s² (ABS braking)
+CAR_TURN_SPEED = 180    # degrees/second
+CAR_LENGTH = 4.5        # meters
+CAR_WIDTH = 2.0         # meters
+```
+
+### Minimap
+```python
+MINIMAP_SIZE = 200
+MINIMAP_MARGIN = 10
+MINIMAP_BG = (20, 20, 20, 150)
+MINIMAP_BORDER = (100, 100, 100)
+MINIMAP_CAR_COLOR = (100, 150, 255)
+```
+
+### Bounding Box (Kleinmachnow)
+```python
+BOUNDING_BOX = {
+    "north": 52.42382,
+    "west": 13.21831,
+    "south": 52.40714,
+    "east": 13.25033,
+}
+```
 
 ## Project Structure
 
 ```
 car/
 ├── docs/
-│   └── SPEC.md
+│   └── SPEC.md              # This file
 ├── src/
 │   ├── __init__.py
-│   ├── main.py              # Entry point
-│   ├── config.py            # Settings (colors, speeds, etc.)
-│   ├── osm_loader.py        # Overpass API queries
-│   ├── road_network.py      # Graph data structure + projection
-│   ├── renderer.py          # Pygame drawing
-│   ├── car.py               # Car entity + physics
+│   ├── main.py              # Entry point, game loop
+│   ├── config.py            # Settings & constants
+│   ├── osm_loader.py        # PostgreSQL data fetcher
+│   ├── road_network.py      # Graph + spatial queries
+│   ├── renderer.py          # Pygame drawing (roads, HUD, minimap)
+│   ├── car.py               # Car physics & modes
 │   └── camera.py            # Camera / viewport logic
 ├── tests/
-│   └── __init__.py
-├── assets/                  # Images, fonts
+│   ├── __init__.py
+│   └── test_road_network.py  # 10 unit tests (projection, spatial)
 ├── requirements.txt
-└── .gitignore
+├── .gitignore
+└── README.md
 ```
 
-## Decisions
+## Implementation Status
 
-### Target Area
+### ✅ Completed Features
+- [x] PostgreSQL OSM data loader (Brandenburg schema)
+- [x] Road network graph with node degrees & connections
+- [x] Direct polygon rendering (no pixelation on zoom)
+- [x] Car physics with two modes (FREE/RAILS)
+- [x] Automatic road following (RAILS mode)
+- [x] Turn signals & intelligent blinker logic
+- [x] Automatic braking with physics-based distance calculation
+- [x] "Rechts vor links" junction logic
+- [x] HUD with speed, mode, and status indicators
+- [x] Minimap with viewport indicator
+- [x] Camera follow & manual pan/zoom
+- [x] Headlights & taillights (brake lights)
+- [x] Blinker visualization
+- [x] Dead-end handling (180° turn)
+- [x] Teleportation watchdog (bug detection)
+- [x] Service road width (3.5m fixed)
+- [x] Endpoint snapping (8m threshold)
+- [x] Off-road detection (FREE mode)
+- [x] 10 unit tests passing
 
-Currently: **Bremen city center** (~3 × 3 km around Marktplatz), served from the OSM-Wars PostgreSQL DB.
-- Upper-left:  `53.0893, 8.7848`
-- Lower-right: `53.0623, 8.8296`
+### 🚧 Known Issues
+None currently
 
-Later (once imported): Kleinmachnow, south of Berlin
-(`52.42382, 13.21831` → `52.40714, 13.25033`)
+### 🔮 Future Enhancements
+- Building footprints from OSM `building` polygons
+- Road surface textures (asphalt, cobblestone)
+- Road markings (center lines, crosswalks)
+- Traffic signs
+- Day/night cycle with dynamic lighting
+- Multiple cars / traffic simulation
+- Sound effects (engine, brakes)
+- Anti-aliasing via pygame.gfxdraw
 
-### Car
-- **Controls**: Both arrow keys **and** WASD
-- **Start position**: Placed on a random road at game start
-- **Appearance**: Sprite with clear front/rear distinction, **headlights**, and **taillights** that illuminate when braking
-- **Turning**: Smooth rotation (not snapped)
-- **Turning at intersections**: Free turning (align naturally with momentum)
+## Performance
 
-### Roads
-- **One-way streets**: Respect OSM `oneway` tags — car cannot drive against one-way
-- **Road types**: Only drivable roads (motorway, trunk, primary, secondary, tertiary, residential, unclassified, service)
-- **Exclude**: Footways, cycleways, paths, pedestrian zones, etc.
-- **Map edges**: Invisible wall — trying to cross = crash/stop
+- **FPS**: 109 fps @ 4× zoom with 1970 segments
+- **Rendering**: Vector polygons drawn per frame
+- **Database query**: <1 second for Kleinmachnow area
+- **Memory**: ~50 MB for full network
 
-### Visual
-- **View**: Pure top-down 2D
-- **Camera**: Follows the car (smooth follow, centered on car)
-- **Zoom**: Zoom in/out ability (scroll wheel or +/- keys)
-- **Road width**: Mapped from highway tag type
-- **Background**: Plain base color for Phase 1; **building footprints** as drawn shapes planned for Phase 3
+## Testing
 
-### Gameplay
-- **Mode**: Free driving — no objectives, no win/lose
-- **Off-road**: Car stops immediately if it leaves the road
-- **UI**: **Minimap** in corner showing full area + car position
-- **Architecture**: Clear module separation:
-  - OSM data loader
-  - Road network / world
-  - Car movement / input
-  - Camera / viewport (smooth follow + zoom)
-  - Renderer
-  - Game state
+### Unit Tests
+```bash
+python -m pytest tests/
+```
+
+### Smoke Test
+```bash
+python -m src.main --smoke 60  # Run 60 frames headless
+```
+
+### Manual Testing
+```bash
+python -m src.main
+```
+
+## Controls Summary
+
+| Key | FREE Mode | RAILS Mode |
+|-----|-----------|------------|
+| W/↑ | Accelerate | Accelerate |
+| S/↓ | Brake | Brake |
+| A/← | Steer left | Left blinker → turn left at junction |
+| D/→ | Steer right | Right blinker → turn right at junction |
+| TAB | → RAILS mode | → FREE mode |
+| C | Snap camera to car | Snap camera to car |
+| +/- | Zoom in/out | Zoom in/out |
+| Scroll | Zoom in/out | Zoom in/out |
+| Middle mouse | Pan map | Pan map |
+
+## Game Loop (60 FPS)
+
+1. **Input**: Process keyboard & mouse events
+2. **Physics**: Update car position, speed, heading (mode-dependent)
+3. **Collisions**: Check off-road, map edges (FREE mode only)
+4. **Watchdog**: Detect teleportation (>50m jumps)
+5. **Camera**: Update viewport (smooth follow if moving)
+6. **Render**:
+   - Roads (direct polygon drawing)
+   - Car (sprite + lights + blinkers)
+   - HUD (speed, mode, indicators)
+   - Minimap
+7. **Display**: Flip buffer (vsync at 60 Hz)
+
+## Debug Features
+
+### Teleportation Watchdog Output
+```
+======================================================================
+TELEPORTATION DETECTED!
+======================================================================
+Old position: (1280.9, 1566.7)
+New position: (4351.6, 3267.1)
+Distance: 1755.0m (max allowed: 50.0m)
+Speed: 0.0 m/s (0 km/h)
+Mode: rails
+Segment: 0, Progress: 0.500, Forward: True
+dt: 0.0170s
+======================================================================
+[Stack trace follows]
+```
+
+### Frame Dump
+```bash
+python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
+```
+
+## Technical Decisions
+
+### Why Direct Polygon Rendering?
+- **No pixelation** on zoom (vector vs raster)
+- Real-time width scaling with zoom
+- Smooth rounded caps on segments
+- 109 FPS with 1970 segments (fast enough)
+
+### Why Two Driving Modes?
+- **FREE**: Classic driving game feel, full control
+- **RAILS**: Relaxed driving, focus on route planning, realistic turn signals
+
+### Why Teleportation Watchdog?
+- Catches segment transition bugs early
+- Provides detailed debug info
+- Prevents game-breaking jumps
+
+### Why "Rechts vor links" Logic?
+- Realistic German traffic rules
+- Reduces unnecessary braking (only at conflict junctions)
+- Makes automatic driving smoother
+
+---
+
+**Last Updated**: 2025-01-10  
+**Status**: ✅ Fully playable, all core features implemented

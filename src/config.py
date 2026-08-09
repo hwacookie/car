@@ -27,15 +27,16 @@ MIN_ZOOM = 0.64
 ZOOM_STEP = 1.15
 
 # --- Car ---
-CAR_SPEED = 10          # meters/second
-CAR_ACCELERATION = 15   # meters/second^2
-CAR_BRAKING = 25        # meters/second^2
+CAR_SPEED = 50          # meters/second = 180 km/h
+CAR_ACCELERATION = 2.8  # m/s²  → 0-100 km/h in ~10s (normales Auto)
+CAR_BRAKING = 10.0      # m/s²  → starke Bremsung mit ABS (~1g)
 CAR_TURN_SPEED = 180    # degrees/second
 CAR_LENGTH = 4.4        # meters
 CAR_WIDTH = 1.8         # meters
 
 # --- Road rendering ---
 # Real-world widths in meters (2-way / 1-way)
+# Levels 1-7: motorway, trunk, primary, secondary, tertiary, residential, unclassified
 ROAD_TYPES = {
     "motorway":      {"color": (68, 68, 68),     "width_2way": 14, "width_1way": 7},
     "motorway_link": {"color": (68, 68, 68),     "width_2way": 7,  "width_1way": 3.5},
@@ -49,12 +50,10 @@ ROAD_TYPES = {
     "tertiary_link": {"color": (153, 153, 153),  "width_2way": 7,  "width_1way": 3.5},
     "residential":   {"color": (170, 170, 170),  "width_2way": 7,  "width_1way": 3.5},
     "unclassified":  {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
-    "living_street": {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
-    "road":          {"color": (187, 187, 187),  "width_2way": 7,  "width_1way": 3.5},
-    "service":       {"color": (204, 204, 204),  "width_2way": 7,  "width_1way": 3.5},
+    "service":       {"color": (204, 204, 204),  "width_2way": 3.5, "width_1way": 3.5},
 }
 
-# Drivable highway tags (subset)
+# Drivable highway tags (subset) - levels 1-7
 DRIVABLE_ROADS = set(ROAD_TYPES.keys())
 
 # --- Colors ---

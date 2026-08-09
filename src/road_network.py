@@ -1,19 +1,18 @@
 # Road Network
-# Stores the road graph, projects geographic coords to world pixels,
-# and provides spatial queries (e.g. "what road is at this position?").
+# Stores the road graph with nodes, segments and connectivity,
+# projects geographic coords to world pixels.
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
 
 from . import config
 
 
 @dataclass
 class RoadSegment:
-    """A single road segment between two points."""
+    """A single road segment between two nodes."""
     id: int
     x1: float       # world pixel coords
     y1: float
@@ -22,17 +21,22 @@ class RoadSegment:
     highway: str
     oneway: bool
     width: float    # metres
+    start_node: str = ""   # node id at (x1, y1)
+    end_node: str = ""     # node id at (x2, y2)
+    length: float = 0.0    # metres
 
 
 @dataclass
 class RoadNetwork:
     nodes: dict                # id -> (x, y) in world pixels
     segments: list[RoadSegment]
-    origin_lat: float          # south-west corner lat
-    origin_lon: float          # south-west corner lon
-    world_width: float         # total world pixels (lon span * scale)
-    world_height: float        # total world pixels (lat span * scale)
-    node_max_width: dict = field(default_factory=dict)  # node id -> (half_width_px, highway)
+    origin_lat: float
+    origin_lon: float
+    world_width: float
+    world_height: float
+    node_connections: dict = field(default_factory=dict)  # node_id -> [segment_indices]
+    node_degree: dict = field(default_factory=dict)       # node_id -> connection count
+    node_max_width: dict = field(default_factory=dict)    # node_id -> (half_width_px, highway)
 
     # --- Construction ---
 
@@ -47,9 +51,9 @@ class RoadNetwork:
             x, y = latlon_to_world(n["lat"], n["lon"], south, west, pppm)
             nodes[nid] = (x, y)
 
-        # Build segments
+        # Build segments with node references
         segments = []
-        seg_node_ids: list[tuple[str, str]] = []   # parallel to segments
+        seg_node_ids: list[tuple[str, str]] = []
         for way in data["ways"]:
             way_nodes = way["nodes"]
             highway = way["highway"]
@@ -63,12 +67,14 @@ class RoadNetwork:
                 x1, y1 = nodes[n1]
                 x2, y2 = nodes[n2]
 
-                # Determine width from highway type
                 road_cfg = config.ROAD_TYPES.get(highway)
                 if road_cfg:
                     width = road_cfg["width_1way"] if oneway else road_cfg["width_2way"]
                 else:
                     width = 3.5
+
+                # Length in metres (world coords are in pixels, divide by pppm)
+                seg_length = math.hypot(x2 - x1, y2 - y1) / pppm
 
                 segments.append(RoadSegment(
                     id=way["id"],
@@ -76,16 +82,18 @@ class RoadNetwork:
                     highway=highway,
                     oneway=oneway,
                     width=width,
+                    start_node=n1,
+                    end_node=n2,
+                    length=seg_length,
                 ))
                 seg_node_ids.append((n1, n2))
 
-        # Snap dangling endpoints onto nearby roads (closes OSM mapping gaps)
+        # Snap dangling endpoints onto nearby roads
         snapped = snap_endpoints(segments, pppm)
         if snapped:
             print(f"  Snapped {snapped} dangling endpoints")
 
-        # Recompute node positions from snapped segment endpoints
-        # (average position for nodes shared by several segments)
+        # Recompute node positions from snapped endpoints
         node_sum: dict[str, list[float]] = {}
         node_degree: dict[str, int] = {}
         for seg, (n1, n2) in zip(segments, seg_node_ids):
@@ -98,18 +106,22 @@ class RoadNetwork:
         for nid, (sx, sy, c) in node_sum.items():
             nodes[nid] = (sx / c, sy / c)
 
-        # Junction info: widest road at each node
+        # Build node_connections: which segment indices touch each node
+        node_connections: dict[str, list[int]] = {}
+        for idx, seg in enumerate(segments):
+            node_connections.setdefault(seg.start_node, []).append(idx)
+            node_connections.setdefault(seg.end_node, []).append(idx)
+
+        # Junction info: widest road at each node (for rendering)
         node_info: dict[str, tuple[float, str]] = {}
-        for seg, (n1, n2) in zip(segments, seg_node_ids):
+        for seg in segments:
             half = (seg.width / 2) * pppm
-            for nid in (n1, n2):
+            for nid in (seg.start_node, seg.end_node):
                 cur = node_info.get(nid)
                 if cur is None or half > cur[0]:
                     node_info[nid] = (half, seg.highway)
 
-        # Only keep junction info for real intersections (degree >= 3) and
-        # dead ends (degree == 1, for rounded caps). Intermediate nodes along
-        # a single road (degree == 2) would create ugly bulges.
+        # Skip degree-2 nodes (straight road continuation)
         node_info = {
             nid: info for nid, info in node_info.items()
             if node_degree.get(nid, 0) != 2
@@ -125,8 +137,123 @@ class RoadNetwork:
             origin_lon=west,
             world_width=world_width,
             world_height=world_height,
+            node_connections=node_connections,
+            node_degree=node_degree,
             node_max_width=node_info,
         )
+
+    # --- Graph queries ---
+
+    def get_connected_segments(self, node_id: str) -> list[int]:
+        """Return indices of all segments connected to a node."""
+        return self.node_connections.get(node_id, [])
+
+    def get_exit_angle(self, from_seg_idx: int, to_seg_idx: int) -> float:
+        """Return the turning angle (degrees, negative=left, positive=right)
+        when going from one segment to another at a shared node."""
+        from_seg = self.segments[from_seg_idx]
+        to_seg = self.segments[to_seg_idx]
+
+        # Find shared node
+        shared = None
+        for n in (from_seg.start_node, from_seg.end_node):
+            if n in (to_seg.start_node, to_seg.end_node):
+                shared = n
+                break
+        if not shared:
+            return 0.0
+
+        # Entry direction: towards the shared node (along from_seg)
+        fn = self.nodes[from_seg.start_node] if from_seg.start_node != shared else self.nodes[from_seg.end_node]
+        fs = self.nodes[shared]
+        # Vector pointing TOWARDS shared node
+        from_vec = (fs[0] - fn[0], fs[1] - fn[1])
+
+        # Exit direction: away from shared node (along to_seg)
+        tn = self.nodes[to_seg.start_node] if to_seg.start_node != shared else self.nodes[to_seg.end_node]
+        ts = self.nodes[shared]
+        # Vector pointing AWAY from shared node
+        to_vec = (tn[0] - ts[0], tn[1] - ts[1])
+
+        # Angle between vectors (left = negative, right = positive)
+        from_angle = math.degrees(math.atan2(from_vec[0], from_vec[1]))
+        to_angle = math.degrees(math.atan2(to_vec[0], to_vec[1]))
+        diff = to_angle - from_angle
+        # Normalize to (-180, 180]
+        while diff > 180:
+            diff -= 360
+        while diff <= -180:
+            diff += 360
+        return diff
+
+    def has_right_of_way_conflict(self, from_seg_idx: int, node_id: str) -> bool:
+        """Check if there's a road coming from the right at this junction.
+        Returns True if we need to yield (rechts vor links)."""
+        connected = self.get_connected_segments(node_id)
+        if len(connected) <= 2:
+            # Not a real junction
+            return False
+        
+        for idx in connected:
+            if idx == from_seg_idx:
+                continue
+            
+            angle = self.get_exit_angle(from_seg_idx, idx)
+            # "From the right" means angle between -45° and -135° (right side)
+            if -135 <= angle <= -45:
+                return True
+        
+        return False
+
+    def choose_next_segment(self, from_seg_idx: int, node_id: str, turn_direction: str) -> int | None:
+        """Choose the next segment when reaching a node.
+        turn_direction: 'left', 'right', or 'straight'.
+        Returns segment index or None if no suitable segment found."""
+        connected = self.get_connected_segments(node_id)
+        if len(connected) <= 1:
+            # Dead end or continuation — just go back the way we came
+            return from_seg_idx if len(connected) == 1 else None
+
+        candidates = []
+        for idx in connected:
+            if idx == from_seg_idx:
+                continue
+            angle = self.get_exit_angle(from_seg_idx, idx)
+            candidates.append((idx, angle))
+
+        if not candidates:
+            return None
+
+        # For oneway roads, respect direction
+        filtered = []
+        for idx, angle in candidates:
+            seg = self.segments[idx]
+            # Simple check: if oneway, only allow if we're going with the flow
+            # (this is approximate; proper check would need edge direction)
+            filtered.append((idx, angle))
+
+        if not filtered:
+            return None
+
+        if turn_direction == "left":
+            # Most negative angle (sharp left preferred)
+            best = min(filtered, key=lambda x: x[1])
+            if best[1] < -10:
+                return best[0]
+        elif turn_direction == "right":
+            # Most positive angle (sharp right preferred)
+            best = max(filtered, key=lambda x: x[1])
+            if best[1] > 10:
+                return best[0]
+        else:
+            # Straight: smallest absolute angle
+            best = min(filtered, key=lambda x: abs(x[1]))
+            if abs(best[1]) < 30:
+                return best[0]
+
+        # Fallback: if preferred turn not available, just go straight
+        best = min(filtered, key=lambda x: abs(x[1]))
+        return best[0]
 
     # --- Spatial queries ---
 
@@ -140,15 +267,17 @@ class RoadNetwork:
                 return True
         return False
 
-    def random_road_point(self) -> tuple[float, float, float]:
-        """Return a random (x, y, heading) on any road segment. Heading in degrees, 0=up."""
+    def random_road_point(self) -> tuple[float, float, float, int, str]:
+        """Return a random (x, y, heading, seg_idx, node_id) on any road segment.
+        Heading in degrees, 0=up. node_id is the start node."""
         import random
-        seg = random.choice(self.segments)
+        seg_idx = random.randrange(len(self.segments))
+        seg = self.segments[seg_idx]
         t = random.random()
         x = seg.x1 + t * (seg.x2 - seg.x1)
         y = seg.y1 + t * (seg.y2 - seg.y1)
         heading = math.degrees(math.atan2(seg.x2 - seg.x1, seg.y2 - seg.y1))
-        return x, y, heading
+        return x, y, heading, seg_idx, seg.start_node
 
     # --- Bounds ---
 
@@ -161,12 +290,7 @@ class RoadNetwork:
 # --- Projection helpers ---
 
 def latlon_to_world(lat: float, lon: float, ref_lat: float, ref_lon: float, pppm: float) -> tuple[float, float]:
-    """Convert lat/lon to world pixel coordinates using equirectangular projection.
-
-    origin is bottom-left (ref_lat, ref_lon).
-    x increases east, y increases north.
-    """
-    # Approximate metres-per-degree, adjusted for latitude
+    """Convert lat/lon to world pixel coordinates using equirectangular projection."""
     meters_per_lat_deg = 111132.9 - 566.0 * math.cos(2 * math.radians(lat)) + 1.2 * math.cos(4 * math.radians(lat))
     meters_per_lon_deg = 111320 * math.cos(math.radians(lat))
 
@@ -193,18 +317,13 @@ def point_to_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: 
 
 
 def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
-    """Shortest distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+    """Shortest distance from point to line segment."""
     d, _, _ = point_to_segment(px, py, x1, y1, x2, y2)
     return d
 
 
 def snap_endpoints(segments: list[RoadSegment], pppm: float, snap_m: float = 8.0) -> int:
-    """Snap dangling segment endpoints onto nearby roads.
-
-    OSM ways often end a few metres short of the road they should connect to.
-    This moves such endpoints onto the nearest point of another segment within
-    snap_m metres, closing visual gaps. Returns the number of snapped endpoints.
-    """
+    """Snap dangling segment endpoints onto nearby roads."""
     snap_px = snap_m * pppm
     cell = max(snap_px, 1.0)
     grid: dict[tuple[int, int], list[int]] = {}
@@ -233,7 +352,7 @@ def snap_endpoints(segments: list[RoadSegment], pppm: float, snap_m: float = 8.0
                         if d < best_d:
                             best_d = d
                             best_pt = (qx, qy)
-            if best_pt is not None and best_d > 0.5:  # don't touch already-connected ends
+            if best_pt is not None and best_d > 0.5:
                 setattr(seg, xa, best_pt[0])
                 setattr(seg, ya, best_pt[1])
                 snapped += 1

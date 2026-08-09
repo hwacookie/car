@@ -37,7 +37,9 @@ HIGHWAY_ID_TO_NAME = {
 }
 
 # highway tags treated as drivable roads (others, e.g. track, excluded)
-DRIVABLE_HIGHWAY_IDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16)
+# Levels 1-7 only: motorway, trunk, primary, secondary, tertiary, residential, service
+# (including _link variants)
+DRIVABLE_HIGHWAY_IDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14)
 
 
 def _connect():

@@ -1,7 +1,10 @@
 # Camera / Viewport
-# Follows the car with smooth interpolation and supports zoom in/out.
+# Follows the car with smooth interpolation, supports zoom in/out,
+# and middle-mouse drag to pan the map.
 
 from __future__ import annotations
+
+import pygame
 
 from . import config
 
@@ -15,12 +18,30 @@ class Camera:
         self.zoom = 1.0
         self.lerp_factor = 0.08   # smooth follow speed
 
-    def update(self, target_x: float, target_y: float, world_w: float, world_h: float):
-        """Smoothly move camera toward target, clamped to world bounds."""
-        self.x += (target_x - self.x) * self.lerp_factor
-        self.y += (target_y - self.y) * self.lerp_factor
+        # Drag state
+        self._dragging = False
+        self._drag_start_mouse = (0, 0)
+        self._drag_start_camera = (0.0, 0.0)
+
+    def update(self, target_x: float, target_y: float, world_w: float, world_h: float,
+               follow: bool = True):
+        """Smoothly move camera toward target, clamped to world bounds.
+        Only follows if not manually dragging and follow=True.
+        """
+        if not self._dragging and follow:
+            self.x += (target_x - self.x) * self.lerp_factor
+            self.y += (target_y - self.y) * self.lerp_factor
 
         # Clamp so camera never shows outside the world
+        half_w = (self.width / 2) / self.zoom
+        half_h = (self.height / 2) / self.zoom
+        self.x = max(half_w, min(world_w - half_w, self.x))
+        self.y = max(half_h, min(world_h - half_h, self.y))
+
+    def snap_to(self, x: float, y: float, world_w: float, world_h: float):
+        """Instantly snap camera to a position (e.g., when pressing 'c')."""
+        self.x = x
+        self.y = y
         half_w = (self.width / 2) / self.zoom
         half_h = (self.height / 2) / self.zoom
         self.x = max(half_w, min(world_w - half_w, self.x))
@@ -43,3 +64,26 @@ class Camera:
             self.zoom_in()
         elif delta < 0:
             self.zoom_out()
+
+    # --- Mouse drag ---
+
+    def handle_mouse_down(self, button: int, pos: tuple[int, int]):
+        """Start dragging on middle mouse button (button 2)."""
+        if button == 2:  # middle mouse button
+            self._dragging = True
+            self._drag_start_mouse = pos
+            self._drag_start_camera = (self.x, self.y)
+
+    def handle_mouse_up(self, button: int):
+        """Stop dragging."""
+        if button == 2:
+            self._dragging = False
+
+    def handle_mouse_motion(self, pos: tuple[int, int]):
+        """Drag the map by moving camera opposite to mouse movement."""
+        if self._dragging:
+            dx = pos[0] - self._drag_start_mouse[0]
+            dy = pos[1] - self._drag_start_mouse[1]
+            # Camera moves opposite to mouse drag (map follows cursor)
+            self.x = self._drag_start_camera[0] - dx / self.zoom
+            self.y = self._drag_start_camera[1] + dy / self.zoom  # +dy because screen Y is down

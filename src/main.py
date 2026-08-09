@@ -41,8 +41,8 @@ def main(smoke_test_frames: int = 0):
     network = RoadNetwork.from_osm_data(osm_data, bb["north"], bb["south"], bb["west"], bb["east"])
 
     # --- Car on random road ---
-    rx, ry, rh = network.random_road_point()
-    car = Car(rx, ry, rh)
+    rx, ry, rh, seg_idx, node_id = network.random_road_point()
+    car = Car(rx, ry, rh, seg_idx)
 
     # --- Camera + Renderer ---
     camera = Camera(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -67,6 +67,12 @@ def main(smoke_test_frames: int = 0):
                 running = False
             elif event.type == pygame.MOUSEWHEEL:
                 camera.handle_zoom(event.y)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                camera.handle_mouse_down(event.button, event.pos)
+            elif event.type == pygame.MOUSEBUTTONUP:
+                camera.handle_mouse_up(event.button)
+            elif event.type == pygame.MOUSEMOTION:
+                camera.handle_mouse_motion(event.pos)
 
         keys = pygame.key.get_pressed()
 
@@ -82,21 +88,28 @@ def main(smoke_test_frames: int = 0):
             keys = _FakeKeys(accel=True, right=(frame > smoke_test_frames // 2))
 
         # Car physics
-        car.handle_input(keys, dt)
+        car.handle_input(keys, dt, network)
 
-        # Off-road check
-        if not network.is_on_road(car.x, car.y):
-            car.speed = 0
+        # Free mode: enforce road boundaries and map edges
+        if car.mode == "free":
+            # Off-road check
+            if not network.is_on_road(car.x, car.y):
+                car.speed = 0
 
-        # Map edge check
-        bounds = network.bounds
-        if car.x < 0 or car.x > bounds[2] or car.y < 0 or car.y > bounds[3]:
-            car.speed = 0
-            car.x = max(0, min(bounds[2], car.x))
-            car.y = max(0, min(bounds[3], car.y))
+            # Map edge check
+            bounds = network.bounds
+            if car.x < 0 or car.x > bounds[2] or car.y < 0 or car.y > bounds[3]:
+                car.speed = 0
+                car.x = max(0, min(bounds[2], car.x))
+                car.y = max(0, min(bounds[3], car.y))
 
-        # Camera follow
-        camera.update(car.x, car.y, network.world_width, network.world_height)
+        # Camera follow (only when moving)
+        camera.update(car.x, car.y, network.world_width, network.world_height,
+                      follow=car.speed > 0.1)
+
+        # Snap camera to car with 'C' key
+        if keys[pygame.K_c]:
+            camera.snap_to(car.x, car.y, network.world_width, network.world_height)
 
         # Render
         screen.fill(BG_COLOR)
