@@ -253,12 +253,13 @@ def main(smoke_test_frames: int = 0):
             })
             
             # Update screenshot (every 10 frames to reduce overhead)
-            if frame % 10 == 0:
+            if frame % 10 == 0 and not smoke_test_frames:
                 # Convert surface to PNG bytes
                 import io
                 png_io = io.BytesIO()
-                pygame.image.save(screen, png_io, 'car_frame.png')
-                api.update_screenshot(png_io.getvalue())
+                pygame.image.save(screen, png_io)
+                png_io.seek(0)
+                api.update_screenshot(png_io.read())
 
         # Debug: dump framebuffer after a few frames
         if "--dump" in sys.argv and frame == 30:

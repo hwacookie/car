@@ -174,6 +174,10 @@ class GameAPI:
     
     def start(self, port: int = 5000, host: str = '127.0.0.1'):
         """Start API server in background thread."""
+        import logging
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)  # Suppress Flask startup messages
+        
         def run():
             self.app.run(host=host, port=port, debug=False, use_reloader=False)
         
