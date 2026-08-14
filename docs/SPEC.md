@@ -106,6 +106,88 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 - **Safety margin**: 5 meters before junction
 - **Only at junctions with right-of-way conflict** (road from right, 3+ connections)
 
+### Realistic Turning Physics (RAILS mode)
+
+**Core Rule**: The car must **ALWAYS stay completely on the road** with all four tires. No cutting corners, no off-road driving.
+
+#### Real Car Dynamics
+- **Pivot point**: Rear axle (like a real car)
+- **Turning radius**: Depends on speed and steering angle
+- **Centripetal force**: `F = mv²/r` → faster speed requires wider radius
+
+#### Speed-Based Turning Radius
+| Speed | Required Turning Radius |
+|-------|-------------------------|
+| 20-30 km/h | 5-10 m (tight turn) |
+| 40-60 km/h | 15-25 m (medium turn) |
+| 80+ km/h | 30-50 m (wide turn) |
+
+**Formula**: `radius = k × speed²` (where k is tuned for realistic feel)
+
+#### Geometry-Based Turn Validation
+
+Before starting any turn (at degree-2, degree-3, or degree-3+ nodes):
+
+1. **Calculate required turning radius** based on current speed
+2. **Check available road geometry**:
+   - Distance remaining on current segment
+   - Angle between current and next segment
+   - Width of both road segments
+   - Calculate if circular arc fits within both segments
+3. **Validate arc stays on road**:
+   - Start point: X meters before junction (on current road)
+   - End point: Y meters into next road
+   - Arc must stay within road boundaries at all points
+4. **If arc doesn't fit** → brake harder
+5. **If cannot brake in time** → **miss the turn**, continue straight
+
+#### Turn Execution
+
+**All nodes** (degree 2, 3, 4+) use the same physics:
+- Calculate angle change between segments
+- Determine if turn is possible at current speed
+- If yes: follow circular arc with calculated radius
+- If no: brake or miss turn
+
+**Smooth rotation at degree-2 nodes**:
+- Even when "following the road" without changing at an intersection
+- Car smoothly rotates to follow road curvature
+- No instant heading snaps
+
+**Turn sequence**:
+1. **Pre-turn phase** (10-30m before junction):
+   - Validate geometry
+   - Brake if needed
+   - Start rotation early if possible
+2. **Arc phase** (through the junction):
+   - Follow circular arc with constant radius
+   - Heading rotates smoothly
+   - Stay within both road segments
+3. **Post-turn phase** (settling onto new road):
+   - Complete rotation to new road direction
+   - Resume normal following
+
+#### Braking Strategy
+
+**Geometry-based braking** (not just angle-based):
+```
+required_radius = calculate_radius(current_speed)
+available_geometry = analyze_roads(current_seg, next_seg, junction)
+
+if arc_fits(required_radius, available_geometry):
+    execute_turn()
+else:
+    brake_harder()
+    
+if cannot_brake_in_time():
+    miss_turn()  # Continue on current road
+```
+
+**Missed turn behavior**:
+- Blinker stays on
+- Car continues on current road (follows "straight")
+- Will attempt turn at next junction if blinker still active
+
 ### Turning
 - **FREE mode**: Turn rate depends on speed (slower at high speed)
 - **RAILS mode**: Heading follows road direction automatically
@@ -337,10 +419,21 @@ car/
 - [x] Service road width (3.5m fixed)
 - [x] Endpoint snapping (8m threshold)
 - [x] Off-road detection (FREE mode)
+- [x] Breadcrumb trail (cyan dots showing driven path)
 - [x] 10 unit tests passing
 
-### 🚧 Known Issues
-None currently
+### 🚧 In Progress
+- [ ] **Realistic turning physics** (circular arc, geometry-based)
+  - Speed-dependent turning radius
+  - Geometry validation (arc must fit within road)
+  - Smooth rotation at all nodes (degree 2, 3, 4+)
+  - Miss turn if cannot brake in time
+  - Always stay on road (strict constraint)
+
+### 🐛 Known Issues
+- **RAILS mode turns go off-road**: Current Bezier curve implementation cuts corners
+- **Instant heading changes**: At degree-2 nodes, heading snaps instead of smooth rotation
+- **Unrealistic braking**: Brakes by angle, not by geometry constraints
 
 ### 🔮 Future Enhancements
 - Building footprints from OSM `building` polygons
@@ -451,5 +544,6 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ---
 
-**Last Updated**: 2025-01-10  
-**Status**: ✅ Fully playable, all core features implemented
+**Last Updated**: 2026-01-10  
+**Status**: 🚧 In active development - implementing realistic turning physics  
+**Version**: 0.9 (playable, physics improvements in progress)
