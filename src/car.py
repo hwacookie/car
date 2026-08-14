@@ -198,15 +198,18 @@ class Car:
         distance_frac = distance_m / seg.length if seg.length > 0 else 0
         
         # Check if approaching junction and should plan/execute turn
+        # TEMPORARILY DISABLED - arc calculation goes off-road
+        # TODO: Fix arc geometry to stay within road boundaries
         approaching_junction = False
         junction_node = None
         
-        if self.forward and self.progress > 0.7:
-            approaching_junction = True
-            junction_node = seg.end_node
-        elif not self.forward and self.progress < 0.3:
-            approaching_junction = True
-            junction_node = seg.start_node
+        if False:  # Disabled
+            if self.forward and self.progress > 0.7:
+                approaching_junction = True
+                junction_node = seg.end_node
+            elif not self.forward and self.progress < 0.3:
+                approaching_junction = True
+                junction_node = seg.start_node
         
         # Plan turn if approaching junction
         if approaching_junction and junction_node and not hasattr(self, '_turn_planned_for_node'):
