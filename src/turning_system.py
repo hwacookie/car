@@ -102,6 +102,7 @@ class TurningSystem:
         car_x: float, 
         car_y: float, 
         car_speed: float,
+        car_heading: float,
         from_seg_idx: int,
         to_seg_idx: int,
         junction_node: str,
@@ -112,13 +113,14 @@ class TurningSystem:
         Args:
             car_x, car_y: Current car position (world pixels)
             car_speed: Current speed (m/s)
+            car_heading: Current heading (degrees)
             from_seg_idx: Current segment index
             to_seg_idx: Target segment index
             junction_node: Junction node ID
             network: RoadNetwork instance
         
         Returns:
-            TurnPlan if turn is possible, None if segments don't connect properly
+            TurnPlan if turn is possible and stays on road, None otherwise
         """
         if from_seg_idx == to_seg_idx:
             return None
@@ -129,15 +131,22 @@ class TurningSystem:
         # Get junction position
         if from_seg.end_node == junction_node:
             junction_x, junction_y = from_seg.x2, from_seg.y2
-            from_heading = math.atan2(from_seg.x2 - from_seg.x1, from_seg.y2 - from_seg.y1)
+            from_dx = from_seg.x2 - from_seg.x1
+            from_dy = from_seg.y2 - from_seg.y1
         else:
             junction_x, junction_y = from_seg.x1, from_seg.y1
-            from_heading = math.atan2(from_seg.x1 - from_seg.x2, from_seg.y1 - from_seg.y2)
+            from_dx = from_seg.x1 - from_seg.x2
+            from_dy = from_seg.y1 - from_seg.y2
         
         if to_seg.start_node == junction_node:
-            to_heading = math.atan2(to_seg.x2 - to_seg.x1, to_seg.y2 - to_seg.y1)
+            to_dx = to_seg.x2 - to_seg.x1
+            to_dy = to_seg.y2 - to_seg.y1
         else:
-            to_heading = math.atan2(to_seg.x1 - to_seg.x2, to_seg.y1 - to_seg.y2)
+            to_dx = to_seg.x1 - to_seg.x2
+            to_dy = to_seg.y1 - to_seg.y2
+        
+        from_heading = math.atan2(from_dx, from_dy)
+        to_heading = math.atan2(to_dx, to_dy)
         
         # Calculate turn angle
         angle_diff = (to_heading - from_heading) % (2 * math.pi)
@@ -148,49 +157,77 @@ class TurningSystem:
         clockwise = angle_diff < 0
         turn_angle = abs(angle_diff)
         
-        # Calculate required radius
+        # For very small turns (<10°), just do instant transition
+        if turn_angle < math.radians(10):
+            return None
+        
+        # Calculate required radius from speed
         required_radius = self.calculate_turning_radius(car_speed)
         
-        # For very gentle turns (<20°), use larger radius for smoother path
-        if turn_angle < math.radians(20):
-            required_radius = max(required_radius, 20.0)
-        
-        # Calculate arc center
-        # The center is perpendicular to the heading at the junction
+        # Try multiple radii to find one that fits
         pppm = config.PIXELS_PER_METER
-        offset_angle = from_heading + (math.pi / 2 if not clockwise else -math.pi / 2)
-        center_x = junction_x + required_radius * pppm * math.sin(offset_angle)
-        center_y = junction_y - required_radius * pppm * math.cos(offset_angle)
         
-        # Calculate start and end angles (from center)
-        start_angle = math.atan2(junction_y - center_y, junction_x - center_x)
-        end_angle = start_angle + (angle_diff if not clockwise else -abs(angle_diff))
+        for radius_factor in [1.0, 1.2, 1.5, 2.0, 2.5]:
+            test_radius = required_radius * radius_factor
+            
+            # Calculate arc center
+            # Center is perpendicular to the FROM segment at the junction
+            offset_angle = from_heading + (math.pi / 2 if not clockwise else -math.pi / 2)
+            center_x = junction_x + test_radius * pppm * math.sin(offset_angle)
+            center_y = junction_y - test_radius * pppm * math.cos(offset_angle)
+            
+            # Calculate start and end angles (from center)
+            start_angle = math.atan2(junction_y - center_y, junction_x - center_x)
+            end_angle = math.atan2(
+                junction_y + to_dy * test_radius * pppm / math.hypot(to_dx, to_dy) - center_y,
+                junction_x + to_dx * test_radius * pppm / math.hypot(to_dx, to_dy) - center_x
+            )
+            
+            # Adjust angles for proper arc direction
+            if not clockwise:
+                # Counter-clockwise
+                while end_angle < start_angle:
+                    end_angle += 2 * math.pi
+            else:
+                # Clockwise
+                while end_angle > start_angle:
+                    end_angle -= 2 * math.pi
+            
+            # Calculate arc length
+            arc_angle = abs(end_angle - start_angle)
+            arc_length = test_radius * arc_angle
+            
+            # Start and end points
+            start_x = center_x + test_radius * pppm * math.cos(start_angle)
+            start_y = center_y + test_radius * pppm * math.sin(start_angle)
+            end_x = center_x + test_radius * pppm * math.cos(end_angle)
+            end_y = center_y + test_radius * pppm * math.sin(end_angle)
+            
+            # Create candidate turn plan
+            candidate = TurnPlan(
+                center_x=center_x,
+                center_y=center_y,
+                radius=test_radius,
+                start_angle=start_angle,
+                end_angle=end_angle,
+                clockwise=clockwise,
+                from_seg_idx=from_seg_idx,
+                to_seg_idx=to_seg_idx,
+                junction_node=junction_node,
+                arc_length=arc_length,
+                start_x=start_x,
+                start_y=start_y,
+                end_x=end_x,
+                end_y=end_y,
+                progress=0.0
+            )
+            
+            # VALIDATE: Check if entire arc stays on road
+            if self.validate_arc_on_road(candidate, network, num_samples=20):
+                return candidate
         
-        # Calculate arc length
-        arc_length = required_radius * turn_angle
-        
-        # Start and end points (at junction for now - can be refined)
-        start_x, start_y = junction_x, junction_y
-        end_x = center_x + required_radius * pppm * math.cos(end_angle)
-        end_y = center_y + required_radius * pppm * math.sin(end_angle)
-        
-        return TurnPlan(
-            center_x=center_x,
-            center_y=center_y,
-            radius=required_radius,
-            start_angle=start_angle,
-            end_angle=end_angle,
-            clockwise=clockwise,
-            from_seg_idx=from_seg_idx,
-            to_seg_idx=to_seg_idx,
-            junction_node=junction_node,
-            arc_length=arc_length,
-            start_x=start_x,
-            start_y=start_y,
-            end_x=end_x,
-            end_y=end_y,
-            progress=0.0
-        )
+        # No valid arc found
+        return None
     
     def check_turn_feasible(
         self,

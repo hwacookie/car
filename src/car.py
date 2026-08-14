@@ -198,18 +198,15 @@ class Car:
         distance_frac = distance_m / seg.length if seg.length > 0 else 0
         
         # Check if approaching junction and should plan/execute turn
-        # TEMPORARILY DISABLED - arc calculation goes off-road
-        # TODO: Fix arc geometry to stay within road boundaries
         approaching_junction = False
         junction_node = None
         
-        if False:  # Disabled
-            if self.forward and self.progress > 0.7:
-                approaching_junction = True
-                junction_node = seg.end_node
-            elif not self.forward and self.progress < 0.3:
-                approaching_junction = True
-                junction_node = seg.start_node
+        if self.forward and self.progress > 0.7:
+            approaching_junction = True
+            junction_node = seg.end_node
+        elif not self.forward and self.progress < 0.3:
+            approaching_junction = True
+            junction_node = seg.start_node
         
         # Plan turn if approaching junction
         if approaching_junction and junction_node and not hasattr(self, '_turn_planned_for_node'):
@@ -279,13 +276,14 @@ class Car:
         
         # Plan the turn
         turn_plan = self.turning_system.plan_turn(
-            self.x, self.y, self.speed,
+            self.x, self.y, self.speed, self.heading,
             self.seg_idx, next_seg_idx, junction_node,
             network
         )
         
         if not turn_plan:
-            return  # Can't plan turn
+            print(f"⚠️ Cannot plan turn {self.seg_idx} → {next_seg_idx}: no arc fits within road boundaries")
+            return  # Can't plan turn - will use instant transition at segment end
         
         # Check feasibility
         seg = network.segments[self.seg_idx]
