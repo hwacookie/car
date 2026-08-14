@@ -102,15 +102,40 @@ class Renderer:
 
     # --- Breadcrumb Trail ---
     def draw_trail(self, surface: pygame.Surface, car):
-        """Draw the breadcrumb trail showing where the car has driven."""
+        """Draw the breadcrumb trail: small chevron ("v") arrows showing
+        the car's heading at each recorded point, instead of plain dots.
+        """
         if not hasattr(car, 'trail') or len(car.trail) < 2:
             return
         
-        # Draw small dots for each breadcrumb
-        for wx, wy in car.trail:
+        zoom = self.camera.zoom
+        arrow_len = 6 * zoom    # length of each arrow leg (screen px)
+        arrow_half_w = 4 * zoom  # half-width of the chevron opening
+        
+        for point in car.trail:
+            # Trail points are (x, y, heading); tolerate old (x, y) tuples too
+            if len(point) == 3:
+                wx, wy, heading = point
+            else:
+                wx, wy = point
+                heading = 0.0
+            
             sx, sy = self.camera.world_to_screen(wx, wy)
-            # Draw a small cyan dot
-            pygame.draw.circle(surface, (0, 255, 255), (int(sx), int(sy)), 3)
+            rad = math.radians(heading)
+            
+            # Forward direction (matches car movement convention: heading
+            # 0 = screen "up"/away from viewer along +y world axis)
+            fx, fy = math.sin(rad), -math.cos(rad)
+            # Perpendicular (for the two chevron legs)
+            px, py = -fy, fx
+            
+            tip_x, tip_y = sx + fx * arrow_len, sy + fy * arrow_len
+            back_x, back_y = sx - fx * arrow_len, sy - fy * arrow_len
+            left_x, left_y = back_x + px * arrow_half_w, back_y + py * arrow_half_w
+            right_x, right_y = back_x - px * arrow_half_w, back_y - py * arrow_half_w
+            
+            pygame.draw.line(surface, (0, 255, 255), (left_x, left_y), (tip_x, tip_y), 2)
+            pygame.draw.line(surface, (0, 255, 255), (right_x, right_y), (tip_x, tip_y), 2)
 
     # --- HUD / Dashboard ---
     def draw_hud(self, surface: pygame.Surface, car):

@@ -35,6 +35,15 @@ class TurnPlan:
     # Progress tracking
     progress: float = 0.0  # 0.0 to 1.0 along arc
     
+    # Calibrated correction (degrees) so heading is guaranteed to be
+    # continuous with the car's actual heading at progress=0. The
+    # tangent-heading formula below is derived from a circle
+    # parametrization (cos/sin) that is rotated 90 deg relative to the
+    # sin/-cos convention used to place the arc's center from the car's
+    # heading, which otherwise produces a systematic ~90 deg discontinuity
+    # right when the turn starts. See TurningSystem.plan_turn().
+    heading_offset: float = 0.0  # degrees
+    
     def get_point_on_arc(self, progress: float) -> Tuple[float, float, float]:
         """Get (x, y, heading) at given progress along arc.
         
@@ -60,11 +69,13 @@ class TurnPlan:
         x = self.center_x + self.radius * pppm * math.cos(current_angle)
         y = self.center_y + self.radius * pppm * math.sin(current_angle)
         
-        # Heading (tangent to circle)
+        # Heading (tangent to circle), calibrated to match the car's real
+        # heading at progress=0 (see heading_offset docstring above)
         if self.clockwise:
             heading = math.degrees(current_angle - math.pi / 2)
         else:
             heading = math.degrees(current_angle + math.pi / 2)
+        heading += self.heading_offset
         
         return x, y, heading % 360
 
@@ -164,6 +175,22 @@ class TurningSystem:
         # Calculate required radius from speed
         required_radius = self.calculate_turning_radius(car_speed)
         
+        # Geometric sanity cap: an arc can never plausibly fit if its radius
+        # is large relative to the roads it connects (e.g. a 160m-radius arc
+        # on 200m-long residential segments). Without this cap, the coarse
+        # point-sampling in validate_arc_on_road() can produce false
+        # positives for huge arcs that happen to graze close to a segment's
+        # line for part of their length — i.e. a 90° turn at 120 km/h could
+        # otherwise "validate" when it clearly shouldn't. This forces such
+        # turns to be correctly rejected (caller then brakes and retries).
+        max_sane_radius = 0.6 * min(from_seg.length, to_seg.length)
+        if required_radius > max_sane_radius:
+            print(f"\n🔍 Planning turn {from_seg_idx} → {to_seg_idx}, angle={math.degrees(turn_angle):.1f}°, "
+                  f"speed={car_speed * 3.6:.0f} km/h")
+            print(f"  ❌ Required radius {required_radius:.1f}m exceeds geometric cap "
+                  f"{max_sane_radius:.1f}m (too fast for these road lengths) - rejecting")
+            return None
+        
         # Try multiple radii to find one that fits
         pppm = config.PIXELS_PER_METER
         
@@ -171,33 +198,46 @@ class TurningSystem:
         
         for radius_factor in [1.0, 1.2, 1.5, 2.0, 2.5]:
             test_radius = required_radius * radius_factor
+            if test_radius > max_sane_radius:
+                print(f"  ⏭️  Skipping radius {test_radius:.1f}m (factor {radius_factor}): exceeds geometric cap {max_sane_radius:.1f}m")
+                continue
             print(f"  Trying radius: {test_radius:.1f}m (factor {radius_factor})")
             
             # Calculate arc center
-            # Center is perpendicular to the FROM segment at the junction
-            offset_angle = from_heading + (math.pi / 2 if not clockwise else -math.pi / 2)
-            center_x = junction_x + test_radius * pppm * math.sin(offset_angle)
-            center_y = junction_y - test_radius * pppm * math.cos(offset_angle)
+            # IMPORTANT: anchor the START of the arc at the car's ACTUAL
+            # current position and heading — not an idealized point on the
+            # segment centerline computed from the junction. The car isn't
+            # necessarily exactly `radius` meters before the junction, and
+            # it may have a lane offset from the centerline; anchoring to
+            # the idealized point caused a visible position jump (and
+            # occasionally an off-road pop) at the instant the arc began.
+            offset_angle = math.radians(car_heading) + (math.pi / 2 if not clockwise else -math.pi / 2)
+            center_x = car_x + test_radius * pppm * math.sin(offset_angle)
+            center_y = car_y - test_radius * pppm * math.cos(offset_angle)
             
-            # Calculate start and end angles (from center)
-            start_angle = math.atan2(junction_y - center_y, junction_x - center_x)
-            end_angle = math.atan2(
-                junction_y + to_dy * test_radius * pppm / math.hypot(to_dx, to_dy) - center_y,
-                junction_x + to_dx * test_radius * pppm / math.hypot(to_dx, to_dy) - center_x
-            )
+            # Start angle: car's real current position around this center
+            start_angle = math.atan2(car_y - center_y, car_x - center_x)
             
-            # Adjust angles for proper arc direction
-            if not clockwise:
-                # Counter-clockwise
-                while end_angle < start_angle:
-                    end_angle += 2 * math.pi
+            # End angle: DIRECTLY offset from start_angle by the known,
+            # exact turn_angle (not re-derived via a separate point/atan2
+            # calculation). The previous approach computed end_angle
+            # independently from a point projected along the to_seg
+            # direction, which does NOT guarantee the swept angle equals
+            # the intended turn_angle — for small radii especially, this
+            # could accidentally require sweeping ~270° the "wrong way"
+            # around the circle to reach that independently-computed point,
+            # producing a near-full loop instead of a clean quarter-turn
+            # (visibly confirmed via breadcrumb trail: the car looped
+            # almost 360° right at the corner before merging onto the
+            # road). Using start_angle +/- turn_angle guarantees the arc
+            # sweeps EXACTLY the intended angle, every time.
+            if clockwise:
+                end_angle = start_angle - turn_angle
             else:
-                # Clockwise
-                while end_angle > start_angle:
-                    end_angle -= 2 * math.pi
+                end_angle = start_angle + turn_angle
             
-            # Calculate arc length
-            arc_angle = abs(end_angle - start_angle)
+            # Arc length now follows directly from the guaranteed sweep
+            arc_angle = turn_angle
             arc_length = test_radius * arc_angle
             
             # Start and end points
@@ -206,6 +246,14 @@ class TurningSystem:
             end_x = center_x + test_radius * pppm * math.cos(end_angle)
             end_y = center_y + test_radius * pppm * math.sin(end_angle)
             
+            # Calibrate heading_offset so the arc's tangent heading at
+            # progress=0 exactly matches the car's real current heading
+            # (see TurnPlan.heading_offset docstring)
+            raw_heading_at_0 = math.degrees(
+                start_angle - math.pi / 2 if clockwise else start_angle + math.pi / 2
+            )
+            heading_offset = (car_heading - raw_heading_at_0) % 360
+
             # Create candidate turn plan
             candidate = TurnPlan(
                 center_x=center_x,
@@ -222,7 +270,8 @@ class TurningSystem:
                 start_y=start_y,
                 end_x=end_x,
                 end_y=end_y,
-                progress=0.0
+                progress=0.0,
+                heading_offset=heading_offset,
             )
             
             # VALIDATE: Check if entire arc stays on road
@@ -335,7 +384,12 @@ class TurningSystem:
         to_seg = network.segments[turn_plan.to_seg_idx]
         
         # Use generous buffer at junctions (road width + extra margin)
-        buffer_margin = 5.0  # Extra 5 meters beyond road edge
+        # No extra buffer: match the ACTUAL rendered road width exactly.
+        # A generous margin here was letting arcs validate that visibly
+        # clipped the grass at the corner (confirmed via breadcrumb trail
+        # screenshot) — the renderer draws roads at exactly half-width
+        # with no slack, so validation must match that precisely.
+        buffer_margin = 0.0
         
         failed_points = []
         

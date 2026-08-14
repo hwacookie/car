@@ -38,6 +38,10 @@ class Car:
         # Turning system
         self.turning_system = TurningSystem(max_lateral_accel=5.0)
         self.active_turn: TurnPlan | None = None
+        self._cached_turn_node: str | None = None
+        self._cached_turn_to_seg: int | None = None
+        self._cached_turn_plan: TurnPlan | None = None
+        self._warned_no_arc_for_node: str | None = None
         
         # Visual state
         self._braking = False
@@ -85,7 +89,7 @@ class Car:
             self._trail_timer += dt
             if self._trail_timer >= 0.1:
                 self._trail_timer = 0.0
-                self.trail.append((self.x, self.y))
+                self.trail.append((self.x, self.y, self.heading))
                 if len(self.trail) > 500:
                     self.trail.pop(0)
     
@@ -180,6 +184,17 @@ class Car:
             self.forward = (to_seg.start_node == self.active_turn.junction_node)
             self.progress = 0.0 if self.forward else 1.0
             
+            # IMPORTANT: The arc's own geometry (circle math) does not
+            # necessarily land exactly on the network's real junction node
+            # coordinates. Snap position to the actual node here so the
+            # next frame's segment-following code (which recomputes x/y
+            # directly from network.segments[...].x1/y1) doesn't see a
+            # sudden jump (this was causing teleportation-watchdog
+            # violations immediately after a completed arc turn).
+            node_xy = network.nodes.get(self.active_turn.junction_node)
+            if node_xy is not None:
+                self.x, self.y = node_xy
+            
             # Notify driver that turn completed
             if self.driver and hasattr(self.driver, 'clear_blinker_if_turned'):
                 self.driver.clear_blinker_if_turned(
@@ -211,15 +226,18 @@ class Car:
             approaching_junction = True
             junction_node = seg.start_node
         
-        # Plan turn if approaching junction
-        if approaching_junction and junction_node and not hasattr(self, '_turn_planned_for_node'):
-            self._turn_planned_for_node = junction_node
-            self._check_and_plan_turn(network, junction_node)
+        # Re-check every frame while approaching (not just once!) so we can
+        # keep braking harder as long as the turn is not yet feasible at the
+        # current speed. The expensive arc search itself is cached per node
+        # inside _check_and_plan_turn, so this is cheap to call repeatedly.
+        if approaching_junction and junction_node and not self.active_turn:
+            self._check_and_plan_turn(network, junction_node, dt)
         
-        # Clear turn planning flag when far from junction
-        if hasattr(self, '_turn_planned_for_node'):
+        # Clear turn-plan cache once we're far from any junction again
+        if hasattr(self, '_cached_turn_node'):
             if (self.forward and self.progress < 0.5) or (not self.forward and self.progress > 0.5):
-                delattr(self, '_turn_planned_for_node')
+                self._cached_turn_node = None
+                self._cached_turn_plan = None
         
         # Move along segment
         if self.forward:
@@ -263,8 +281,15 @@ class Car:
         else:
             self.heading = math.degrees(math.atan2(-dx, -dy))
     
-    def _check_and_plan_turn(self, network, junction_node: str):
-        """Check if we should plan/execute a turn at upcoming junction."""
+    def _check_and_plan_turn(self, network, junction_node: str, dt: float):
+        """Check if we should plan/execute a turn at upcoming junction.
+
+        Called every frame while approaching a junction (until the turn
+        actually starts). Re-evaluates feasibility at the CURRENT speed
+        every time, so if the turn isn't safe yet we brake hard and try
+        again next frame — we never start an arc that doesn't fit, and we
+        never blindly attempt a 90° turn at highway speed.
+        """
         # Get turn intention from driver
         if self.driver and hasattr(self.driver, 'pending_turn'):
             turn = self.driver.pending_turn or "straight"
@@ -277,34 +302,59 @@ class Car:
         if next_seg_idx is None or next_seg_idx == self.seg_idx:
             return  # No valid turn or dead end
         
-        # Plan the turn
+        # Recompute fresh every frame using the car's CURRENT position and
+        # heading as the arc's anchor (validate_arc_on_road only checks 2
+        # segments so this is cheap). We deliberately don't cache the plan
+        # across frames: while braking towards feasibility the car keeps
+        # moving, and an arc anchored to a stale position would itself
+        # reintroduce a small jump the moment the turn actually starts.
         turn_plan = self.turning_system.plan_turn(
             self.x, self.y, self.speed, self.heading,
             self.seg_idx, next_seg_idx, junction_node,
             network
         )
+        self._cached_turn_node = junction_node
+        self._cached_turn_to_seg = next_seg_idx
+        self._cached_turn_plan = turn_plan
         
         if not turn_plan:
-            print(f"⚠️ Cannot plan turn {self.seg_idx} → {next_seg_idx}: no arc fits within road boundaries")
-            return  # Can't plan turn - will use instant transition at segment end
+            # No arc fits within road boundaries at any radius we tried —
+            # almost always because we're going too fast for this turn given
+            # the available road length. Brake hard and retry next frame:
+            # as speed drops, the required radius shrinks and a fitting arc
+            # may become possible. If we run out of road before that
+            # happens, the segment-end fallback (instant transition) kicks
+            # in instead of attempting a geometrically invalid arc.
+            if not getattr(self, '_warned_no_arc_for_node', None) == junction_node:
+                self._warned_no_arc_for_node = junction_node
+                print(f"⚠️ Cannot plan turn {self.seg_idx} → {next_seg_idx} at {self.speed * 3.6:.0f} km/h: "
+                      f"no arc fits within road boundaries — braking hard")
+            self.speed = max(0.0, self.speed - config.CAR_BRAKING * dt)
+            self.target_speed = min(self.target_speed, self.speed)
+            self._braking = True
+            return
         
-        # Check feasibility
+        # Check feasibility AT CURRENT SPEED (re-evaluated every frame)
         seg = network.segments[self.seg_idx]
         feasibility = self.turning_system.check_turn_feasible(
             self.speed, self.progress, seg.length, turn_plan, self.forward
         )
         
         if not feasibility['feasible']:
-            # Can't make turn - brake harder
-            print(f"⚠️  Turn too tight! Need to brake: current {self.speed * 3.6:.0f} km/h, need {feasibility['required_speed'] * 3.6:.0f} km/h")
-        elif feasibility['braking_required']:
-            # Need to brake (braking happens in main update loop)
-            pass
+            # Too fast for this turn given remaining distance to the
+            # junction — brake hard (full braking force) and re-check next
+            # frame. If we run out of road before becoming feasible, the
+            # segment-end fallback (instant transition) kicks in instead of
+            # us blindly attempting an oversized, off-geometry arc.
+            self.speed = max(0.0, self.speed - config.CAR_BRAKING * dt)
+            self.target_speed = min(self.target_speed, self.speed)
+            self._braking = True
+            return
         
-        # START TURN IMMEDIATELY when planning (at progress ~0.7)
-        # This ensures turn starts before we reach segment end
+        # Feasible now (possibly after braking on previous frames) - start it
         self.active_turn = turn_plan
-        print(f"🔄 Starting turn: {self.seg_idx} → {next_seg_idx} at progress {self.progress:.2f}")
+        print(f"🔄 Starting turn: {self.seg_idx} → {next_seg_idx} at progress {self.progress:.2f} "
+              f"(speed {self.speed * 3.6:.0f} km/h, radius {turn_plan.radius:.1f}m)")
     
     def _handle_segment_end(self, network, node_id: str):
         """Handle reaching end of current segment."""
@@ -412,7 +462,26 @@ class Car:
         
         # Clear trail
         self.trail.clear()
-    
+
+    def teleport_to_named_point(self, network, name: str):
+        """Teleport to a deterministic named start point (synthetic test
+        maps only — see RoadNetwork.start_points / test_maps.py).
+
+        Note: Caller should notify PhysicsValidator.reset_car_state() if
+        using validation.
+        """
+        x, y, heading, seg_idx, forward = network.get_start_point(name)
+        self.x = x
+        self.y = y
+        self.heading = heading
+        self.seg_idx = seg_idx
+        self.progress = 0.0 if forward else 1.0
+        self.forward = forward
+        self.speed = 0
+        self.target_speed = 0
+        self.active_turn = None
+        self.trail.clear()
+
     def is_on_road(self, network) -> bool:
         """Check if car is currently on any road."""
         pppm = config.PIXELS_PER_METER

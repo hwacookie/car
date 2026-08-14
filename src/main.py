@@ -17,6 +17,35 @@ from .rest_api import GameAPI
 from .test_maps import build_test_map, TEST_MAPS
 
 
+def copy_screenshot_to_clipboard(screen: pygame.Surface) -> None:
+    """Save the current frame and copy it to the system clipboard.
+    
+    Useful for quick bug reports: press ESC in-game to stop the car and
+    grab a screenshot you can immediately paste elsewhere.
+    """
+    import tempfile
+    from PIL import Image
+    
+    # Convert pygame surface -> PIL image (pygame lacks reliable PNG
+    # encoding on this platform, see docs/SPEC.md)
+    w, h = screen.get_size()
+    raw = pygame.image.tostring(screen, 'RGBA')
+    img = Image.frombytes('RGBA', (w, h), raw)
+    
+    path = tempfile.mktemp(suffix='.png')
+    img.save(path, 'PNG')
+    
+    if sys.platform == 'darwin':
+        import subprocess
+        subprocess.run([
+            'osascript', '-e',
+            f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)'
+        ], capture_output=True)
+        print(f"📷 Screenshot copied to clipboard (saved to {path})")
+    else:
+        print(f"📷 Screenshot saved to {path} (clipboard copy only supported on macOS)")
+
+
 def main(smoke_test_frames: int = 0):
     """Run the game. If smoke_test_frames > 0, run headless for that many frames."""
     # --- Init ---
@@ -69,6 +98,13 @@ def main(smoke_test_frames: int = 0):
     if "--api" in sys.argv:
         api = GameAPI()
         api.start(port=5000)
+        # Publish named start points (synthetic test maps only; empty for OSM data)
+        api.update_state({
+            'start_points': {
+                name: {'x': x, 'y': y, 'heading': h, 'segment': seg, 'forward': fwd}
+                for name, (x, y, h, seg, fwd) in network.start_points.items()
+            }
+        })
     elif not smoke_test_frames:
         print("\n💡 Tip: Run with --api to enable REST API for remote control")
         print("   Example: python -m src.main --api")
@@ -155,6 +191,17 @@ def main(smoke_test_frames: int = 0):
         # Snap camera to car with 'C' key
         if keys[pygame.K_c]:
             camera.snap_to(car.x, car.y, network.world_width, network.world_height)
+        
+        # ESC: emergency stop + screenshot to clipboard (for bug reports)
+        if keys[pygame.K_ESCAPE] and not hasattr(main, '_last_esc'):
+            main._last_esc = False
+        esc_pressed_now = keys[pygame.K_ESCAPE] and not main._last_esc
+        if esc_pressed_now:
+            car.speed = 0.0
+            car.target_speed = 0.0
+            car.active_turn = None
+            print("\n🛑 ESC: Emergency stop\n")
+        main._last_esc = keys[pygame.K_ESCAPE]
 
         # In smoke test, simulate driving inputs
         if smoke_test_frames:
@@ -167,7 +214,16 @@ def main(smoke_test_frames: int = 0):
             # Teleport command
             if 'teleport' in commands:
                 teleport_params = commands['teleport']
-                if teleport_params.get('random'):
+                if teleport_params.get('start_point'):
+                    name = teleport_params['start_point']
+                    try:
+                        car.teleport_to_named_point(network, name)
+                        validator.reset_car_state(car)
+                        print(f"\nAPI: Teleport to named start point '{name}' "
+                              f"(segment {car.seg_idx}, heading {car.heading:.1f}°)\n")
+                    except KeyError as e:
+                        print(f"\nAPI: {e}\n")
+                elif teleport_params.get('random'):
                     car.teleport_random(network)
                     validator.reset_car_state(car)
                     print(f"\nAPI: Random teleport to segment {car.seg_idx}\n")
@@ -241,6 +297,11 @@ def main(smoke_test_frames: int = 0):
         car.draw(screen, camera)
 
         pygame.display.flip()
+        
+        # ESC was just pressed: capture this frame (car now stopped) and
+        # copy it to the system clipboard for easy bug reporting
+        if esc_pressed_now:
+            copy_screenshot_to_clipboard(screen)
         
         # Update API state and screenshot (if API enabled)
         if api:

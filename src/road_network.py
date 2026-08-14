@@ -37,6 +37,15 @@ class RoadNetwork:
     node_connections: dict = field(default_factory=dict)  # node_id -> [segment_indices]
     node_degree: dict = field(default_factory=dict)       # node_id -> connection count
     node_max_width: dict = field(default_factory=dict)    # node_id -> (half_width_px, highway)
+    start_points: dict = field(default_factory=dict)      # name -> (x, y, heading, seg_idx, forward)
+
+    def get_start_point(self, name: str) -> tuple[float, float, float, int, bool]:
+        """Look up a named, deterministic start point (defined by synthetic
+        test maps). Returns (x, y, heading, seg_idx, forward)."""
+        if name not in self.start_points:
+            available = ", ".join(sorted(self.start_points.keys())) or "(none defined)"
+            raise KeyError(f"No start point named '{name}'. Available: {available}")
+        return self.start_points[name]
 
     # --- Construction ---
 

@@ -50,6 +50,16 @@ class TurnTester:
         requests.post(f"{API_URL}/teleport", json={'random': True})
         time.sleep(0.3)  # Wait for teleport to complete
     
+    def teleport_to_start_point(self, name: str):
+        """Teleport to a deterministic named start point (synthetic test maps)."""
+        requests.post(f"{API_URL}/teleport", json={'start_point': name})
+        time.sleep(0.3)  # Wait for teleport to complete
+    
+    def get_start_points(self) -> dict:
+        """List available deterministic start points from the loaded map."""
+        response = requests.get(f"{API_URL}/start_points")
+        return response.json()
+    
     def save_violation_screenshot(self, test_name: str, state: dict):
         """Save screenshot when violation detected."""
         try:
@@ -64,28 +74,35 @@ class TurnTester:
             print(f"      ⚠️  Screenshot failed: {e}")
         return None
     
-    def monitor_turn(self, direction: str, duration: float = 15.0, target_speed: float = 50.0) -> dict:
+    def monitor_turn(self, direction: str, duration: float = 15.0, target_speed: float = 50.0,
+                      start_point: str | None = None) -> dict:
         """Monitor a turn for violations.
         
         Args:
             direction: "left" or "right"
             duration: Maximum time to monitor (seconds)
             target_speed: Target speed in km/h
+            start_point: If given, teleport to this deterministic named start
+                point (synthetic test map) instead of a random location.
         
         Returns:
             dict with test results
         """
         print(f"\n{'='*60}")
-        print(f"Testing {direction.upper()} Turn")
+        print(f"Testing {direction.upper()} Turn" + (f" @ '{start_point}'" if start_point else ""))
         print(f"{'='*60}")
         
         # Reset and enable breadcrumbs for visual debugging
         self.reset_controls()
         requests.post(f"{API_URL}/toggle", json={'breadcrumbs': True})
         
-        # Teleport to random location
-        print("📍 Teleporting to random location...")
-        self.teleport_random()
+        # Teleport to a deterministic start point if given, else random location
+        if start_point:
+            print(f"📍 Teleporting to named start point '{start_point}'...")
+            self.teleport_to_start_point(start_point)
+        else:
+            print("📍 Teleporting to random location...")
+            self.teleport_random()
         
         state = self.get_state()
         initial_segment = state['segment']
@@ -97,8 +114,11 @@ class TurnTester:
         
         # Accelerate to target speed
         print(f"🚗 Accelerating to {target_speed:.0f} km/h...")
-        blinker_key = 'blinker_left' if direction == 'left' else 'blinker_right'
-        self.send_control(accelerate=True, **{blinker_key: True})
+        if direction == 'straight':
+            self.send_control(accelerate=True)
+        else:
+            blinker_key = 'blinker_left' if direction == 'left' else 'blinker_right'
+            self.send_control(accelerate=True, **{blinker_key: True})
         
         # Wait to reach speed
         for _ in range(50):  # 5 seconds max
@@ -220,6 +240,7 @@ class TurnTester:
         
         # Prepare results
         result = {
+            'start_point': start_point,
             'direction': direction,
             'target_speed_kmh': target_speed,
             'frames_checked': frames_checked,
@@ -256,10 +277,12 @@ class TurnTester:
         
         return result
     
-    def run_comprehensive_test(self):
-        """Run full test suite with multiple speeds and directions."""
+    def run_random_test(self):
+        """Run full test suite with multiple speeds and directions,
+        teleporting to random locations on whatever map is loaded
+        (real OSM data or a synthetic test map)."""
         print("\n" + "="*60)
-        print("COMPREHENSIVE TURN TESTING")
+        print("RANDOM-LOCATION TURN TESTING")
         print("="*60)
         print("\nTesting turns at different speeds:")
         print("  - Low speed:  30 km/h")
@@ -300,6 +323,70 @@ class TurnTester:
         # Final summary
         self.print_summary()
     
+    def run_deterministic_test(self):
+        """Run the turn test suite against KNOWN, reproducible scenarios
+        from the 'basic' synthetic test map (see src/test_maps.py).
+        Requires the game to be started with: --map basic --api
+        """
+        print("\n" + "="*60)
+        print("DETERMINISTIC TURN TESTING (synthetic 'basic' map)")
+        print("="*60)
+
+        available = self.get_start_points()
+        if not available:
+            print("\n❌ No named start points reported by the API.")
+            print("   Start the game with: python -m src.main --map basic --api\n")
+            sys.exit(1)
+
+        print(f"\n{len(available)} named start points available on this map.")
+        print("\nEach test will:")
+        print("  1. Teleport to a KNOWN start point (exact position + heading)")
+        print("  2. Accelerate to target speed")
+        print("  3. Activate turn signal (or none, for 'straight')")
+        print("  4. Monitor turn execution")
+        print("  5. Check for off-road violations and instant heading snaps")
+        print("\n" + "="*60)
+
+        # (start_point, direction, speed_kmh)
+        tests = [
+            # 90-degree corners (the classic reported bug)
+            ('corner_right_entry', 'right', 30),
+            ('corner_right_entry', 'right', 50),
+            ('corner_right_entry', 'right', 80),
+            ('corner_left_entry', 'left', 30),
+            ('corner_left_entry', 'left', 50),
+            ('corner_left_entry', 'left', 80),
+            # T-junction (perpendicular 3-way)
+            ('tjunction_from_top', 'left', 50),
+            ('tjunction_from_top', 'right', 50),
+            # Y-intersection (shallow ~40 degree diverging angles)
+            ('y_from_stem', 'left', 50),
+            ('y_from_stem', 'right', 50),
+            # 4-way crossroads
+            ('crossroads_from_north', 'left', 50),
+            ('crossroads_from_north', 'right', 50),
+            ('crossroads_from_north', 'straight', 50),
+            # One-way street (legal direction)
+            ('oneway_entry', 'straight', 40),
+            # Simple curves (degree-2 nodes, no blinker needed)
+            ('s_curve', 'straight', 40),
+            ('hairpin_entry', 'straight', 20),
+            ('sweeping_curve', 'straight', 60),
+        ]
+
+        for i, (start_point, direction, speed) in enumerate(tests, 1):
+            print(f"\n\n{'#'*60}")
+            print(f"# TEST {i}/{len(tests)}: '{start_point}' -> {direction.upper()} @ {speed} km/h")
+            print(f"{'#'*60}")
+
+            self.monitor_turn(direction, duration=15.0, target_speed=speed, start_point=start_point)
+
+            if i < len(tests):
+                print("\n⏸️  Pausing 1s before next test...")
+                time.sleep(1)
+
+        self.print_summary()
+    
     def print_summary(self):
         """Print summary of all tests."""
         print("\n" + "="*60)
@@ -327,7 +414,8 @@ class TurnTester:
             print(f"{'─'*60}")
             for i, r in enumerate(snap_violations, 1):
                 v = r['violation_details']
-                print(f"\n{i}. {r['direction'].upper()} turn @ {r['target_speed_kmh']:.0f} km/h")
+                label = f" @ '{r['start_point']}'" if r.get('start_point') else ""
+                print(f"\n{i}. {r['direction'].upper()} turn{label} @ {r['target_speed_kmh']:.0f} km/h")
                 print(f"   Time: {v['time']:.2f}s")
                 print(f"   Heading change: {v['old_heading']:.1f}° → {v['new_heading']:.1f}° ({v['heading_change']:.1f}°)")
                 print(f"   Position: ({v['position'][0]:.0f}, {v['position'][1]:.0f})")
@@ -341,7 +429,8 @@ class TurnTester:
             print(f"{'─'*60}")
             for i, r in enumerate(offroad_violations, 1):
                 v = r['violation_details']
-                print(f"\n{i}. {r['direction'].upper()} turn @ {r['target_speed_kmh']:.0f} km/h")
+                label = f" @ '{r['start_point']}'" if r.get('start_point') else ""
+                print(f"\n{i}. {r['direction'].upper()} turn{label} @ {r['target_speed_kmh']:.0f} km/h")
                 print(f"   Time: {v['time']:.2f}s")
                 print(f"   Position: ({v['position'][0]:.0f}, {v['position'][1]:.0f})")
                 print(f"   Speed: {v['speed_kmh']:.0f} km/h")
@@ -362,14 +451,37 @@ class TurnTester:
 
 
 def main():
-    """Run turn tests."""
+    """Run turn tests.
+    
+    By default, runs the DETERMINISTIC suite against the synthetic
+    'basic' test map (start the game with: --map basic --api).
+    
+    Pass --random to instead teleport to random locations on whatever
+    map is currently loaded (real OSM data or a test map).
+    
+    Pass --only <start_point> <direction> <speed_kmh> to run a SINGLE
+    scenario directly instead of the whole suite (much faster when
+    debugging one known-failing case):
+    
+        python tests/test_turning.py --only corner_right_entry right 120
+    """
     tester = TurnTester()
     
     if not tester.health_check():
         sys.exit(1)
     
     try:
-        tester.run_comprehensive_test()
+        if '--only' in sys.argv:
+            idx = sys.argv.index('--only')
+            start_point = sys.argv[idx + 1]
+            direction = sys.argv[idx + 2]
+            speed = float(sys.argv[idx + 3])
+            tester.monitor_turn(direction, duration=15.0, target_speed=speed, start_point=start_point)
+            tester.print_summary()
+        elif '--random' in sys.argv:
+            tester.run_random_test()
+        else:
+            tester.run_deterministic_test()
         
         # Exit code: 0 if all passed, 1 if any failed
         all_passed = all(r['passed'] for r in tester.test_results)

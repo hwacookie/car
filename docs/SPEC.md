@@ -624,6 +624,7 @@ python -m src.main
 | B | Toggle breadcrumb trail | Toggle breadcrumb trail |
 | R | Random location (teleport) | Random location (teleport) |
 | V | Toggle physics validator | Toggle physics validator |
+| ESC | Emergency stop + screenshot to clipboard | Emergency stop + screenshot to clipboard |
 | +/- | Zoom in/out | Zoom in/out |
 | Scroll | Zoom in/out | Zoom in/out |
 | Middle mouse | Pan map | Pan map |

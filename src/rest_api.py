@@ -69,12 +69,22 @@ class GameAPI:
         def teleport():
             """Teleport car to location.
             
-            Body: {"random": true} or {"segment": int, "progress": float}
+            Body: {"random": true}
+                  or {"start_point": "corner_right_entry"} (synthetic test maps only,
+                      see GET /start_points for available names)
             """
             data = request.get_json()
             with self.lock:
                 self.commands['teleport'] = data
             return jsonify({'ok': True, 'command': 'teleport', 'params': data})
+        
+        @self.app.route('/start_points', methods=['GET'])
+        def start_points():
+            """List named deterministic start points (synthetic test maps only).
+            Empty if the currently loaded map defines none (e.g. real OSM data).
+            """
+            with self.lock:
+                return jsonify(self.game_state.get('start_points', {}))
         
         @self.app.route('/toggle', methods=['POST'])
         def toggle():
