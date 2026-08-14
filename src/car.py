@@ -93,6 +93,8 @@ class Car:
             self.forward = diff < 90
             # Clear trail
             self.trail.clear()
+            # Skip watchdog for next few frames (intentional teleport)
+            self._frames_to_skip = 5
             print(f"\n🎲 Random location: Segment {seg_idx}, Pos ({self.x:.0f}, {self.y:.0f})\n")
         self._last_r = keys[pygame.K_r]
         
