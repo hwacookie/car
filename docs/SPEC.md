@@ -481,6 +481,7 @@ python -m src.main
 | C | Snap camera to car | Snap camera to car |
 | B | Toggle breadcrumb trail | Toggle breadcrumb trail |
 | R | Random location (teleport) | Random location (teleport) |
+| V | Toggle physics validator | Toggle physics validator |
 | +/- | Zoom in/out | Zoom in/out |
 | Scroll | Zoom in/out | Zoom in/out |
 | Middle mouse | Pan map | Pan map |
@@ -498,6 +499,41 @@ python -m src.main
    - HUD (speed, mode, indicators)
    - Minimap
 7. **Display**: Flip buffer (vsync at 60 Hz)
+
+## Physics Validator ("Physics Judge")
+
+**Independent validation system** that runs separately from car physics to detect constraint violations.
+
+### Architecture
+- **Separate class** (`PhysicsValidator`) - not embedded in `Car`
+- **Toggleable** with V key (enabled by default during development)
+- **Per-car state tracking** - supports multiple cars
+- **Performance-friendly** - disable for proven-good cars
+
+### Checks Performed
+1. **Teleportation detection**: Position jumps > 50m
+2. **Instant heading changes**: Rotations > 30° in one frame (RAILS mode)
+3. **Off-road violations**: Car leaving road in RAILS mode
+
+### Usage Pattern
+```python
+validator = PhysicsValidator(enabled=True)
+
+# Game loop:
+car.update(dt, network, control_input)
+validator.check(car, dt, network)  # Independent check
+
+# After intentional teleport:
+car.teleport_random(network)
+validator.reset_car_state(car)  # Skip next 5 frames
+```
+
+### Benefits
+- ✅ Separation of concerns (physics vs validation)
+- ✅ Can be disabled for performance
+- ✅ Re-enable when experimenting with new features
+- ✅ Works with multiple cars
+- ✅ Easy to extend with new checks
 
 ## Debug Features
 

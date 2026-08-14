@@ -119,9 +119,9 @@ class Renderer:
 
         if font_large:
             # Mode indicator (top)
-            mode_color = (0, 200, 100) if car.mode == "rails" else (100, 150, 255)
-            mode_text = car.mode.upper()
-            txt_mode = font_unit.render(mode_text, True, mode_color)
+            driver_name = car.driver.get_name() if car.driver else "NONE"
+            mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
+            txt_mode = font_unit.render(driver_name, True, mode_color)
             surface.blit(txt_mode, (panel_x + 10, panel_y + 5))
             txt_hint = font_small.render("(TAB)", True, (100, 100, 100))
             surface.blit(txt_hint, (panel_x + 140, panel_y + 5))

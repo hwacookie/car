@@ -11,6 +11,8 @@ from .road_network import RoadNetwork
 from .camera import Camera
 from .renderer import Renderer
 from .car import Car
+from .driver import Driver, KeyboardDriver, AIDriver
+from .physics_validator import PhysicsValidator
 
 
 def main(smoke_test_frames: int = 0):
@@ -40,9 +42,14 @@ def main(smoke_test_frames: int = 0):
     # --- Build network ---
     network = RoadNetwork.from_osm_data(osm_data, bb["north"], bb["south"], bb["west"], bb["east"])
 
-    # --- Car on random road ---
+    # --- Car with AI driver on random road ---
     rx, ry, rh, seg_idx, node_id = network.random_road_point()
-    car = Car(rx, ry, rh, seg_idx)
+    driver = AIDriver()  # Start in RAILS mode
+    car = Car(rx, ry, rh, seg_idx, driver)
+    
+    # --- Physics validator (can be toggled with V key) ---
+    validator = PhysicsValidator(enabled=True)
+    print("Physics validator: ENABLED (press V to toggle)")
 
     # --- Camera + Renderer ---
     camera = Camera(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -82,20 +89,67 @@ def main(smoke_test_frames: int = 0):
         if keys[pygame.K_MINUS]:
             camera.zoom_out()
 
+        # Toggle driver mode with TAB
+        if keys[pygame.K_TAB] and not hasattr(main, '_last_tab'):
+            main._last_tab = False
+        if keys[pygame.K_TAB] and not main._last_tab:
+            if isinstance(car.driver, AIDriver):
+                car.driver = KeyboardDriver()
+            else:
+                car.driver = AIDriver()
+                car.snap_to_road(network)
+                car.target_speed = car.speed
+            print(f"Driving mode: {car.driver.get_name()}")
+        main._last_tab = keys[pygame.K_TAB]
+        
+        # Toggle breadcrumb trail with B
+        if keys[pygame.K_b] and not hasattr(main, '_last_b'):
+            main._last_b = False
+        if keys[pygame.K_b] and not main._last_b:
+            car.trail_enabled = not car.trail_enabled
+            print(f"Breadcrumb trail: {'ON' if car.trail_enabled else 'OFF'}")
+        main._last_b = keys[pygame.K_b]
+        
+        # Random location with R
+        if keys[pygame.K_r] and not hasattr(main, '_last_r'):
+            main._last_r = False
+        if keys[pygame.K_r] and not main._last_r:
+            car.teleport_random(network)
+            validator.reset_car_state(car)
+            print(f"\n🎲 Random location: Segment {car.seg_idx}, Pos ({car.x:.0f}, {car.y:.0f})\n")
+        main._last_r = keys[pygame.K_r]
+        
+        # Toggle physics validator with V
+        if keys[pygame.K_v] and not hasattr(main, '_last_v'):
+            main._last_v = False
+        if keys[pygame.K_v] and not main._last_v:
+            if validator.enabled:
+                validator.disable()
+            else:
+                validator.enable()
+        main._last_v = keys[pygame.K_v]
+        
+        # Snap camera to car with 'C' key
+        if keys[pygame.K_c]:
+            camera.snap_to(car.x, car.y, network.world_width, network.world_height)
+
         # In smoke test, simulate driving inputs
         if smoke_test_frames:
-            # accelerate for first half, then steer
             keys = _FakeKeys(accel=True, right=(frame > smoke_test_frames // 2))
 
-        # Car physics
-        car.handle_input(keys, dt, network)
+        # Get control input from driver
+        control_input = car.driver.get_control(car, network, dt, keys)
+        
+        # Update car physics
+        car.update(dt, network, control_input)
+        
+        # Run physics validation (independent check)
+        validator.check(car, dt, network)
 
-        # Free mode: enforce road boundaries and map edges
-        if car.mode == "free":
-            # Off-road check
-            if not network.is_on_road(car.x, car.y):
+        # Off-road check (FREE mode only)
+        if car.driver.get_name() == "FREE":
+            if not car.is_on_road(network):
                 car.speed = 0
-
             # Map edge check
             bounds = network.bounds
             if car.x < 0 or car.x > bounds[2] or car.y < 0 or car.y > bounds[3]:
@@ -106,10 +160,6 @@ def main(smoke_test_frames: int = 0):
         # Camera follow (only when moving)
         camera.update(car.x, car.y, network.world_width, network.world_height,
                       follow=car.speed > 0.1)
-
-        # Snap camera to car with 'C' key
-        if keys[pygame.K_c]:
-            camera.snap_to(car.x, car.y, network.world_width, network.world_height)
 
         # Render
         screen.fill(BG_COLOR)
