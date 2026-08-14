@@ -7,6 +7,7 @@ import math
 import pygame
 
 from . import config
+from .turning_system import TurningSystem, TurnPlan
 
 
 class Car:
@@ -30,6 +31,10 @@ class Car:
         
         # Driver controlling this car
         self.driver = driver
+        
+        # Turning system
+        self.turning_system = TurningSystem(max_lateral_accel=5.0)
+        self.active_turn: TurnPlan | None = None
         
         # Visual state
         self._braking = False
@@ -119,7 +124,7 @@ class Car:
     # --- RAILS Mode Physics ---
     
     def _update_rails_mode(self, dt: float, network, control_input: dict):
-        """Automatic road following mode."""
+        """Automatic road following mode with physics-based turning."""
         accel = control_input.get('accelerate', False)
         brake = control_input.get('brake', False)
         
@@ -141,12 +146,50 @@ class Car:
         
         # Move along road
         if self.speed > 0:
-            if self._heading_transition:
-                self._update_heading_transition(dt)
-            self._update_position_rails(dt, network)
+            # Check if we're currently executing a turn
+            if self.active_turn:
+                self._execute_active_turn(dt, network)
+            else:
+                # Normal segment following
+                self._update_position_rails(dt, network)
+    
+    def _execute_active_turn(self, dt: float, network):
+        """Execute current turn using circular arc."""
+        distance_m = self.speed * dt
+        
+        # Move along arc
+        x, y, heading, new_progress = self.turning_system.execute_turn(
+            self.active_turn, distance_m
+        )
+        
+        self.x = x
+        self.y = y
+        self.heading = heading
+        self.active_turn.progress = new_progress
+        
+        # Check if turn complete
+        if new_progress >= 1.0:
+            # Transition to next segment
+            self.seg_idx = self.active_turn.to_seg_idx
+            to_seg = network.segments[self.seg_idx]
+            
+            # Set direction on new segment
+            self.forward = (to_seg.start_node == self.active_turn.junction_node)
+            self.progress = 0.0 if self.forward else 1.0
+            
+            # Notify driver that turn completed
+            if self.driver and hasattr(self.driver, 'clear_blinker_if_turned'):
+                self.driver.clear_blinker_if_turned(
+                    self, network, 
+                    self.active_turn.from_seg_idx, 
+                    self.active_turn.to_seg_idx
+                )
+            
+            # Clear active turn
+            self.active_turn = None
     
     def _update_position_rails(self, dt: float, network):
-        """Move along current segment."""
+        """Move along current segment, checking for upcoming turns."""
         if self.seg_idx >= len(network.segments):
             return
         
@@ -154,6 +197,28 @@ class Car:
         distance_m = self.speed * dt
         distance_frac = distance_m / seg.length if seg.length > 0 else 0
         
+        # Check if approaching junction and should plan/execute turn
+        approaching_junction = False
+        junction_node = None
+        
+        if self.forward and self.progress > 0.7:
+            approaching_junction = True
+            junction_node = seg.end_node
+        elif not self.forward and self.progress < 0.3:
+            approaching_junction = True
+            junction_node = seg.start_node
+        
+        # Plan turn if approaching junction
+        if approaching_junction and junction_node and not hasattr(self, '_turn_planned_for_node'):
+            self._turn_planned_for_node = junction_node
+            self._check_and_plan_turn(network, junction_node)
+        
+        # Clear turn planning flag when far from junction
+        if hasattr(self, '_turn_planned_for_node'):
+            if (self.forward and self.progress < 0.5) or (not self.forward and self.progress > 0.5):
+                delattr(self, '_turn_planned_for_node')
+        
+        # Move along segment
         if self.forward:
             self.progress += distance_frac
         else:
@@ -187,11 +252,58 @@ class Car:
                 self.x += nx * lane_offset
                 self.y += ny * lane_offset
         
-        # Heading
+        # Heading (smooth from segment direction, will be overridden during turn)
         if self.forward:
             self.heading = math.degrees(math.atan2(dx, dy))
         else:
             self.heading = math.degrees(math.atan2(-dx, -dy))
+    
+    def _check_and_plan_turn(self, network, junction_node: str):
+        """Check if we should plan/execute a turn at upcoming junction."""
+        # Get turn intention from driver
+        if self.driver and hasattr(self.driver, 'pending_turn'):
+            turn = self.driver.pending_turn or "straight"
+        else:
+            turn = "straight"
+        
+        # Get next segment
+        next_seg_idx = network.choose_next_segment(self.seg_idx, junction_node, turn)
+        
+        if next_seg_idx is None or next_seg_idx == self.seg_idx:
+            return  # No valid turn or dead end
+        
+        # Plan the turn
+        turn_plan = self.turning_system.plan_turn(
+            self.x, self.y, self.speed,
+            self.seg_idx, next_seg_idx, junction_node,
+            network
+        )
+        
+        if not turn_plan:
+            return  # Can't plan turn
+        
+        # Check feasibility
+        seg = network.segments[self.seg_idx]
+        feasibility = self.turning_system.check_turn_feasible(
+            self.speed, self.progress, seg.length, turn_plan, self.forward
+        )
+        
+        if not feasibility['feasible']:
+            # Can't make turn - brake harder
+            # Note: actual braking happens in _update_rails_mode
+            print(f"⚠️  Turn too tight! Need to brake: current {self.speed * 3.6:.0f} km/h, need {feasibility['required_speed'] * 3.6:.0f} km/h")
+        elif feasibility['braking_required']:
+            # Need to brake (braking happens in main update loop)
+            pass
+        else:
+            # Turn is feasible - check if we should start it now
+            # Start turn a bit before junction for smoother entry
+            start_threshold = 0.9 if self.forward else 0.1
+            if (self.forward and self.progress >= start_threshold) or \
+               (not self.forward and self.progress <= start_threshold):
+                # Start the turn!
+                self.active_turn = turn_plan
+                print(f"🔄 Starting turn: {self.seg_idx} → {next_seg_idx}")
     
     def _handle_segment_end(self, network, node_id: str):
         """Handle reaching end of current segment."""
