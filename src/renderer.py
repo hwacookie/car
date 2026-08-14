@@ -101,9 +101,29 @@ class Renderer:
             pygame.draw.circle(surface, color, (int(sx2), int(sy2)), r)
 
     # --- Breadcrumb Trail ---
+    # Fixed rainbow sequence (oldest -> newest) applied to the most recent
+    # 10 breadcrumb arrows, so the direction of travel *and* recency are
+    # both visible at a glance. Older arrows fall back to plain white.
+    _RECENT_RAINBOW = [
+        (148, 0, 211),   # violet   (10th most recent / oldest of the batch)
+        (75, 0, 130),    # indigo
+        (0, 0, 255),     # blue
+        (0, 128, 255),   # azure
+        (0, 255, 255),   # cyan
+        (0, 255, 0),     # green
+        (255, 255, 0),   # yellow
+        (255, 165, 0),   # orange
+        (255, 69, 0),    # orange-red
+        (255, 0, 0),     # red      (most recent)
+    ]
+    
     def draw_trail(self, surface: pygame.Surface, car):
         """Draw the breadcrumb trail: small chevron ("v") arrows showing
         the car's heading at each recorded point, instead of plain dots.
+        
+        The most recent N points are colored with a fixed rainbow
+        sequence (oldest-of-the-recent-batch -> violet, most recent ->
+        red); everything older is drawn plain white.
         """
         if not hasattr(car, 'trail') or len(car.trail) < 2:
             return
@@ -112,7 +132,10 @@ class Renderer:
         arrow_len = 6 * zoom    # length of each arrow leg (screen px)
         arrow_half_w = 4 * zoom  # half-width of the chevron opening
         
-        for point in car.trail:
+        n = len(car.trail)
+        n_recent = len(self._RECENT_RAINBOW)
+        
+        for i, point in enumerate(car.trail):
             # Trail points are (x, y, heading); tolerate old (x, y) tuples too
             if len(point) == 3:
                 wx, wy, heading = point
@@ -134,8 +157,15 @@ class Renderer:
             left_x, left_y = back_x + px * arrow_half_w, back_y + py * arrow_half_w
             right_x, right_y = back_x - px * arrow_half_w, back_y - py * arrow_half_w
             
-            pygame.draw.line(surface, (0, 255, 255), (left_x, left_y), (tip_x, tip_y), 2)
-            pygame.draw.line(surface, (0, 255, 255), (right_x, right_y), (tip_x, tip_y), 2)
+            # Index from the end: 0 = most recent (last appended)
+            age = n - 1 - i
+            if age < n_recent:
+                color = self._RECENT_RAINBOW[n_recent - 1 - age]
+            else:
+                color = (255, 255, 255)
+            
+            pygame.draw.line(surface, color, (left_x, left_y), (tip_x, tip_y), 2)
+            pygame.draw.line(surface, color, (right_x, right_y), (tip_x, tip_y), 2)
 
     # --- HUD / Dashboard ---
     def draw_hud(self, surface: pygame.Surface, car):
