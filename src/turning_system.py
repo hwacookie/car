@@ -330,17 +330,25 @@ class TurningSystem:
         """
         pppm = config.PIXELS_PER_METER
         
+        # Get the two segments we're transitioning between
+        from_seg = network.segments[turn_plan.from_seg_idx]
+        to_seg = network.segments[turn_plan.to_seg_idx]
+        
+        # Use generous buffer at junctions (road width + extra margin)
+        buffer_margin = 5.0  # Extra 5 meters beyond road edge
+        
         failed_points = []
         
         for i in range(num_samples + 1):
             progress = i / num_samples
             x, y, _ = turn_plan.get_point_on_arc(progress)
             
-            # Check if this point is on ANY road segment (not just from/to)
+            # Check if point is near EITHER from_seg OR to_seg with generous buffer
             on_road = False
             
-            for seg in network.segments:
-                half_width = (seg.width / 2) * pppm
+            for seg in [from_seg, to_seg]:
+                # Use generous buffer = half width + margin
+                buffer = (seg.width / 2 + buffer_margin) * pppm
                 
                 # Point-to-segment distance
                 dx = seg.x2 - seg.x1
@@ -349,12 +357,13 @@ class TurningSystem:
                 if length_sq == 0:
                     continue
                 
+                # Project point onto segment
                 t = max(0, min(1, ((x - seg.x1) * dx + (y - seg.y1) * dy) / length_sq))
                 proj_x = seg.x1 + t * dx
                 proj_y = seg.y1 + t * dy
                 dist = math.hypot(x - proj_x, y - proj_y)
                 
-                if dist <= half_width:
+                if dist <= buffer:
                     on_road = True
                     break
             
