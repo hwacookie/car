@@ -116,6 +116,9 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 - **Centripetal force**: `F = mv²/r` → faster speed requires wider radius
 
 #### Speed-Based Turning Radius
+
+**Design constraint** (not validated after the fact): Maximum lateral acceleration determines turning radius.
+
 | Speed | Required Turning Radius |
 |-------|-------------------------|
 | 20-30 km/h | 5-10 m (tight turn) |
@@ -123,6 +126,10 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 | 80+ km/h | 30-50 m (wide turn) |
 
 **Formula**: `radius = k × speed²` (where k is tuned for realistic feel)
+
+**Physics**: Centripetal force `F = mv²/r` means faster speed requires wider radius to keep lateral acceleration within design limits.
+
+**Note**: This is a **design constraint** for the turning system (how we calculate turns), NOT a validation check. External forces (collisions, explosions) CAN exceed this limit—that's physically possible!
 
 #### Geometry-Based Turn Validation
 
@@ -502,7 +509,25 @@ python -m src.main
 
 ## Physics Validator ("Physics Judge")
 
-**Independent validation system** that runs separately from car physics to detect constraint violations.
+**Independent validation system** that runs separately from car physics to detect **hard physics constraint violations**.
+
+### Philosophy: Hard Invariants Only
+
+PhysicsValidator checks **only constraints that can NEVER be violated** by the laws of physics:
+
+✅ **Checked** (always impossible):
+- Position discontinuity (teleportation)
+- Rotation discontinuity (instant heading snap)
+- Solid object overlap (collisions)
+- Going through solid boundaries (off-road)
+
+❌ **NOT Checked** (can be exceeded by external forces):
+- Maximum lateral acceleration (lorry crash can exceed this!)
+- Maximum speed (external forces can push car faster)
+- Speed limits (traffic rule, not physics)
+- Lane discipline (design preference, not physics law)
+
+**Key insight**: If a lorry crashes into a car sideways, the car CAN experience huge lateral acceleration. This is physically possible! So it's NOT a validation check—it's a **design constraint** used during turning calculation.
 
 ### Architecture
 - **Separate class** (`PhysicsValidator`) - not embedded in `Car`
@@ -510,10 +535,22 @@ python -m src.main
 - **Per-car state tracking** - supports multiple cars
 - **Performance-friendly** - disable for proven-good cars
 
-### Checks Performed
+### Current Checks
 1. **Teleportation detection**: Position jumps > 50m
 2. **Instant heading changes**: Rotations > 30° in one frame (RAILS mode)
 3. **Off-road violations**: Car leaving road in RAILS mode
+4. **Collision detection**: (TODO) Two cars occupying same space
+
+### Future: TrafficPolice Class
+
+For **traffic rules** (not physics), we'll create a separate `TrafficPolice` class:
+- Speed limit violations 🚔
+- Red light running 🚦
+- Stop sign violations 🛑
+- One-way street violations ➡️
+- Lane discipline checks
+
+These are **legal constraints**, not physics constraints.
 
 ### Usage Pattern
 ```python
