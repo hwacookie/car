@@ -23,6 +23,33 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 
 ## Architecture
 
+### Class Structure
+
+```
+Main Game Loop (src/main.py)
+  ├─ RoadNetwork (spatial queries, graph)
+  ├─ Camera (viewport, zoom, pan)
+  ├─ Renderer (roads, HUD, minimap)
+  ├─ Car (physics, state)
+  │   ├─ Driver (control interface)
+  │   │   ├─ KeyboardDriver (FREE mode)
+  │   │   └─ AIDriver (RAILS mode)
+  │   └─ TurningSystem (arc geometry)
+  ├─ PhysicsValidator (constraint checking)
+  └─ GameAPI (REST server, optional)
+
+Driver → Car.update(control_input) → PhysicsValidator.check()
+```
+
+**Separation of Concerns:**
+- **Car**: Pure physics and state (no input handling)
+- **Driver**: Control logic (keyboard or AI)
+- **TurningSystem**: Geometry calculations (arc planning)
+- **PhysicsValidator**: Constraint validation (teleportation, snaps, off-road)
+- **GameAPI**: Remote control interface (optional, thread-safe)
+
+### Visual Layout
+
 ```
 ┌─────────────────────────────────────────────┐
 │                  Pygame Window               │
@@ -408,47 +435,85 @@ car/
 ## Implementation Status
 
 ### ✅ Completed Features
+
+#### Core Systems
 - [x] PostgreSQL OSM data loader (Brandenburg schema)
 - [x] Road network graph with node degrees & connections
 - [x] Direct polygon rendering (no pixelation on zoom)
+- [x] Camera follow & manual pan/zoom
+- [x] Minimap with viewport indicator
+- [x] Service road width (3.5m fixed)
+- [x] Endpoint snapping (8m threshold)
+
+#### Car & Physics
+- [x] **Driver class architecture** (Keyboard, AI drivers)
+- [x] **Car class** (pure physics, no input handling)
 - [x] Car physics with two modes (FREE/RAILS)
 - [x] Automatic road following (RAILS mode)
 - [x] Turn signals & intelligent blinker logic
 - [x] Automatic braking with physics-based distance calculation
 - [x] "Rechts vor links" junction logic
-- [x] HUD with speed, mode, and status indicators
-- [x] Minimap with viewport indicator
-- [x] Camera follow & manual pan/zoom
-- [x] Headlights & taillights (brake lights)
-- [x] Blinker visualization
 - [x] Dead-end handling (180° turn)
-- [x] Teleportation watchdog (bug detection)
-- [x] Service road width (3.5m fixed)
-- [x] Endpoint snapping (8m threshold)
 - [x] Off-road detection (FREE mode)
-- [x] Breadcrumb trail (cyan dots showing driven path)
+- [x] **TurningSystem class** (circular arc physics - in development)
+
+#### Visual & UI
+- [x] **Professional SVG car sprite** (windows, mirrors, wheels)
+- [x] **Sprite scaling** based on zoom and car dimensions
+- [x] **HUD with PIL text rendering** (speed, mode, indicators)
+- [x] Speedometer arc (0-180 km/h)
+- [x] Blinker visualization (flashing orange)
+- [x] **Breadcrumb trail** (toggleable with B key)
+- [x] Mode indicator (RAILS/FREE)
+
+#### Debugging & Validation
+- [x] **PhysicsValidator class** (independent "physics judge")
+  - Teleportation detection (>50m jumps)
+  - Instant heading snap detection (>30° per frame)
+  - Off-road detection (RAILS mode)
+  - Toggleable with V key
+- [x] Debug keys (B=breadcrumbs, R=random location, V=validator)
+
+#### Testing & API
+- [x] **REST API** for remote control (Flask, 10+ endpoints)
+  - GET /state - real-time game state
+  - POST /control - send input commands
+  - POST /teleport - move car
+  - GET /screenshot - capture frame
+  - Full thread-safe integration
+- [x] **Automated test suite**
+  - test_api.py - basic API tests
+  - test_turning.py - comprehensive turn tests (6 scenarios)
+  - Instant snap detection (>30° changes)
+  - Off-road violation detection
+  - Screenshot capture on failure
 - [x] 10 unit tests passing
 
 ### 🚧 In Progress
-- [ ] **Realistic turning physics** (circular arc, geometry-based)
-  - Speed-dependent turning radius
-  - Geometry validation (arc must fit within road)
-  - Smooth rotation at all nodes (degree 2, 3, 4+)
-  - Miss turn if cannot brake in time
-  - Always stay on road (strict constraint)
+- [ ] **Realistic turning physics** (circular arc with validation)
+  - Speed-dependent turning radius ✅ (implemented)
+  - Arc geometry calculation ✅ (implemented)
+  - Generous junction buffer ✅ (implemented)
+  - **Issue**: Arcs planned but instant snaps still occur
+  - **Test status**: 5/6 pass, 1/6 fail (118.4° snap)
+  - Need to debug why arc execution isn't happening
 
 ### 🐛 Known Issues
-- **RAILS mode turns go off-road**: Current Bezier curve implementation cuts corners
-- **Instant heading changes**: At degree-2 nodes, heading snaps instead of smooth rotation
-- **Unrealistic braking**: Brakes by angle, not by geometry constraints
+- **Instant heading snaps**: Detected by tests (>30° in one frame)
+  - Occurs at segment transitions
+  - Arc system exists but not being used consistently
+  - Test suite successfully detects violations
+- **Pygame font module broken**: Worked around with PIL text rendering
+- **Pygame PNG support missing**: Worked around with PIL image loading
 
 ### 🔮 Future Enhancements
+- Multiple AI cars (infrastructure ready - Driver class supports it)
 - Building footprints from OSM `building` polygons
 - Road surface textures (asphalt, cobblestone)
 - Road markings (center lines, crosswalks)
 - Traffic signs
+- TrafficPolice class (speed limits, traffic rules)
 - Day/night cycle with dynamic lighting
-- Multiple cars / traffic simulation
 - Sound effects (engine, brakes)
 - Anti-aliasing via pygame.gfxdraw
 
@@ -463,8 +528,78 @@ car/
 
 ### Unit Tests
 ```bash
-python -m pytest tests/
+python -m pytest tests/test_road_network.py
 ```
+10 unit tests covering:
+- Lat/lon to world coordinate projection
+- Spatial queries (nearest road)
+- Snapping logic
+
+### REST API Tests
+```bash
+# Terminal 1: Start game with API
+python -m src.main --api
+
+# Terminal 2: Run tests
+python tests/test_api.py
+```
+
+Tests:
+- Health check
+- Basic driving (accelerate, brake, coast)
+- Turn monitoring (off-road detection)
+- Screenshot capture
+
+### Comprehensive Turn Tests
+```bash
+# Terminal 1: Start game with API
+python -m src.main --api
+
+# Terminal 2: Run turn tests
+python tests/test_turning.py
+```
+
+Tests 6 scenarios:
+1. RIGHT turn @ 30 km/h
+2. LEFT turn @ 30 km/h
+3. RIGHT turn @ 50 km/h
+4. LEFT turn @ 50 km/h
+5. RIGHT turn @ 80 km/h
+6. LEFT turn @ 80 km/h
+
+Each test:
+- Teleports to random location
+- Accelerates to target speed
+- Activates turn signal
+- Monitors every frame for:
+  * Off-road violations
+  * Instant heading snaps (>30°)
+  * Smooth circular arc progression
+- Captures screenshot on violation
+- Reports detailed metrics
+
+**Current Results**: 5/6 pass, 1/6 fail (instant snap detected)
+
+### REST API Endpoints
+
+Start with `--api` flag:
+```bash
+python -m src.main --api
+```
+
+API runs on http://localhost:5000
+
+Endpoints:
+- `GET /health` - Health check
+- `GET /state` - Current game state (position, speed, on_road, etc.)
+- `POST /control` - Send control inputs (accelerate, brake, steer, blinkers)
+- `POST /reset` - Reset all controls
+- `POST /teleport` - Move car (random or specific location)
+- `POST /toggle` - Toggle features (breadcrumbs, validator, mode)
+- `GET /screenshot` - Capture current frame as PNG
+- `POST /wait` - Wait for condition (segment change, speed, etc.)
+
+See `docs/REST_API.md` for full documentation.
 
 ### Smoke Test
 ```bash
@@ -620,5 +755,7 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 ---
 
 **Last Updated**: 2026-01-10  
-**Status**: 🚧 In active development - implementing realistic turning physics  
-**Version**: 0.9 (playable, physics improvements in progress)
+**Status**: 🚧 Active development - debugging arc turning system  
+**Version**: 0.95 (fully playable, comprehensive test suite, professional sprite, REST API)  
+**Test Results**: 5/6 turn tests passing (1 instant snap detected)  
+**Lines of Code**: ~6000 lines (including 982 lines of test infrastructure)
