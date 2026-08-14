@@ -14,10 +14,18 @@ class PhysicsValidator:
     Detects violations:
     - Teleportation (position jumps)
     - Instant heading changes (>30° in one frame)
+    - Rotating in place (heading changes without any position change —
+      a car has a nonzero turning radius, so ANY rotation must be
+      accompanied by translation; this is a hard invariant, checked
+      every single frame, not a heuristic)
     - Off-road driving (RAILS mode only)
     
     Can be enabled/disabled per car for performance.
     """
+    
+    # "Rotation requires movement" tolerances (floating-point noise only)
+    HEADING_EPSILON_DEG = 0.05
+    DISTANCE_EPSILON_M = 0.001
     
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
@@ -76,7 +84,14 @@ class PhysicsValidator:
         if car.driver and car.driver.get_name() == "RAILS":
             self._check_heading_snap(car, old_heading)
         
-        # Check 3: Off-road in RAILS mode
+        # Check 3: Rotating in place (heading changed but position didn't)
+        # Hard invariant: a car has a nonzero turning radius, so it can
+        # only be a spot-turn if it's not actually moving. Checked every
+        # frame directly — no heuristics, no thresholds beyond float noise.
+        if car.driver and car.driver.get_name() == "RAILS":
+            self._check_rotation_requires_movement(car, old_x, old_y, old_heading)
+        
+        # Check 4: Off-road in RAILS mode
         if car.driver and car.driver.get_name() == "RAILS":
             self._check_off_road(car, network)
         
@@ -158,6 +173,43 @@ class PhysicsValidator:
             print(error_msg)
             traceback.print_stack()
             # Don't raise - just warn for now
+    
+    def _check_rotation_requires_movement(self, car, old_x: float, old_y: float, old_heading: float):
+        """Hard invariant: a car cannot change heading without also
+        changing position. It has a nonzero turning radius (r > 0), so
+        rotating by any angle theta necessarily sweeps an arc of length
+        r*theta > 0 — there is no such thing as a car turning "on the
+        spot". If heading changed but position didn't, something in the
+        simulation computed an impossible motion (e.g. a buggy arc whose
+        position and heading updates got out of sync).
+        
+        Checked directly every frame — no thresholds beyond floating-point
+        noise, no rolling windows, no heuristics.
+        """
+        heading_diff = abs((car.heading - old_heading + 180) % 360 - 180)
+        distance_moved_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
+        
+        if heading_diff > self.HEADING_EPSILON_DEG and distance_moved_m < self.DISTANCE_EPSILON_M:
+            import traceback
+            error_msg = (
+                f"\n{'='*70}\n"
+                f"⚠️  ROTATING IN PLACE DETECTED (impossible)!\n"
+                f"{'='*70}\n"
+                f"Heading changed by {heading_diff:.2f}° but position moved only "
+                f"{distance_moved_m*1000:.2f}mm.\n"
+                f"A car has a nonzero turning radius — it cannot rotate without\n"
+                f"also translating. This means position/heading updates fell\n"
+                f"out of sync somewhere in the simulation.\n"
+                f"Old position: ({old_x:.1f}, {old_y:.1f}), heading {old_heading:.1f}°\n"
+                f"New position: ({car.x:.1f}, {car.y:.1f}), heading {car.heading:.1f}°\n"
+                f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
+                f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
+                f"Driver: {car.driver.get_name()}\n"
+                f"{'='*70}\n"
+            )
+            print(error_msg)
+            traceback.print_stack()
+            raise RuntimeError(error_msg)
     
     def reset_car_state(self, car):
         """Clear stored state for a car (after manual teleport, etc)."""
