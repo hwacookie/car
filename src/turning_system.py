@@ -167,8 +167,11 @@ class TurningSystem:
         # Try multiple radii to find one that fits
         pppm = config.PIXELS_PER_METER
         
+        print(f"\n🔍 Planning turn {from_seg_idx} → {to_seg_idx}, angle={math.degrees(turn_angle):.1f}°, speed={car_speed * 3.6:.0f} km/h")
+        
         for radius_factor in [1.0, 1.2, 1.5, 2.0, 2.5]:
             test_radius = required_radius * radius_factor
+            print(f"  Trying radius: {test_radius:.1f}m (factor {radius_factor})")
             
             # Calculate arc center
             # Center is perpendicular to the FROM segment at the junction
@@ -223,10 +226,14 @@ class TurningSystem:
             )
             
             # VALIDATE: Check if entire arc stays on road
-            if self.validate_arc_on_road(candidate, network, num_samples=20):
+            if self.validate_arc_on_road(candidate, network, num_samples=20, debug=True):
+                print(f"  ✅ Arc validated! Using radius {test_radius:.1f}m")
                 return candidate
+            else:
+                print(f"  ❌ Arc validation failed at radius {test_radius:.1f}m")
         
         # No valid arc found
+        print(f"  ⚠️ No valid arc found after trying all radii")
         return None
     
     def check_turn_feasible(
@@ -309,28 +316,30 @@ class TurningSystem:
         
         return x, y, heading, new_progress
     
-    def validate_arc_on_road(self, turn_plan: TurnPlan, network, num_samples: int = 10) -> bool:
+    def validate_arc_on_road(self, turn_plan: TurnPlan, network, num_samples: int = 10, debug: bool = False) -> bool:
         """Check if entire arc stays within road boundaries.
         
         Args:
             turn_plan: Turn to validate
             network: RoadNetwork instance
             num_samples: Number of points to check along arc
+            debug: Print debug info for failed points
         
         Returns:
             True if entire arc is on road, False otherwise
         """
         pppm = config.PIXELS_PER_METER
         
+        failed_points = []
+        
         for i in range(num_samples + 1):
             progress = i / num_samples
             x, y, _ = turn_plan.get_point_on_arc(progress)
             
-            # Check if this point is on either the from or to segment
+            # Check if this point is on ANY road segment (not just from/to)
             on_road = False
             
-            for seg_idx in [turn_plan.from_seg_idx, turn_plan.to_seg_idx]:
-                seg = network.segments[seg_idx]
+            for seg in network.segments:
                 half_width = (seg.width / 2) * pppm
                 
                 # Point-to-segment distance
@@ -350,6 +359,11 @@ class TurningSystem:
                     break
             
             if not on_road:
-                return False
+                failed_points.append((i, progress, x, y))
         
-        return True
+        if failed_points and debug:
+            print(f"    🚧 Arc validation failed at {len(failed_points)}/{num_samples+1} points:")
+            for idx, prog, px, py in failed_points[:3]:  # Show first 3
+                print(f"      Point {idx} (progress={prog:.2f}): ({px:.0f}, {py:.0f})")
+        
+        return len(failed_points) == 0
