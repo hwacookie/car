@@ -12,21 +12,42 @@ from .camera import Camera
 
 
 class Renderer:
+    # Cache of PIL fonts by size (class-level, shared across instances)
+    _pil_fonts: dict[int, object] = {}
+
     def __init__(self, network: RoadNetwork, camera: Camera):
         self.network = network
         self.camera = camera
-        self._font: pygame.font.Font | None = None
-        self._font_large: pygame.font.Font | None = None
-        self._font_unit: pygame.font.Font | None = None
-        try:
-            pygame.font.init()
-            self._font = pygame.font.SysFont("monospace", 14, bold=True)
-            self._font_large = pygame.font.SysFont("monospace", 42, bold=True)
-            self._font_unit = pygame.font.SysFont("monospace", 16)
-        except Exception:
-            self._font = None
-            self._font_large = None
-            self._font_unit = None
+        # Note: pygame.font is broken on some platforms (SDL_ttf import
+        # issue). All text rendering goes through PIL instead — see
+        # _text_surface() below.
+
+    @classmethod
+    def _get_pil_font(cls, size: int):
+        """Load (and cache) a PIL font at the given point size."""
+        from PIL import ImageFont
+        if size not in cls._pil_fonts:
+            try:
+                cls._pil_fonts[size] = ImageFont.truetype(
+                    "/System/Library/Fonts/Helvetica.ttc", size
+                )
+            except Exception:
+                cls._pil_fonts[size] = ImageFont.load_default()
+        return cls._pil_fonts[size]
+
+    def _text_surface(self, text: str, size: int, color: tuple[int, int, int]) -> pygame.Surface:
+        """Render text to a Pygame surface using PIL (pygame.font is unreliable)."""
+        from PIL import Image, ImageDraw
+        font = self._get_pil_font(size)
+        # Measure text bounding box
+        tmp = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        bbox = ImageDraw.Draw(tmp).textbbox((0, 0), text, font=font)
+        w = max(1, bbox[2] - bbox[0] + 2)
+        h = max(1, bbox[3] - bbox[1] + 2)
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.text((-bbox[0], -bbox[1]), text, fill=(*color, 255), font=font)
+        return pygame.image.fromstring(img.tobytes(), img.size, img.mode)
 
     def draw(self, surface: pygame.Surface, car):
         self.draw_roads(surface)
@@ -94,9 +115,6 @@ class Renderer:
     # --- HUD / Dashboard ---
     def draw_hud(self, surface: pygame.Surface, car):
         """Draw speedometer HUD in bottom-left corner of main window."""
-        from PIL import Image, ImageDraw, ImageFont
-        import io
-        
         # Panel background
         panel_w, panel_h = 220, 130
         panel_x, panel_y = 15, surface.get_height() - panel_h - 15
@@ -111,41 +129,16 @@ class Renderer:
         if kmh > 100:
             color = (255, 80, 80)
 
-        # Mode indicator (top) - using PIL
+        # Mode indicator (top)
         driver_name = car.driver.get_name() if car.driver else "NONE"
         mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
-        
-        # Create PIL image for text
-        text_img = Image.new('RGBA', (200, 100), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(text_img)
-        
-        try:
-            # Try to load a font
-            font_large = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 54)
-            font_medium = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
-            font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 12)
-        except:
-            # Fallback to default
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-            font_small = ImageFont.load_default()
-        
-        # Draw mode
-        draw.text((0, 0), driver_name, fill=mode_color, font=font_medium)
-        draw.text((110, 2), "(TAB)", fill=(100, 100, 100), font=font_small)
-        
-        # Draw speed number
-        draw.text((0, 25), f"{kmh}", fill=color, font=font_large)
-        
-        # Draw unit
-        draw.text((0, 75), "km/h", fill=(200, 200, 200), font=font_medium)
-        
-        # Convert PIL image to pygame surface
-        mode = text_img.mode
-        size = text_img.size
-        data = text_img.tobytes()
-        text_surf = pygame.image.fromstring(data, size, mode)
-        surface.blit(text_surf, (panel_x + 10, panel_y + 5))
+
+        surface.blit(self._text_surface(driver_name, 20, mode_color), (panel_x + 10, panel_y + 5))
+        surface.blit(self._text_surface("(TAB)", 12, (100, 100, 100)), (panel_x + 120, panel_y + 8))
+
+        # Speed number (large) + unit
+        surface.blit(self._text_surface(f"{kmh}", 54, color), (panel_x + 10, panel_y + 28))
+        surface.blit(self._text_surface("km/h", 20, (200, 200, 200)), (panel_x + 10, panel_y + 100))
 
         # Speedometer arc (right side of panel)
         cx = panel_x + 170
@@ -173,31 +166,29 @@ class Renderer:
             pygame.draw.circle(surface, c, (int(x), int(y)), 3)
 
         # Indicators: Brake (red), Accel (green), Blinkers (orange)
+        # Driver may expose braking/accelerating flags directly (Car) or
+        # blinker state indirectly (via car.driver for AIDriver).
         indicator_y = panel_y + 15
+        driver = getattr(car, 'driver', None)
+        blinker_left = getattr(driver, 'blinker_left', False)
+        blinker_right = getattr(driver, 'blinker_right', False)
+
         # Brake
-        if hasattr(car, '_braking') and car._braking:
+        if getattr(car, '_braking', False):
             pygame.draw.circle(surface, (255, 0, 0), (panel_x + panel_w - 25, indicator_y), 5)
-            if font_small:
-                txt = font_small.render("B", True, (255, 255, 255))
-                surface.blit(txt, (panel_x + panel_w - 29, indicator_y - 6))
+            surface.blit(self._text_surface("B", 12, (255, 255, 255)), (panel_x + panel_w - 29, indicator_y - 7))
         # Accel
-        if hasattr(car, '_accelerating') and car._accelerating:
+        if getattr(car, '_accelerating', False):
             pygame.draw.circle(surface, (0, 255, 0), (panel_x + panel_w - 50, indicator_y), 5)
-            if font_small:
-                txt = font_small.render("A", True, (255, 255, 255))
-                surface.blit(txt, (panel_x + panel_w - 54, indicator_y - 6))
+            surface.blit(self._text_surface("A", 12, (255, 255, 255)), (panel_x + panel_w - 54, indicator_y - 7))
         # Blinker left
-        if hasattr(car, 'blinker_left') and car.blinker_left:
+        if blinker_left:
             pygame.draw.circle(surface, (255, 180, 0), (panel_x + panel_w - 75, indicator_y), 5)
-            if font_small:
-                txt = font_small.render("L", True, (255, 255, 255))
-                surface.blit(txt, (panel_x + panel_w - 78, indicator_y - 6))
+            surface.blit(self._text_surface("L", 12, (255, 255, 255)), (panel_x + panel_w - 78, indicator_y - 7))
         # Blinker right
-        if hasattr(car, 'blinker_right') and car.blinker_right:
+        if blinker_right:
             pygame.draw.circle(surface, (255, 180, 0), (panel_x + panel_w - 100, indicator_y), 5)
-            if font_small:
-                txt = font_small.render("R", True, (255, 255, 255))
-                surface.blit(txt, (panel_x + panel_w - 104, indicator_y - 6))
+            surface.blit(self._text_surface("R", 12, (255, 255, 255)), (panel_x + panel_w - 104, indicator_y - 7))
 
     # --- Minimap ---
     def draw_minimap(self, surface: pygame.Surface, car):
@@ -233,7 +224,5 @@ class Renderer:
         vp_y = mm_y + mm_h - (self.camera.y + (surface.get_height() / 2) / self.camera.zoom) * sy
         pygame.draw.rect(surface, (255, 255, 0), (int(vp_x), int(vp_y), int(vp_w), int(vp_h)), 2)
 
-        if self._font is not None:
-            speed_kmh = int(car.speed * 3.6)
-            txt = self._font.render(f"{speed_kmh} km/h", True, (255, 255, 255))
-            surface.blit(txt, (mm_x + 6, mm_y + mm_h - 22))
+        speed_kmh = int(car.speed * 3.6)
+        surface.blit(self._text_surface(f"{speed_kmh} km/h", 14, (255, 255, 255)), (mm_x + 6, mm_y + mm_h - 22))

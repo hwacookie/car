@@ -14,6 +14,7 @@ from .car import Car
 from .driver import Driver, KeyboardDriver, AIDriver
 from .physics_validator import PhysicsValidator
 from .rest_api import GameAPI
+from .test_maps import build_test_map, TEST_MAPS
 
 
 def main(smoke_test_frames: int = 0):
@@ -35,13 +36,24 @@ def main(smoke_test_frames: int = 0):
         ], capture_output=True)
 
     # --- Load road data ---
-    print("Loading OSM data…")
-    bb = BOUNDING_BOX
-    osm_data = fetch_osm_data(bb["north"], bb["south"], bb["west"], bb["east"])
-    print(f"  {len(osm_data['nodes'])} nodes, {len(osm_data['ways'])} ways")
+    map_name = None
+    if "--map" in sys.argv:
+        idx = sys.argv.index("--map")
+        if idx + 1 < len(sys.argv):
+            map_name = sys.argv[idx + 1]
 
-    # --- Build network ---
-    network = RoadNetwork.from_osm_data(osm_data, bb["north"], bb["south"], bb["west"], bb["east"])
+    if map_name:
+        print(f"Loading synthetic test map: '{map_name}'")
+        network = build_test_map(map_name)
+        print(f"  {len(network.nodes)} nodes, {len(network.segments)} segments")
+    else:
+        print("Loading OSM data…")
+        bb = BOUNDING_BOX
+        osm_data = fetch_osm_data(bb["north"], bb["south"], bb["west"], bb["east"])
+        print(f"  {len(osm_data['nodes'])} nodes, {len(osm_data['ways'])} ways")
+
+        # --- Build network ---
+        network = RoadNetwork.from_osm_data(osm_data, bb["north"], bb["south"], bb["west"], bb["east"])
 
     # --- Car with AI driver on random road ---
     rx, ry, rh, seg_idx, node_id = network.random_road_point()
