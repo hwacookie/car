@@ -440,32 +440,34 @@ class Car:
         sx, sy = int(sx), int(sy)
         scale = camera.zoom
         
-        # Load sprite (cached)
-        sprite = self._get_sprite(scale)
+        # Calculate desired size in screen pixels
+        # CAR_LENGTH and CAR_WIDTH are in meters
+        car_length_px = config.CAR_LENGTH * config.PIXELS_PER_METER * scale
+        car_width_px = config.CAR_WIDTH * config.PIXELS_PER_METER * scale
+        
+        # Load base sprite (high-res version)
+        base_sprite = self._get_base_sprite()
+        
+        # Scale sprite to match world dimensions
+        scaled_sprite = pygame.transform.scale(base_sprite, (int(car_width_px), int(car_length_px)))
         
         # Rotate sprite
-        rotated = pygame.transform.rotate(sprite, -self.heading)
+        rotated = pygame.transform.rotate(scaled_sprite, -self.heading)
         
         # Center and draw
         rect = rotated.get_rect(center=(sx, sy))
         surface.blit(rotated, rect)
         
-        # Draw dynamic lights on top (blinkers, brake lights)
+        # Draw dynamic lights on top (blinkers)
         if self.driver and self.driver.get_name() == "RAILS":
             self._draw_blinkers(surface, sx, sy, scale)
     
-    def _get_sprite(self, zoom: float) -> pygame.Surface:
-        """Load and cache car sprite at appropriate size for zoom level."""
+    def _get_base_sprite(self) -> pygame.Surface:
+        """Load and cache the base car sprite (high-res version)."""
         import os
         from PIL import Image
         
-        # Choose sprite size based on zoom
-        if zoom < 1.5:
-            sprite_file = 'car_32x64.png'
-        elif zoom < 3.0:
-            sprite_file = 'car_50x100.png'
-        else:
-            sprite_file = 'car_64x128.png'
+        sprite_file = 'car_64x128.png'  # Use high-res version as base
         
         # Check cache
         if sprite_file not in Car._sprite_cache:
@@ -482,7 +484,7 @@ class Car:
                 Car._sprite_cache[sprite_file] = surf
             else:
                 # Fallback: create simple colored rectangle if sprite not found
-                size = (32, 64) if '32' in sprite_file else (50, 100) if '50' in sprite_file else (64, 128)
+                size = (64, 128)
                 surf = pygame.Surface(size, pygame.SRCALPHA)
                 pygame.draw.rect(surf, (180, 30, 30), surf.get_rect())
                 Car._sprite_cache[sprite_file] = surf
