@@ -479,6 +479,8 @@ python -m src.main
 | D/→ | Steer right | Right blinker → turn right at junction |
 | TAB | → RAILS mode | → FREE mode |
 | C | Snap camera to car | Snap camera to car |
+| B | Toggle breadcrumb trail | Toggle breadcrumb trail |
+| R | Random location (teleport) | Random location (teleport) |
 | +/- | Zoom in/out | Zoom in/out |
 | Scroll | Zoom in/out | Zoom in/out |
 | Middle mouse | Pan map | Pan map |

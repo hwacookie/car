@@ -1,7 +1,7 @@
 # Car Entity
 # Two driving modes:
 #   1. FREE mode: manual steering (W/S = accel/brake, A/D = steer)
-#   2. RAILS mode: follow road automatically (W/S = accel/brake, A/D = blinker/turn at junctions)
+#   2. RAILS mode: follow road automatically with smooth Bezier curves at junctions
 # Press TAB to toggle between modes.
 
 from __future__ import annotations
@@ -38,16 +38,12 @@ class Car:
         self._blinker_timer = 0.0
         self._pending_turn = None  # "left", "right", or None
 
-        # Junction transition (for smooth turning)
-        self._in_junction = False
-        self._junction_from_seg = None
-        self._junction_to_seg = None
-        self._junction_progress = 0.0
-        self._junction_duration = 1.0  # will be recalculated per junction
-        self._junction_start_pos = (0.0, 0.0)
-        self._junction_end_pos = (0.0, 0.0)
-        self._junction_start_heading = 0.0
-        self._junction_end_heading = 0.0
+        # Smooth heading transition (instead of Bezier curves)
+        self._heading_transition = False
+        self._heading_transition_progress = 0.0
+        self._heading_start = 0.0
+        self._heading_target = 0.0
+        self._heading_transition_duration = 0.3  # 0.3 seconds for smooth turn
 
         # Visual state
         self._braking = False
@@ -56,12 +52,49 @@ class Car:
         self._last_right = False
         self._last_tab = False
 
+        # Breadcrumb trail for debugging (shows path driven)
+        self.trail = []  # List of (x, y) positions
+        self._trail_timer = 0.0
+        self._trail_enabled = False  # Toggle with 'B' key
+
     # --- Input & Physics ---
 
     def handle_input(self, keys: dict, dt: float, network):
         """Process keyboard input and update physics."""
         # Save old position for teleportation check
         old_x, old_y = self.x, self.y
+        
+        # Toggle breadcrumb trail with 'B' key
+        if keys[pygame.K_b] and not hasattr(self, '_last_b'):
+            self._last_b = False
+        if keys[pygame.K_b] and not self._last_b:
+            self._trail_enabled = not self._trail_enabled
+            print(f"Breadcrumb trail: {'ON' if self._trail_enabled else 'OFF'}")
+        self._last_b = keys[pygame.K_b]
+        
+        # Random location with 'R' key
+        if keys[pygame.K_r] and not hasattr(self, '_last_r'):
+            self._last_r = False
+        if keys[pygame.K_r] and not self._last_r:
+            rx, ry, rh, seg_idx, node_id = network.random_road_point()
+            self.x = rx
+            self.y = ry
+            self.heading = rh
+            self.seg_idx = seg_idx
+            self.progress = 0.5
+            self.speed = 0
+            self.target_speed = 0
+            # Determine forward direction
+            seg = network.segments[seg_idx]
+            dx = seg.x2 - seg.x1
+            dy = seg.y2 - seg.y1
+            seg_heading = math.degrees(math.atan2(dx, dy))
+            diff = abs((self.heading - seg_heading + 180) % 360 - 180)
+            self.forward = diff < 90
+            # Clear trail
+            self.trail.clear()
+            print(f"\n🎲 Random location: Segment {seg_idx}, Pos ({self.x:.0f}, {self.y:.0f})\n")
+        self._last_r = keys[pygame.K_r]
         
         # Toggle mode with TAB
         if keys[pygame.K_TAB] and not self._last_tab:
@@ -76,6 +109,20 @@ class Car:
             self._handle_free_mode(keys, dt)
         else:
             self._handle_rails_mode(keys, dt, network)
+        
+        # Add breadcrumb to trail every 0.1 seconds (if enabled)
+        if self._trail_enabled:
+            self._trail_timer += dt
+            if self._trail_timer >= 0.1:
+                self._trail_timer = 0.0
+                self.trail.append((self.x, self.y))
+                # Keep only last 500 points (50 seconds of trail)
+                if len(self.trail) > 500:
+                    self.trail.pop(0)
+                # Debug output: print speed in km/h
+                kmh = int(self.speed * 3.6)
+                mode_txt = "🚗 FREE" if self.mode == "free" else "🛤️  RAILS"
+                print(f"{mode_txt} | Speed: {kmh:3d} km/h | Pos: ({self.x:.0f}, {self.y:.0f}) | Seg: {self.seg_idx}"))
         
         # Watchdog: check for teleportation (skip first few frames for initial positioning)
         if self._frames_to_skip > 0:
@@ -187,9 +234,8 @@ class Car:
             # DIRECT braking: also immediately reduce speed when S is pressed
             self.speed -= config.CAR_BRAKING * dt
 
-        # Automatic braking before turns at real junctions (3+ connections)
-        # Only brake if "rechts vor links" applies (road from the right)
-        if self._pending_turn:
+        # Smoother automatic braking before turns (earlier, gentler)
+        if not self._in_junction and self._pending_turn:
             seg = network.segments[self.seg_idx]
             node = seg.end_node if self.forward else seg.start_node
             
@@ -199,13 +245,13 @@ class Car:
                 next_seg = network.choose_next_segment(self.seg_idx, node, self._pending_turn)
                 if next_seg is not None and next_seg != self.seg_idx:
                     turn_angle = abs(network.get_exit_angle(self.seg_idx, next_seg))
-                    # Determine safe turn speed based on angle
+                    # Smoother safe speeds
                     if turn_angle > 90:
-                        safe_speed = 20 / 3.6  # 20 km/h for sharp turns
+                        safe_speed = 25 / 3.6  # 25 km/h for sharp turns
                     elif turn_angle > 60:
-                        safe_speed = 30 / 3.6  # 30 km/h
-                    elif turn_angle > 30:
                         safe_speed = 40 / 3.6  # 40 km/h
+                    elif turn_angle > 30:
+                        safe_speed = 55 / 3.6  # 55 km/h
                     else:
                         safe_speed = self.target_speed  # gentle turn, no braking needed
 
@@ -219,39 +265,38 @@ class Car:
                     if self.speed > safe_speed:
                         braking_distance = (self.speed**2 - safe_speed**2) / (2 * config.CAR_BRAKING)
                         
-                        # Start braking when remaining distance <= braking distance + safety margin
-                        safety_margin = 5.0  # 5 meters buffer
+                        # Start braking EARLIER with margin
+                        safety_margin = 15.0  # 15 meters buffer (was 5)
                         if remaining_distance <= braking_distance + safety_margin:
-                            # Brake with FULL force (emergency braking for curves)
-                            self.speed -= config.CAR_BRAKING * dt
+                            # Gentler braking (60% of full force for smoother feel)
+                            self.speed -= config.CAR_BRAKING * dt * 0.6
                             self._braking = True
                         else:
-                            # Not yet time to brake - maintain target speed
+                            # Normal acceleration
                             if self.speed < self.target_speed:
                                 self.speed += config.CAR_ACCELERATION * dt
                             elif self.speed > self.target_speed:
                                 self.speed -= config.CAR_BRAKING * dt * 0.3
                     else:
-                        # Already at safe speed or below
+                        # Already at safe speed
                         if self.speed < self.target_speed:
                             self.speed += config.CAR_ACCELERATION * dt
                         elif self.speed > self.target_speed:
                             self.speed -= config.CAR_BRAKING * dt * 0.3
                 else:
-                    # No valid turn — just maintain speed
+                    # No valid turn
                     if self.speed < self.target_speed:
                         self.speed += config.CAR_ACCELERATION * dt
                     elif self.speed > self.target_speed:
                         self.speed -= config.CAR_BRAKING * dt * 0.3
             else:
                 # Not a real junction or no right-of-way conflict
-                # Don't brake, just maintain target speed
                 if self.speed < self.target_speed:
                     self.speed += config.CAR_ACCELERATION * dt
                 elif self.speed > self.target_speed:
                     self.speed -= config.CAR_BRAKING * dt * 0.3
         else:
-            # No turn pending — accelerate to target speed
+            # No turn pending
             if self.speed < self.target_speed:
                 self.speed += config.CAR_ACCELERATION * dt
             elif self.speed > self.target_speed:
@@ -262,9 +307,12 @@ class Car:
         # Move along the road
         if self.speed > 0:
             self._update_position_rails(dt, network)
+            # Update heading transition if active
+            if self._heading_transition:
+                self._update_heading_transition(dt)
 
     def _update_position_rails(self, dt: float, network):
-        """Move along current segment."""
+        """Move along current segment. Start Bezier curve for turns >20°."""
         if self.seg_idx >= len(network.segments):
             return
 
@@ -280,41 +328,41 @@ class Car:
         # Check if we reached end of segment
         if self.progress >= 1.0:
             node = seg.end_node
-            node_deg = network.node_degree.get(node, 2)
             turn = self._pending_turn or "straight"
             next_seg = network.choose_next_segment(self.seg_idx, node, turn)
             
             if next_seg is not None and next_seg != self.seg_idx:
-                # Calculate turn angle to determine if we actually turned
                 turn_angle = network.get_exit_angle(self.seg_idx, next_seg)
                 
-                # Switch to next segment
-                old_seg_idx = self.seg_idx
-                self.seg_idx = next_seg
-                new_seg = network.segments[next_seg]
-                self.forward = (new_seg.start_node == node)
-                
-                # Set progress to start/end of new segment (near the shared node)
-                if self.forward:
-                    self.progress = 0.0
+                # If turn is >20°, start smooth Bezier curve transition
+                if abs(turn_angle) > 20:
+                    self._start_bezier_junction(self.seg_idx, next_seg, node, turn_angle, network)
+                    # Clear blinker if turned in signaled direction
+                    if self.blinker_left and turn_angle < -30:
+                        self.blinker_left = False
+                        self._pending_turn = None
+                    elif self.blinker_right and turn_angle > 30:
+                        self.blinker_right = False
+                        self._pending_turn = None
                 else:
-                    self.progress = 1.0
-                
-                # Clear blinker ONLY if we actually turned in the blinked direction
-                if self.blinker_left and turn_angle < -30:  # Actually turned left
-                    self.blinker_left = False
-                    self._pending_turn = None
-                elif self.blinker_right and turn_angle > 30:  # Actually turned right
-                    self.blinker_right = False
-                    self._pending_turn = None
-                # Otherwise: keep blinker on (geradeaus or wrong direction available)
+                    # Small angle: direct transition
+                    self.seg_idx = next_seg
+                    new_seg = network.segments[next_seg]
+                    self.forward = (new_seg.start_node == node)
+                    self.progress = 0.0 if self.forward else 1.0
+                    # Clear blinker
+                    if self.blinker_left and turn_angle < -30:
+                        self.blinker_left = False
+                        self._pending_turn = None
+                    elif self.blinker_right and turn_angle > 30:
+                        self.blinker_right = False
+                        self._pending_turn = None
             else:
                 # Dead end - turn around 180° and stop
                 self.heading = (self.heading + 180) % 360
                 self.forward = not self.forward
                 self.progress = 0.9
                 self.speed = 0
-                # Clear blinker at dead end
                 self.blinker_left = False
                 self.blinker_right = False
                 self._pending_turn = None
@@ -325,28 +373,29 @@ class Car:
             next_seg = network.choose_next_segment(self.seg_idx, node, turn)
             
             if next_seg is not None and next_seg != self.seg_idx:
-                # Calculate turn angle
                 turn_angle = network.get_exit_angle(self.seg_idx, next_seg)
                 
-                self.seg_idx = next_seg
-                new_seg = network.segments[next_seg]
-                
-                if new_seg.start_node == node:
-                    self.forward = True
-                    self.progress = 0.0
+                if abs(turn_angle) > 20:
+                    self._start_bezier_junction(self.seg_idx, next_seg, node, turn_angle, network)
+                    if self.blinker_left and turn_angle < -30:
+                        self.blinker_left = False
+                        self._pending_turn = None
+                    elif self.blinker_right and turn_angle > 30:
+                        self.blinker_right = False
+                        self._pending_turn = None
                 else:
-                    self.forward = False
-                    self.progress = 1.0
-                
-                # Clear blinker ONLY if we actually turned in the blinked direction
-                if self.blinker_left and turn_angle < -30:  # Actually turned left
-                    self.blinker_left = False
-                    self._pending_turn = None
-                elif self.blinker_right and turn_angle > 30:  # Actually turned right
-                    self.blinker_right = False
-                    self._pending_turn = None
+                    self.seg_idx = next_seg
+                    new_seg = network.segments[next_seg]
+                    self.forward = (new_seg.start_node == node)
+                    self.progress = 0.0 if self.forward else 1.0
+                    if self.blinker_left and turn_angle < -30:
+                        self.blinker_left = False
+                        self._pending_turn = None
+                    elif self.blinker_right and turn_angle > 30:
+                        self.blinker_right = False
+                        self._pending_turn = None
             else:
-                # Dead end - turn around 180° and stop
+                # Dead end
                 self.heading = (self.heading + 180) % 360
                 self.forward = not self.forward
                 self.progress = 0.1
@@ -355,129 +404,128 @@ class Car:
                 self.blinker_right = False
                 self._pending_turn = None
 
-        # Update position on segment
-        seg = network.segments[self.seg_idx]
-        t = max(0.0, min(1.0, self.progress))
-        self.x = seg.x1 + t * (seg.x2 - seg.x1)
-        self.y = seg.y1 + t * (seg.y2 - seg.y1)
+        # Update position on segment (if not in junction)
+        if not self._in_junction:
+            seg = network.segments[self.seg_idx]
+            t = max(0.0, min(1.0, self.progress))
+            self.x = seg.x1 + t * (seg.x2 - seg.x1)
+            self.y = seg.y1 + t * (seg.y2 - seg.y1)
 
-        # Offset to right lane
+            # Offset to right lane
+            pppm = config.PIXELS_PER_METER
+            lane_offset = (seg.width / 4) * pppm if not seg.oneway else 0
+            dx = seg.x2 - seg.x1
+            dy = seg.y2 - seg.y1
+            seg_len = math.hypot(dx, dy)
+            if seg_len > 0:
+                nx = -dy / seg_len
+                ny = dx / seg_len
+                if self.forward:
+                    self.x -= nx * lane_offset
+                    self.y -= ny * lane_offset
+                else:
+                    self.x += nx * lane_offset
+                    self.y += ny * lane_offset
+
+            # Heading
+            if self.forward:
+                self.heading = math.degrees(math.atan2(dx, dy))
+            else:
+                self.heading = math.degrees(math.atan2(-dx, -dy))
+
+    def _start_bezier_junction(self, from_seg: int, to_seg: int, node_id: str, angle: float, network):
+        """Start smooth Bezier curve transition at junction."""
+        self._in_junction = True
+        self._junction_progress = 0.0
+        
+        # Start position: current car position (with lane offset)
+        self._junction_start_x = self.x
+        self._junction_start_y = self.y
+        self._junction_start_heading = self.heading
+        
+        # Target segment
+        self._junction_target_seg = to_seg
+        new_seg = network.segments[to_seg]
+        self._junction_target_forward = (new_seg.start_node == node_id)
+        
+        # End position: 5m into new segment (shorter curve, stays on road better)
         pppm = config.PIXELS_PER_METER
-        lane_offset = (seg.width / 4) * pppm if not seg.oneway else 0
-        dx = seg.x2 - seg.x1
-        dy = seg.y2 - seg.y1
+        dist_into_seg = min(5.0, new_seg.length * 0.2)  # 5m or 20% of segment
+        t_end = dist_into_seg / new_seg.length if new_seg.length > 0 else 0.1
+        
+        if self._junction_target_forward:
+            base_x = new_seg.x1 + (new_seg.x2 - new_seg.x1) * t_end
+            base_y = new_seg.y1 + (new_seg.y2 - new_seg.y1) * t_end
+            dx = new_seg.x2 - new_seg.x1
+            dy = new_seg.y2 - new_seg.y1
+            self._junction_end_heading = math.degrees(math.atan2(dx, dy))
+        else:
+            base_x = new_seg.x2 + (new_seg.x1 - new_seg.x2) * t_end
+            base_y = new_seg.y2 + (new_seg.y1 - new_seg.y2) * t_end
+            dx = new_seg.x1 - new_seg.x2
+            dy = new_seg.y1 - new_seg.y2
+            self._junction_end_heading = math.degrees(math.atan2(dx, dy))
+        
+        # Apply lane offset to end position
+        lane_offset = (new_seg.width / 4) * pppm if not new_seg.oneway else 0
         seg_len = math.hypot(dx, dy)
         if seg_len > 0:
             nx = -dy / seg_len
             ny = dx / seg_len
-            if self.forward:
-                self.x -= nx * lane_offset
-                self.y -= ny * lane_offset
+            if self._junction_target_forward:
+                self._junction_end_x = base_x - nx * lane_offset
+                self._junction_end_y = base_y - ny * lane_offset
             else:
-                self.x += nx * lane_offset
-                self.y += ny * lane_offset
-
-        # Heading
-        if self.forward:
-            self.heading = math.degrees(math.atan2(dx, dy))
+                self._junction_end_x = base_x + nx * lane_offset
+                self._junction_end_y = base_y + ny * lane_offset
         else:
-            self.heading = math.degrees(math.atan2(-dx, -dy))
+            self._junction_end_x = base_x
+            self._junction_end_y = base_y
+        
+        # Bezier control point: use the junction node itself for sharp, road-following curves
+        # This keeps the car ON the road instead of cutting corners
+        node_pos = network.nodes[node_id]
+        self._junction_control_x = node_pos[0]
+        self._junction_control_y = node_pos[1]
 
-    def _start_junction(self, from_idx: int, to_idx: int, node_id: str, network, turn_angle: float):
-        """Begin smooth junction transition."""
-        self._in_junction = True
-        self._junction_from_seg = from_idx
-        self._junction_to_seg = to_idx
-        self._junction_progress = 0.0
-
-        from_seg = network.segments[from_idx]
-        to_seg = network.segments[to_idx]
+    def _update_junction_bezier(self, dt: float, network):
+        """Move along Bezier curve through junction."""
+        # Duration depends on curve length and speed (roughly 0.5-1.5 seconds)
+        curve_length = math.hypot(self._junction_end_x - self._junction_start_x,
+                                   self._junction_end_y - self._junction_start_y)
         pppm = config.PIXELS_PER_METER
+        curve_length_m = curve_length / pppm
+        duration = max(0.5, min(1.5, curve_length_m / max(self.speed, 5.0)))
         
-        # Junction distance: shorter for sharper turns (5-8m)
-        if turn_angle > 90:
-            junction_dist_m = 5.0  # very tight turn
-        else:
-            junction_dist_m = 6.0  # sharp turn
+        self._junction_progress += dt / duration
         
-        # Duration based on current speed (distance / speed)
-        # But minimum 0.3s even at high speed, maximum 1.5s at low speed
-        self._junction_duration = max(0.3, min(1.5, junction_dist_m / max(self.speed, 3.0)))
-
-        # Start position: current position (already with lane offset)
-        self._junction_start_pos = (self.x, self.y)
-        self._junction_start_heading = self.heading
-
-        # End position: small distance into the new segment (with proper lane offset)
-        to_seg_len = to_seg.length
-        t_end = min(0.3, junction_dist_m / max(to_seg_len, 1.0))
-        
-        if to_seg.start_node == node_id:
-            # Going forward on new segment
-            base_x = to_seg.x1 + (to_seg.x2 - to_seg.x1) * t_end
-            base_y = to_seg.y1 + (to_seg.y2 - to_seg.y1) * t_end
-            
-            # Apply RIGHT lane offset
-            lane_offset = (to_seg.width / 4) * pppm if not to_seg.oneway else 0
-            dx = to_seg.x2 - to_seg.x1
-            dy = to_seg.y2 - to_seg.y1
-            seg_len = math.hypot(dx, dy)
-            if seg_len > 0:
-                nx = -dy / seg_len
-                ny = dx / seg_len
-                # RIGHT side = negative perpendicular when going forward
-                base_x -= nx * lane_offset
-                base_y -= ny * lane_offset
-            
-            self._junction_end_pos = (base_x, base_y)
-            self._junction_end_heading = math.degrees(math.atan2(dx, dy))
-            self.forward = True
-        else:
-            # Going backward on new segment
-            base_x = to_seg.x2 + (to_seg.x1 - to_seg.x2) * t_end
-            base_y = to_seg.y2 + (to_seg.y1 - to_seg.y2) * t_end
-            
-            # Apply RIGHT lane offset
-            lane_offset = (to_seg.width / 4) * pppm if not to_seg.oneway else 0
-            dx = to_seg.x1 - to_seg.x2
-            dy = to_seg.y1 - to_seg.y2
-            seg_len = math.hypot(dx, dy)
-            if seg_len > 0:
-                nx = -dy / seg_len
-                ny = dx / seg_len
-                # RIGHT side = positive perpendicular when going backward
-                base_x += nx * lane_offset
-                base_y += ny * lane_offset
-            
-            self._junction_end_pos = (base_x, base_y)
-            self._junction_end_heading = math.degrees(math.atan2(dx, dy))
-            self.forward = False
-
-    def _update_junction(self, dt: float, network):
-        """Smoothly interpolate through junction turn."""
-        # Use speed-based duration calculated in _start_junction
-        self._junction_progress += dt / self._junction_duration
-
         if self._junction_progress >= 1.0:
             # Finished junction
             self._in_junction = False
-            self.seg_idx = self._junction_to_seg
-            self.progress = min(0.3, 6.0 / max(network.segments[self._junction_to_seg].length, 1.0))
-            if not self.forward:
-                self.progress = 1.0 - self.progress
-            self.x = self._junction_end_pos[0]
-            self.y = self._junction_end_pos[1]
+            self.seg_idx = self._junction_target_seg
+            self.forward = self._junction_target_forward
+            new_seg = network.segments[self.seg_idx]
+            dist_into_seg = min(5.0, new_seg.length * 0.2)
+            self.progress = dist_into_seg / new_seg.length if self.forward else 1.0 - dist_into_seg / new_seg.length
+            self.x = self._junction_end_x
+            self.y = self._junction_end_y
             self.heading = self._junction_end_heading
         else:
-            # Smooth interpolation (ease-in-out)
+            # Quadratic Bezier interpolation
             t = self._junction_progress
-            t = t * t * (3 - 2 * t)  # smoothstep
-
-            # Position: linear interpolation
-            self.x = self._junction_start_pos[0] + t * (self._junction_end_pos[0] - self._junction_start_pos[0])
-            self.y = self._junction_start_pos[1] + t * (self._junction_end_pos[1] - self._junction_start_pos[1])
-
-            # Heading: interpolate angle (shortest path)
+            # Smoothstep for even smoother feel
+            t = t * t * (3 - 2 * t)
+            
+            # B(t) = (1-t)²P₀ + 2(1-t)tP₁ + t²P₂
+            one_minus_t = 1 - t
+            self.x = (one_minus_t * one_minus_t * self._junction_start_x +
+                     2 * one_minus_t * t * self._junction_control_x +
+                     t * t * self._junction_end_x)
+            self.y = (one_minus_t * one_minus_t * self._junction_start_y +
+                     2 * one_minus_t * t * self._junction_control_y +
+                     t * t * self._junction_end_y)
+            
+            # Heading: interpolate smoothly
             h1 = self._junction_start_heading
             h2 = self._junction_end_heading
             diff = h2 - h1

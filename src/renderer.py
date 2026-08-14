@@ -30,6 +30,7 @@ class Renderer:
 
     def draw(self, surface: pygame.Surface, car):
         self.draw_roads(surface)
+        self.draw_trail(surface, car)  # Draw breadcrumb trail
         self.draw_minimap(surface, car)
         self.draw_hud(surface, car)
 
@@ -78,6 +79,18 @@ class Renderer:
             pygame.draw.circle(surface, color, (int(sx1), int(sy1)), r)
             pygame.draw.circle(surface, color, (int(sx2), int(sy2)), r)
 
+    # --- Breadcrumb Trail ---
+    def draw_trail(self, surface: pygame.Surface, car):
+        """Draw the breadcrumb trail showing where the car has driven."""
+        if not hasattr(car, 'trail') or len(car.trail) < 2:
+            return
+        
+        # Draw small dots for each breadcrumb
+        for wx, wy in car.trail:
+            sx, sy = self.camera.world_to_screen(wx, wy)
+            # Draw a small cyan dot
+            pygame.draw.circle(surface, (0, 255, 255), (int(sx), int(sy)), 3)
+
     # --- HUD / Dashboard ---
     def draw_hud(self, surface: pygame.Surface, car):
         """Draw speedometer HUD in bottom-left corner of main window."""
@@ -97,8 +110,8 @@ class Renderer:
 
         # Use available fonts or create simple ones
         try:
-            font_large = self._font_large if self._font_large else pygame.font.SysFont("arial", 56, bold=True)
-            font_unit = self._font_unit if self._font_unit else pygame.font.SysFont("arial", 20)
+            font_large = self._font_large if self._font_large else pygame.font.SysFont("arial", 64, bold=True)
+            font_unit = self._font_unit if self._font_unit else pygame.font.SysFont("arial", 24, bold=True)
             font_small = self._font if self._font else pygame.font.SysFont("arial", 14)
         except:
             # Ultimate fallback - just draw text directly without fancy fonts
@@ -113,12 +126,13 @@ class Renderer:
             txt_hint = font_small.render("(TAB)", True, (100, 100, 100))
             surface.blit(txt_hint, (panel_x + 140, panel_y + 5))
 
+            # Large speed number
             txt_speed = font_large.render(f"{kmh}", True, color)
-            surface.blit(txt_speed, (panel_x + 20, panel_y + 30))
+            surface.blit(txt_speed, (panel_x + 15, panel_y + 25))
 
-            # Unit
-            txt_unit_render = font_unit.render("km/h", True, (150, 150, 150))
-            surface.blit(txt_unit_render, (panel_x + 20, panel_y + 80))
+            # Unit - larger and more visible
+            txt_unit_render = font_unit.render("km/h", True, (200, 200, 200))
+            surface.blit(txt_unit_render, (panel_x + 15, panel_y + 85))
         else:
             # Simple number display without fonts
             # Just draw the speed as circles/bars (fallback)
