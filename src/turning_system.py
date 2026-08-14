@@ -83,6 +83,13 @@ class TurnPlan:
 class TurningSystem:
     """Calculates and manages physics-based circular arc turns."""
     
+    # Mechanical minimum turning radius (steering-geometry limit): a real
+    # car cannot turn tighter than this REGARDLESS of speed. Only the
+    # centripetal-force limit (v²/a) scales with speed; at low speed the
+    # mechanical limit dominates instead. Matches PhysicsValidator's
+    # MIN_REALISTIC_RADIUS_M expectations (kept comfortably above it).
+    MIN_MECHANICAL_RADIUS_M = 5.0
+    
     def __init__(self, max_lateral_accel: float = 5.0):
         """Initialize turning system.
         
@@ -94,8 +101,11 @@ class TurningSystem:
     def calculate_turning_radius(self, speed: float) -> float:
         """Calculate minimum turning radius for given speed.
         
-        Based on centripetal acceleration: a = v²/r
-        Therefore: r = v²/a
+        Two physical limits, whichever is bigger wins:
+        - Centripetal (lateral acceleration): r = v²/a (dominates at speed)
+        - Mechanical (steering geometry): r >= MIN_MECHANICAL_RADIUS_M
+          (dominates at low speed — v²/a would otherwise shrink toward
+          zero, which no real car's steering can achieve)
         
         Args:
             speed: Speed in m/s
@@ -103,10 +113,8 @@ class TurningSystem:
         Returns:
             Minimum turning radius in meters
         """
-        if speed < 0.1:
-            return 1.0  # Minimum radius at very low speeds
-        
-        return (speed ** 2) / self.max_lateral_accel
+        centripetal_radius = (speed ** 2) / self.max_lateral_accel
+        return max(self.MIN_MECHANICAL_RADIUS_M, centripetal_radius)
     
     def plan_turn(
         self, 

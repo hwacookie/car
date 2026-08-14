@@ -14,18 +14,23 @@ class PhysicsValidator:
     Detects violations:
     - Teleportation (position jumps)
     - Instant heading changes (>30° in one frame)
-    - Rotating in place (heading changes without any position change —
-      a car has a nonzero turning radius, so ANY rotation must be
-      accompanied by translation; this is a hard invariant, checked
-      every single frame, not a heuristic)
+    - Rotating with an impossibly tight implied turning radius (heading
+      changes while the car barely moves — a car has a nonzero minimum
+      turning radius, so distance_moved / angle_rotated can never drop
+      below it; this is a hard invariant, checked every single frame)
     - Off-road driving (RAILS mode only)
     
     Can be enabled/disabled per car for performance.
     """
     
-    # "Rotation requires movement" tolerances (floating-point noise only)
-    HEADING_EPSILON_DEG = 0.05
-    DISTANCE_EPSILON_M = 0.001
+    # "Rotation requires proportional movement" tolerances
+    HEADING_EPSILON_DEG = 0.05      # below this, no meaningful rotation to check
+    # Kept comfortably below TurningSystem.MIN_MECHANICAL_RADIUS_M (5.0m)
+    # so legitimate arcs never trip this by numerical/geometric slack,
+    # while anything meaningfully tighter than a real car can achieve
+    # still gets caught.
+    MIN_REALISTIC_RADIUS_M = 3.0
+    DISTANCE_EPSILON_M = 0.001       # floating-point noise floor for "didn't move at all"
     
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
@@ -175,31 +180,46 @@ class PhysicsValidator:
             # Don't raise - just warn for now
     
     def _check_rotation_requires_movement(self, car, old_x: float, old_y: float, old_heading: float):
-        """Hard invariant: a car cannot change heading without also
-        changing position. It has a nonzero turning radius (r > 0), so
-        rotating by any angle theta necessarily sweeps an arc of length
-        r*theta > 0 — there is no such thing as a car turning "on the
-        spot". If heading changed but position didn't, something in the
-        simulation computed an impossible motion (e.g. a buggy arc whose
-        position and heading updates got out of sync).
+        """Hard invariant: a car cannot change heading without moving a
+        distance PROPORTIONAL to that rotation. It has a minimum turning
+        radius r_min > 0, so rotating by angle theta necessarily sweeps at
+        least an arc of length r_min*theta — there is no such thing as a
+        car turning "on the spot", even a little bit each frame.
         
-        Checked directly every frame — no thresholds beyond floating-point
-        noise, no rolling windows, no heuristics.
+        My first version of this check only flagged EXACTLY zero movement
+        (< 1mm), which missed the actual bug: while an arc is executing,
+        distance = speed*dt is never exactly zero (even a few mm/frame at
+        low speed), so heading rotating a lot while barely translating
+        slipped through. The correct check is the IMPLIED radius
+        (distance_moved / angle_rotated) — if that's smaller than any
+        real car could achieve, the motion is impossible, regardless of
+        whether distance_moved itself is nonzero.
+        
+        Checked directly every frame — no rolling windows, just the one
+        physical constant (MIN_REALISTIC_RADIUS_M).
         """
-        heading_diff = abs((car.heading - old_heading + 180) % 360 - 180)
+        heading_diff_deg = abs((car.heading - old_heading + 180) % 360 - 180)
         distance_moved_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
         
-        if heading_diff > self.HEADING_EPSILON_DEG and distance_moved_m < self.DISTANCE_EPSILON_M:
+        if heading_diff_deg <= self.HEADING_EPSILON_DEG:
+            return  # no meaningful rotation this frame, nothing to check
+        
+        heading_diff_rad = math.radians(heading_diff_deg)
+        implied_radius_m = distance_moved_m / heading_diff_rad
+        
+        if implied_radius_m < self.MIN_REALISTIC_RADIUS_M:
             import traceback
             error_msg = (
                 f"\n{'='*70}\n"
-                f"⚠️  ROTATING IN PLACE DETECTED (impossible)!\n"
+                f"⚠️  ROTATING WITH IMPOSSIBLE TURNING RADIUS!\n"
                 f"{'='*70}\n"
-                f"Heading changed by {heading_diff:.2f}° but position moved only "
-                f"{distance_moved_m*1000:.2f}mm.\n"
-                f"A car has a nonzero turning radius — it cannot rotate without\n"
-                f"also translating. This means position/heading updates fell\n"
-                f"out of sync somewhere in the simulation.\n"
+                f"Heading changed by {heading_diff_deg:.2f}° while moving only "
+                f"{distance_moved_m*1000:.1f}mm.\n"
+                f"Implied turning radius: {implied_radius_m:.3f}m "
+                f"(minimum realistic: {self.MIN_REALISTIC_RADIUS_M}m)\n"
+                f"No real car can turn this tightly — position/heading updates\n"
+                f"fell out of sync somewhere in the simulation (e.g. the car is\n"
+                f"effectively spinning in place instead of sweeping a proper arc).\n"
                 f"Old position: ({old_x:.1f}, {old_y:.1f}), heading {old_heading:.1f}°\n"
                 f"New position: ({car.x:.1f}, {car.y:.1f}), heading {car.heading:.1f}°\n"
                 f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"

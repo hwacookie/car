@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import colorsys
 import math
 import pygame
 
@@ -101,21 +102,17 @@ class Renderer:
             pygame.draw.circle(surface, color, (int(sx2), int(sy2)), r)
 
     # --- Breadcrumb Trail ---
-    # Fixed rainbow sequence (oldest -> newest) applied to the most recent
-    # 10 breadcrumb arrows, so the direction of travel *and* recency are
+    # Fixed rainbow gradient (oldest -> newest) applied to the most recent
+    # N breadcrumb arrows, so the direction of travel *and* recency are
     # both visible at a glance. Older arrows fall back to plain white.
+    # Generated once as a smooth 50-step violet -> red gradient (hue
+    # sweeping from ~300 deg down to 0 deg in HSV space).
     _RECENT_RAINBOW = [
-        (148, 0, 211),   # violet   (10th most recent / oldest of the batch)
-        (75, 0, 130),    # indigo
-        (0, 0, 255),     # blue
-        (0, 128, 255),   # azure
-        (0, 255, 255),   # cyan
-        (0, 255, 0),     # green
-        (255, 255, 0),   # yellow
-        (255, 165, 0),   # orange
-        (255, 69, 0),    # orange-red
-        (255, 0, 0),     # red      (most recent)
-    ]
+        tuple(int(c * 255) for c in colorsys.hsv_to_rgb(
+            (300 - 300 * i / 49) / 360.0, 1.0, 1.0
+        ))
+        for i in range(50)
+    ]  # 50 steps, index 0 = violet (oldest of the batch) -> index -1 = red (most recent)
     
     def draw_trail(self, surface: pygame.Surface, car):
         """Draw the breadcrumb trail: small chevron ("v") arrows showing
