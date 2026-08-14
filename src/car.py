@@ -151,9 +151,19 @@ class Car:
         accel = control_input.get('accelerate', False)
         brake = control_input.get('brake', False)
         
+        # While actively executing a turn's arc, the geometry was built
+        # for a FIXED speed (turn_plan.target_speed_mps) - a driver holding
+        # the accelerator through a corner shouldn't be able to speed up
+        # mid-turn and exceed what that fixed-radius arc was planned for
+        # (that's exactly what "accelerate whenever possible, except while
+        # actively slowing for a turn" means: once we're IN the turn,
+        # further acceleration is deferred until it's over). Braking is
+        # still allowed to reduce speed further at any time.
+        speed_cap = self.active_turn.target_speed_mps if self.active_turn else config.CAR_SPEED
+        
         # Speed control
         if accel:
-            self.target_speed = min(self.target_speed + config.CAR_ACCELERATION * dt, config.CAR_SPEED)
+            self.target_speed = min(self.target_speed + config.CAR_ACCELERATION * dt, speed_cap)
         elif brake:
             self.target_speed = max(self.target_speed - config.CAR_BRAKING * dt, 0)
             # Direct braking
@@ -165,7 +175,7 @@ class Car:
         elif self.speed > self.target_speed:
             self.speed -= config.CAR_BRAKING * dt * 0.3
         
-        self.speed = max(0, min(config.CAR_SPEED, self.speed))
+        self.speed = max(0, min(speed_cap, self.speed))
         
         # Move along road
         if self.speed > 0:

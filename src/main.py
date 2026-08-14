@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Car Game — Entry Point"""
 
+import math
 import os
 import sys
 import pygame
@@ -88,6 +89,18 @@ def main(smoke_test_frames: int = 0):
     rx, ry, rh, seg_idx, node_id = network.random_road_point()
     driver = AIDriver()  # Start in RAILS mode
     car = Car(rx, ry, rh, seg_idx, driver)
+    car.progress = 0.5
+    # Apply the normal right-lane offset immediately (matching what
+    # continuous driving would show), instead of leaving the car exactly
+    # on the raw centerline - otherwise the very first physics frame
+    # "snaps" it sideways into its lane, which the (correctly strict)
+    # teleportation watchdog flags as a real jump. Same fix as
+    # Car.teleport_random()/teleport_to_named_point().
+    _spawn_seg = network.segments[seg_idx]
+    _spawn_dx, _spawn_dy = _spawn_seg.x2 - _spawn_seg.x1, _spawn_seg.y2 - _spawn_seg.y1
+    _spawn_seg_heading = math.degrees(math.atan2(_spawn_dx, _spawn_dy))
+    car.forward = abs((rh - _spawn_seg_heading + 180) % 360 - 180) < 90
+    car._apply_plain_segment_position(_spawn_seg)
     
     # --- Physics validator (can be toggled with V key) ---
     validator = PhysicsValidator(enabled=True)
