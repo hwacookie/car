@@ -224,11 +224,13 @@ class Car:
         else:
             self.progress -= distance_frac
         
-        # Check for segment end
-        if self.progress >= 1.0:
-            self._handle_segment_end(network, seg.end_node)
-        elif self.progress <= 0.0:
-            self._handle_segment_end(network, seg.start_node)
+        # Check for segment end (only if NOT in an active turn)
+        # If we have an active turn, the arc execution handles the transition
+        if not self.active_turn:
+            if self.progress >= 1.0:
+                self._handle_segment_end(network, seg.end_node)
+            elif self.progress <= 0.0:
+                self._handle_segment_end(network, seg.start_node)
         
         # Update position on segment
         seg = network.segments[self.seg_idx]
@@ -290,20 +292,15 @@ class Car:
         
         if not feasibility['feasible']:
             # Can't make turn - brake harder
-            # Note: actual braking happens in _update_rails_mode
             print(f"⚠️  Turn too tight! Need to brake: current {self.speed * 3.6:.0f} km/h, need {feasibility['required_speed'] * 3.6:.0f} km/h")
         elif feasibility['braking_required']:
             # Need to brake (braking happens in main update loop)
             pass
-        else:
-            # Turn is feasible - check if we should start it now
-            # Start turn a bit before junction for smoother entry
-            start_threshold = 0.9 if self.forward else 0.1
-            if (self.forward and self.progress >= start_threshold) or \
-               (not self.forward and self.progress <= start_threshold):
-                # Start the turn!
-                self.active_turn = turn_plan
-                print(f"🔄 Starting turn: {self.seg_idx} → {next_seg_idx}")
+        
+        # START TURN IMMEDIATELY when planning (at progress ~0.7)
+        # This ensures turn starts before we reach segment end
+        self.active_turn = turn_plan
+        print(f"🔄 Starting turn: {self.seg_idx} → {next_seg_idx} at progress {self.progress:.2f}")
     
     def _handle_segment_end(self, network, node_id: str):
         """Handle reaching end of current segment."""
