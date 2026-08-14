@@ -94,6 +94,9 @@ class Renderer:
     # --- HUD / Dashboard ---
     def draw_hud(self, surface: pygame.Surface, car):
         """Draw speedometer HUD in bottom-left corner of main window."""
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+        
         # Panel background
         panel_w, panel_h = 220, 130
         panel_x, panel_y = 15, surface.get_height() - panel_h - 15
@@ -108,35 +111,41 @@ class Renderer:
         if kmh > 100:
             color = (255, 80, 80)
 
-        # Use available fonts or create simple ones
+        # Mode indicator (top) - using PIL
+        driver_name = car.driver.get_name() if car.driver else "NONE"
+        mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
+        
+        # Create PIL image for text
+        text_img = Image.new('RGBA', (200, 100), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(text_img)
+        
         try:
-            font_large = self._font_large if self._font_large else pygame.font.SysFont("arial", 64, bold=True)
-            font_unit = self._font_unit if self._font_unit else pygame.font.SysFont("arial", 24, bold=True)
-            font_small = self._font if self._font else pygame.font.SysFont("arial", 14)
+            # Try to load a font
+            font_large = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 54)
+            font_medium = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
+            font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 12)
         except:
-            # Ultimate fallback - just draw text directly without fancy fonts
-            font_large = font_unit = font_small = None
-
-        if font_large:
-            # Mode indicator (top)
-            driver_name = car.driver.get_name() if car.driver else "NONE"
-            mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
-            txt_mode = font_unit.render(driver_name, True, mode_color)
-            surface.blit(txt_mode, (panel_x + 10, panel_y + 5))
-            txt_hint = font_small.render("(TAB)", True, (100, 100, 100))
-            surface.blit(txt_hint, (panel_x + 140, panel_y + 5))
-
-            # Large speed number
-            txt_speed = font_large.render(f"{kmh}", True, color)
-            surface.blit(txt_speed, (panel_x + 15, panel_y + 25))
-
-            # Unit - larger and more visible
-            txt_unit_render = font_unit.render("km/h", True, (200, 200, 200))
-            surface.blit(txt_unit_render, (panel_x + 15, panel_y + 85))
-        else:
-            # Simple number display without fonts
-            # Just draw the speed as circles/bars (fallback)
-            pass
+            # Fallback to default
+            font_large = ImageFont.load_default()
+            font_medium = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+        
+        # Draw mode
+        draw.text((0, 0), driver_name, fill=mode_color, font=font_medium)
+        draw.text((110, 2), "(TAB)", fill=(100, 100, 100), font=font_small)
+        
+        # Draw speed number
+        draw.text((0, 25), f"{kmh}", fill=color, font=font_large)
+        
+        # Draw unit
+        draw.text((0, 75), "km/h", fill=(200, 200, 200), font=font_medium)
+        
+        # Convert PIL image to pygame surface
+        mode = text_img.mode
+        size = text_img.size
+        data = text_img.tobytes()
+        text_surf = pygame.image.fromstring(data, size, mode)
+        surface.blit(text_surf, (panel_x + 10, panel_y + 5))
 
         # Speedometer arc (right side of panel)
         cx = panel_x + 170
