@@ -267,13 +267,33 @@ class RoadNetwork:
     # --- Spatial queries ---
 
     def is_on_road(self, wx: float, wy: float) -> bool:
-        """Check if a world position is on any road."""
+        """Check if a world position is on any road.
+        
+        Includes the widened junction corner-cutting fillet area at real
+        junctions (config.JUNCTION_WIDENING_M) - see Renderer.draw_roads()
+        and docs/SPEC.md.
+        """
         pppm = config.PIXELS_PER_METER
         for seg in self.segments:
             half_width = (seg.width / 2) * pppm
             dist = point_to_segment_distance(wx, wy, seg.x1, seg.y1, seg.x2, seg.y2)
             if dist <= half_width:
                 return True
+        
+        for node_id, degree in self.node_degree.items():
+            if degree < 3:
+                continue
+            node_xy = self.nodes.get(node_id)
+            if node_xy is None:
+                continue
+            connected = self.node_connections.get(node_id, [])
+            if not connected:
+                continue
+            widest_seg = max((self.segments[i] for i in connected), key=lambda s: s.width)
+            radius_px = (widest_seg.width / 2 + config.JUNCTION_WIDENING_M) * pppm
+            if math.hypot(wx - node_xy[0], wy - node_xy[1]) <= radius_px:
+                return True
+        
         return False
 
     def random_road_point(self) -> tuple[float, float, float, int, str]:

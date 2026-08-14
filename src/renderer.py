@@ -100,6 +100,111 @@ class Renderer:
             # Rounded caps at both ends
             pygame.draw.circle(surface, color, (int(sx1), int(sy1)), r)
             pygame.draw.circle(surface, color, (int(sx2), int(sy2)), r)
+        
+        # Widened junction fillets: real intersections have a much wider
+        # paved "corner-cutting" area than the roads' own width suggests
+        # (curb radii flare the pavement out - confirmed via satellite
+        # imagery, see docs/SPEC.md). A plain circle at the junction node
+        # looks like an unnatural blob and can bulge into areas with no
+        # actual road; instead, for each PAIR of adjacent roads (by angle
+        # around the junction) we compute a proper tangent-arc fillet -
+        # the same "circle tangent to two lines" geometry used for the
+        # car's own turning arc, but with a fixed curb radius instead of a
+        # speed-dependent one - and fill the resulting rounded wedge.
+        # This naturally handles any junction degree (2-way corners,
+        # 3-way, 4-way crossroads) and skips near-straight continuations
+        # (no real corner to round off).
+        for node_id, connected in self.network.node_connections.items():
+            if len(connected) < 2:
+                continue
+            self._draw_junction_fillets(surface, node_id, connected, pppm, zoom, w, h)
+
+    def _draw_junction_fillets(self, surface, node_id, connected, pppm, zoom, w, h):
+        """Draw rounded curb-radius fillets in every 'corner' gap between
+        adjacent roads meeting at a junction node."""
+        node_xy = self.network.nodes.get(node_id)
+        if node_xy is None:
+            return
+        node_x, node_y = node_xy
+        
+        # Spoke = direction AWAY from the junction along each connected
+        # road, plus that road's own segment (for width/color).
+        spokes = []
+        for seg_idx in connected:
+            seg = self.network.segments[seg_idx]
+            if seg.start_node == node_id:
+                away_dx, away_dy = seg.x2 - seg.x1, seg.y2 - seg.y1
+            else:
+                away_dx, away_dy = seg.x1 - seg.x2, seg.y1 - seg.y2
+            length = math.hypot(away_dx, away_dy)
+            if length < 1e-6:
+                continue
+            angle = math.atan2(away_dy, away_dx)
+            spokes.append((angle, away_dx / length, away_dy / length, seg))
+        
+        if len(spokes) < 2:
+            return
+        spokes.sort(key=lambda s: s[0])
+        
+        MIN_GAP_DEG = 15.0   # skip near-parallel/duplicate spokes
+        MAX_GAP_DEG = 155.0  # skip near-straight continuations (no real corner)
+        
+        n = len(spokes)
+        for i in range(n):
+            angle_a, ax, ay, seg_a = spokes[i]
+            angle_b, bx, by, seg_b = spokes[(i + 1) % n]
+            gap = (angle_b - angle_a) % (2 * math.pi)
+            gap_deg = math.degrees(gap)
+            if gap_deg < MIN_GAP_DEG or gap_deg > MAX_GAP_DEG:
+                continue
+            
+            widest = seg_a if seg_a.width >= seg_b.width else seg_b
+            radius_m = widest.width / 2 + config.JUNCTION_WIDENING_M
+            
+            half_gap = gap / 2
+            tangent_dist_m = radius_m * math.tan(half_gap)
+            center_dist_m = radius_m / math.cos(half_gap)
+            
+            bis_x, bis_y = ax + bx, ay + by
+            bis_len = math.hypot(bis_x, bis_y)
+            if bis_len < 1e-9:
+                continue
+            bis_x, bis_y = bis_x / bis_len, bis_y / bis_len
+            
+            pppm_full = pppm  # already includes PIXELS_PER_METER
+            center_x = node_x + center_dist_m * pppm_full * bis_x
+            center_y = node_y + center_dist_m * pppm_full * bis_y
+            tangent1_x = node_x + tangent_dist_m * pppm_full * ax
+            tangent1_y = node_y + tangent_dist_m * pppm_full * ay
+            tangent2_x = node_x + tangent_dist_m * pppm_full * bx
+            tangent2_y = node_y + tangent_dist_m * pppm_full * by
+            
+            start_angle = math.atan2(tangent1_y - center_y, tangent1_x - center_x)
+            end_angle = math.atan2(tangent2_y - center_y, tangent2_x - center_x)
+            sweep = (end_angle - start_angle) % (2 * math.pi)
+            if sweep > math.pi:
+                sweep -= 2 * math.pi
+            
+            # Build filled polygon: node -> tangent1 -> arc points -> tangent2 -> back to node
+            radius_px = radius_m * pppm_full * zoom
+            poly_world = [(node_x, node_y), (tangent1_x, tangent1_y)]
+            num_arc_pts = 10
+            for k in range(1, num_arc_pts + 1):
+                a = start_angle + sweep * (k / num_arc_pts)
+                ax_pt = center_x + radius_m * pppm_full * math.cos(a)
+                ay_pt = center_y + radius_m * pppm_full * math.sin(a)
+                poly_world.append((ax_pt, ay_pt))
+            
+            poly_screen = [self.camera.world_to_screen(px, py) for px, py in poly_world]
+            
+            # Cull if entirely off-screen
+            xs = [p[0] for p in poly_screen]
+            ys = [p[1] for p in poly_screen]
+            if max(xs) < 0 or min(xs) > w or max(ys) < 0 or min(ys) > h:
+                continue
+            
+            color = config.ROAD_TYPES.get(widest.highway, {}).get("color", (150, 150, 150))
+            pygame.draw.polygon(surface, color, [(int(px), int(py)) for px, py in poly_screen])
 
     # --- Breadcrumb Trail ---
     # Fixed rainbow gradient (oldest -> newest) applied to the most recent
@@ -126,8 +231,11 @@ class Renderer:
             return
         
         zoom = self.camera.zoom
+        pppm = config.PIXELS_PER_METER
         arrow_len = 6 * zoom    # length of each arrow leg (screen px)
-        arrow_half_w = 4 * zoom  # half-width of the chevron opening
+        # Half-width matches the car's own half-width, so the trail
+        # visually represents the car's actual footprint at each point.
+        arrow_half_w = (config.CAR_WIDTH / 2) * pppm * zoom
         
         n = len(car.trail)
         n_recent = len(self._RECENT_RAINBOW)

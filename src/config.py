@@ -19,6 +19,14 @@ BOUNDING_BOX = {
 # Pixels per meter at zoom level 1.0
 PIXELS_PER_METER = 2
 
+# Real intersections have a much wider paved "corner-cutting" area than
+# the connecting roads' width alone suggests (curb radii flare the
+# pavement out at junctions - confirmed via satellite imagery). This is
+# the extra radius (meters) added on top of the widest connected road's
+# half-width when rendering junction nodes and when validating whether a
+# turning arc stays on paved surface.
+JUNCTION_WIDENING_M = 4.0
+
 # Zoom limits: viewport width = WINDOW_WIDTH / (zoom * PIXELS_PER_METER)
 # MAX_ZOOM  -> ~40 m viewport (zoomed in)
 # MIN_ZOOM  -> ~1000 m viewport (zoomed out)

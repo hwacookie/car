@@ -38,9 +38,25 @@ class Car:
         # Turning system
         self.turning_system = TurningSystem(max_lateral_accel=5.0)
         self.active_turn: TurnPlan | None = None
-        self._cached_turn_node: str | None = None
-        self._cached_turn_to_seg: int | None = None
-        self._cached_turn_plan: TurnPlan | None = None
+        # 1.0 = full right-lane offset (normal driving), 0.0 = centerline
+        # (at the exact tangent point of an upcoming turn). Blended down
+        # smoothly as we approach a turn's tangent point, so the car
+        # gradually swerves toward - and, only if the corner geometry
+        # genuinely requires it, across - the centerline in preparation,
+        # rather than snapping from lane position to centerline instantly.
+        self._lane_offset_factor: float = 1.0
+        self._recovery_start_factor: float = 1.0
+        
+        # The turn plan for an upcoming junction, decided ONCE (fixed
+        # target speed, fixed geometry) as soon as we know which way we're
+        # turning - like a human sizing up a corner well in advance rather
+        # than reactively recalculating the required radius every frame
+        # from a still-changing current speed (see planning discussion in
+        # conversation history / SPEC.md). Braking is then just "do we
+        # need to slow down to reach this FIXED target speed by this
+        # FIXED point" - a single, stable calculation per frame.
+        self.planned_turn: TurnPlan | None = None
+        self.planned_turn_key: tuple | None = None  # (from_seg_idx, to_seg_idx, junction_node)
         self._warned_no_arc_for_node: str | None = None
         
         # Visual state
@@ -161,9 +177,18 @@ class Car:
                 self._update_position_rails(dt, network)
     
     def _execute_active_turn(self, dt: float, network):
-        """Execute current turn using circular arc."""
-        distance_m = self.speed * dt
+        """Execute current turn using circular arc (this frame's full distance)."""
+        self._advance_active_turn(self.speed * dt, network)
+    
+    def _advance_active_turn(self, distance_m: float, network):
+        """Advance the active turn by an explicit distance (meters).
         
+        Split out from _execute_active_turn so the initial hand-off from
+        plain segment-following onto the arc can move PART of a frame's
+        distance on the straight segment (up to the exact tangent point)
+        and the REMAINDER along the arc, all within the same frame - no
+        discrete jump, see _update_position_rails().
+        """
         # Move along arc
         x, y, heading, new_progress = self.turning_system.execute_turn(
             self.active_turn, distance_m
@@ -182,18 +207,26 @@ class Car:
             
             # Set direction on new segment
             self.forward = (to_seg.start_node == self.active_turn.junction_node)
-            self.progress = 0.0 if self.forward else 1.0
             
-            # IMPORTANT: The arc's own geometry (circle math) does not
-            # necessarily land exactly on the network's real junction node
-            # coordinates. Snap position to the actual node here so the
-            # next frame's segment-following code (which recomputes x/y
-            # directly from network.segments[...].x1/y1) doesn't see a
-            # sudden jump (this was causing teleportation-watchdog
-            # violations immediately after a completed arc turn).
-            node_xy = network.nodes.get(self.active_turn.junction_node)
-            if node_xy is not None:
-                self.x, self.y = node_xy
+            # IMPORTANT: The arc's endpoint is NOT at the junction node -
+            # it's to_tangent_offset_m PAST it (that's the whole point of
+            # the tangent-fillet construction: the arc leaves the curve
+            # already partway along the new road). Setting progress to
+            # 0.0/1.0 ("at the junction") and snapping position back to the
+            # node was causing a visible backward jump every time a turn
+            # completed. Instead, set progress to match EXACTLY where the
+            # arc's own (x, y) already is - self.x/self.y from the arc
+            # execution above are left untouched here, and progress is
+            # derived to be consistent with them, so there is no jump at
+            # all, just a continuous handoff to plain segment-following.
+            # Uses to_tangent_offset_m (measured from the TRUE junction,
+            # consistent with plain segment-following's own
+            # parametrization) rather than the geometric tangent_distance_m
+            # (measured from the lane-offset-shifted effective junction,
+            # which can differ by the offset's along-track component).
+            frac_along = self.active_turn.to_tangent_offset_m / to_seg.length if to_seg.length > 0 else 0.0
+            frac_along = max(0.0, min(1.0, frac_along))
+            self.progress = frac_along if self.forward else 1.0 - frac_along
             
             # Notify driver that turn completed
             if self.driver and hasattr(self.driver, 'clear_blinker_if_turned'):
@@ -203,43 +236,153 @@ class Car:
                     self.active_turn.to_seg_idx
                 )
             
+            # Remember the lane-offset factor the just-completed turn
+            # actually used (self._lane_offset_factor is untouched by arc
+            # execution, so it's still exactly the plan's target_factor
+            # here) - the recovery blend on the new segment eases FROM
+            # this value toward 1.0, instead of assuming it always starts
+            # from 0. Without this, a turn that used the FULL lane offset
+            # (no swerve needed at all) would still get yanked down to a
+            # fresh, wrong, distance-based factor on the very next frame.
+            self._recovery_start_factor = self._lane_offset_factor
+            
             # Clear active turn
             self.active_turn = None
     
     def _update_position_rails(self, dt: float, network):
-        """Move along current segment, checking for upcoming turns."""
+        """Move along current segment, checking for upcoming turns.
+        
+        PLAN-ONCE MODEL: the moment we know which way we're turning at the
+        upcoming junction, we decide (once, fixed) a target speed and the
+        exact arc geometry for that speed - like a human sizing up a
+        corner well in advance, rather than reactively recalculating the
+        required radius every frame from whatever speed we currently
+        happen to be going. From there, each frame just asks one simple,
+        stable question: "do I need to brake NOW to reach that fixed
+        target speed by that fixed point?" Gentle turns naturally need no
+        braking at all if the target speed is already at/above cruise.
+        """
         if self.seg_idx >= len(network.segments):
             return
         
         seg = network.segments[self.seg_idx]
         distance_m = self.speed * dt
+        junction_node = seg.end_node if self.forward else seg.start_node
+        
+        if self.forward:
+            remaining_to_junction_m = seg.length * (1.0 - self.progress)
+        else:
+            remaining_to_junction_m = seg.length * self.progress
+        
+        # Get (or create) the ONE-TIME plan for whichever way the driver
+        # intends to go at this junction. Cheap to call every frame: only
+        # actually (re)plans when the intended direction changes.
+        turn_plan = self._get_or_create_planned_turn(network, junction_node)
+        
+        if turn_plan and not self.active_turn:
+            # Uses from_tangent_offset_m (measured from the TRUE junction)
+            # rather than tangent_distance_m (measured from the lane-
+            # offset-shifted effective junction) - see TurnPlan docstring.
+            distance_to_tangent_m = remaining_to_junction_m - turn_plan.from_tangent_offset_m
+            
+            # Brake NOW (full force, directly - not the gentler cruise
+            # blend) if that's what it takes to reach the FIXED target
+            # speed by the FIXED tangent point. A real driver brakes
+            # firmly and deliberately for a corner, not via gentle cruise
+            # control, so this uses config.CAR_BRAKING at full strength to
+            # match the distance calculation below exactly.
+            if self.speed > turn_plan.target_speed_mps:
+                braking_distance_m = (
+                    (self.speed ** 2 - turn_plan.target_speed_mps ** 2) / (2 * config.CAR_BRAKING)
+                )
+                safety_margin_m = 5.0
+                if distance_to_tangent_m <= braking_distance_m + safety_margin_m:
+                    self.speed = max(turn_plan.target_speed_mps, self.speed - config.CAR_BRAKING * dt)
+                    self.target_speed = min(self.target_speed, turn_plan.target_speed_mps)
+                    self._braking = True
+            
+            # Smoothly blend from full right-lane offset (1.0) toward
+            # whichever fraction the PLAN actually needs
+            # (turn_plan.lane_offset_m, chosen to keep the car in-lane
+            # whenever the corner allows it - see
+            # _get_or_create_planned_turn). Gentle turns/curves plan with
+            # the full lane offset and so never swerve at all; only
+            # genuinely tight corners plan with a reduced (or negative,
+            # opposing-lane) offset and swerve toward it.
+            #
+            # IMPORTANT: blended against distance_to_tangent_m (reaches
+            # exactly 0 AT the tangent point), NOT remaining_to_junction_m
+            # (which only reaches 0 at the TRUE junction - later than the
+            # tangent point!). Using the wrong distance meant the blend
+            # hadn't finished by the time we reached the tangent point,
+            # leaving a residual gap that a forced snap-to-target_factor
+            # then had to paper over - producing exactly the position jump
+            # this blend exists to prevent. Now the blend completes
+            # naturally, continuously, precisely AT the hand-off point.
+            full_lane_offset_m = seg.width / 4
+            target_factor = (turn_plan.lane_offset_m / full_lane_offset_m) if full_lane_offset_m > 0 else 0.0
+            SWERVE_DISTANCE_M = 25.0
+            blend = max(0.0, min(1.0, distance_to_tangent_m / SWERVE_DISTANCE_M))
+            # blend=1.0 (far from tangent point) -> stay at full lane;
+            # blend=0.0 (exactly at tangent point) -> reach target_factor
+            self._lane_offset_factor = target_factor + (1.0 - target_factor) * blend
+            
+            if distance_to_tangent_m <= distance_m:
+                # This frame crosses the tangent point. Split the movement
+                # instead of jumping: advance EXACTLY to the tangent point
+                # on the current (straight) segment first, using the
+                # normal plain-segment position/lane offset/heading code
+                # (so it's pixel-consistent with every previous frame),
+                # THEN start the arc and spend the leftover distance on it.
+                # This gives a perfectly continuous hand-off with no jump.
+                distance_to_tangent_m = max(0.0, distance_to_tangent_m)
+                frac_to_tangent = distance_to_tangent_m / seg.length if seg.length > 0 else 0.0
+                if self.forward:
+                    self.progress += frac_to_tangent
+                else:
+                    self.progress -= frac_to_tangent
+                # _lane_offset_factor was already computed just above via
+                # the (now tangent-point-anchored) blend formula, using
+                # this exact same distance_to_tangent_m - by the time we
+                # finish moving that distance, we're at the tangent point
+                # and the factor is already correct to a small fraction of
+                # a percent (no forced override needed, which would
+                # actually be slightly LESS precise than the natural
+                # blend value).
+                self._apply_plain_segment_position(seg)
+                
+                leftover_distance_m = distance_m - distance_to_tangent_m
+                self.active_turn = turn_plan
+                self.planned_turn = None
+                self.planned_turn_key = None
+                print(f"🔄 Starting turn: {self.seg_idx} → {turn_plan.to_seg_idx} "
+                      f"(speed {self.speed * 3.6:.0f} km/h, target {turn_plan.target_speed_mps * 3.6:.0f} km/h, "
+                      f"radius {turn_plan.radius:.1f}m, tangent_distance {turn_plan.tangent_distance_m:.1f}m)")
+                if leftover_distance_m > 0:
+                    self._advance_active_turn(leftover_distance_m, network)
+                return
+        else:
+            # No turn planned here (straight continuation, dead end, or no
+            # radius fits even at the mechanical minimum). Blend the lane
+            # offset back toward 1.0 (full right-lane) as we get further
+            # into the segment, EASING FROM WHATEVER FACTOR THE LAST
+            # COMPLETED TURN ACTUALLY USED (see _recovery_start_factor,
+            # set in _advance_active_turn on completion) - not from an
+            # assumed 0. A turn that needed the FULL lane offset (no
+            # swerve at all) correctly stays at 1.0 the whole time instead
+            # of being yanked down to a fresh, wrong, distance-based value.
+            # (The old formula also blended down near the far end of the
+            # segment "just in case" another turn was coming - redundant
+            # now, since the "if turn_plan" branch above already handles
+            # that with a precise, tangent-point-anchored blend.)
+            SWERVE_DISTANCE_M = 20.0
+            distance_from_seg_start_m = seg.length * (self.progress if self.forward else 1.0 - self.progress)
+            recovery_progress = max(0.0, min(1.0, distance_from_seg_start_m / SWERVE_DISTANCE_M))
+            recovery_start = getattr(self, '_recovery_start_factor', 1.0)
+            self._lane_offset_factor = recovery_start + (1.0 - recovery_start) * recovery_progress
+        
+        # Normal plain-segment movement (no turn starting this frame)
         distance_frac = distance_m / seg.length if seg.length > 0 else 0
-        
-        # Check if approaching junction and should plan/execute turn
-        approaching_junction = False
-        junction_node = None
-        
-        if self.forward and self.progress > 0.7:
-            approaching_junction = True
-            junction_node = seg.end_node
-        elif not self.forward and self.progress < 0.3:
-            approaching_junction = True
-            junction_node = seg.start_node
-        
-        # Re-check every frame while approaching (not just once!) so we can
-        # keep braking harder as long as the turn is not yet feasible at the
-        # current speed. The expensive arc search itself is cached per node
-        # inside _check_and_plan_turn, so this is cheap to call repeatedly.
-        if approaching_junction and junction_node and not self.active_turn:
-            self._check_and_plan_turn(network, junction_node, dt)
-        
-        # Clear turn-plan cache once we're far from any junction again
-        if hasattr(self, '_cached_turn_node'):
-            if (self.forward and self.progress < 0.5) or (not self.forward and self.progress > 0.5):
-                self._cached_turn_node = None
-                self._cached_turn_plan = None
-        
-        # Move along segment
         if self.forward:
             self.progress += distance_frac
         else:
@@ -253,15 +396,28 @@ class Car:
             elif self.progress <= 0.0:
                 self._handle_segment_end(network, seg.start_node)
         
-        # Update position on segment
         seg = network.segments[self.seg_idx]
+        self._apply_plain_segment_position(seg)
+    
+    def _apply_plain_segment_position(self, seg):
+        """Compute x/y/heading from self.progress along a (straight) segment,
+        including the right-hand lane offset. Shared by normal segment
+        following and by the exact-tangent-point hand-off when a turn
+        starts mid-frame (see _update_position_rails).
+        """
         t = max(0.0, min(1.0, self.progress))
         self.x = seg.x1 + t * (seg.x2 - seg.x1)
         self.y = seg.y1 + t * (seg.y2 - seg.y1)
         
-        # Lane offset (right side)
+        # Lane offset (right side), blended down toward 0 (centerline) as
+        # we approach a turn's tangent point - see _lane_offset_factor and
+        # _check_and_plan_turn(). The tangent-fillet arc geometry is built
+        # relative to the CENTERLINE, so the car must actually BE on the
+        # centerline by the time it reaches the tangent point for a
+        # jump-free hand-off; blending gets it there smoothly in advance
+        # instead of driving centered the whole time.
         pppm = config.PIXELS_PER_METER
-        lane_offset = (seg.width / 4) * pppm if not seg.oneway else 0
+        lane_offset = (seg.width / 4) * pppm * self._lane_offset_factor if not seg.oneway else 0
         dx = seg.x2 - seg.x1
         dy = seg.y2 - seg.y1
         seg_len = math.hypot(dx, dy)
@@ -281,14 +437,24 @@ class Car:
         else:
             self.heading = math.degrees(math.atan2(-dx, -dy))
     
-    def _check_and_plan_turn(self, network, junction_node: str, dt: float):
-        """Check if we should plan/execute a turn at upcoming junction.
-
-        Called every frame while approaching a junction (until the turn
-        actually starts). Re-evaluates feasibility at the CURRENT speed
-        every time, so if the turn isn't safe yet we brake hard and try
-        again next frame — we never start an arc that doesn't fit, and we
-        never blindly attempt a 90° turn at highway speed.
+    def _get_or_create_planned_turn(self, network, junction_node: str):
+        """Get the cached, ONE-TIME turn plan for the upcoming junction,
+        (re)computing it only if the intended direction has changed since
+        it was last planned (e.g. driver toggled a blinker).
+        
+        The plan's target speed and geometry are decided ONCE, at a fixed
+        speed chosen purely from the turn's severity (TurningSystem.
+        decide_target_speed_for_turn) - not from whatever speed the car
+        happens to be going right now. This is what makes the tangent
+        point and required braking distance stable, computable quantities
+        instead of a moving target that shifts every frame while braking.
+        
+        Returns:
+            TurnPlan if a valid fillet exists (at the chosen target speed,
+            or a reduced fallback speed down to the mechanical minimum),
+            else None (no valid turn, dead end, or roads too short for any
+            realistic radius - segment-end instant-transition fallback
+            handles that case).
         """
         # Get turn intention from driver
         if self.driver and hasattr(self.driver, 'pending_turn'):
@@ -296,65 +462,65 @@ class Car:
         else:
             turn = "straight"
         
-        # Get next segment
         next_seg_idx = network.choose_next_segment(self.seg_idx, junction_node, turn)
         
         if next_seg_idx is None or next_seg_idx == self.seg_idx:
-            return  # No valid turn or dead end
+            self.planned_turn = None
+            self.planned_turn_key = None
+            return None
         
-        # Recompute fresh every frame using the car's CURRENT position and
-        # heading as the arc's anchor (validate_arc_on_road only checks 2
-        # segments so this is cheap). We deliberately don't cache the plan
-        # across frames: while braking towards feasibility the car keeps
-        # moving, and an arc anchored to a stale position would itself
-        # reintroduce a small jump the moment the turn actually starts.
-        turn_plan = self.turning_system.plan_turn(
-            self.x, self.y, self.speed, self.heading,
-            self.seg_idx, next_seg_idx, junction_node,
-            network
-        )
-        self._cached_turn_node = junction_node
-        self._cached_turn_to_seg = next_seg_idx
-        self._cached_turn_plan = turn_plan
+        key = (self.seg_idx, next_seg_idx, junction_node)
+        if self.planned_turn_key == key and self.planned_turn is not None:
+            return self.planned_turn
         
-        if not turn_plan:
-            # No arc fits within road boundaries at any radius we tried —
-            # almost always because we're going too fast for this turn given
-            # the available road length. Brake hard and retry next frame:
-            # as speed drops, the required radius shrinks and a fitting arc
-            # may become possible. If we run out of road before that
-            # happens, the segment-end fallback (instant transition) kicks
-            # in instead of attempting a geometrically invalid arc.
+        # (Re)plan once: decide the ideal target speed from turn severity,
+        # then fall back to progressively slower (tighter-radius) attempts
+        # if the road is too short for the comfortable choice - down to
+        # the absolute mechanical minimum before giving up entirely.
+        turn_angle_deg = abs(network.get_exit_angle(self.seg_idx, next_seg_idx))
+        cruise_speed_mps = config.CAR_SPEED
+        ideal_speed = self.turning_system.decide_target_speed_for_turn(turn_angle_deg, cruise_speed_mps)
+        min_speed = math.sqrt(self.turning_system.max_lateral_accel * self.turning_system.MIN_MECHANICAL_RADIUS_M)
+        
+        candidate_speeds = [ideal_speed, max(ideal_speed * 0.6, min_speed), min_speed]
+        # De-dupe while preserving order (a plain set() would shuffle the
+        # try-ideal-first-then-fallback order we actually want)
+        seen = set()
+        candidate_speeds = [s for s in candidate_speeds if not (s in seen or seen.add(s))]
+        
+        # For EACH speed attempt, try to stay fully within our own lane
+        # first, only reducing toward centerline (and, if truly necessary,
+        # into the opposing lane) if that doesn't fit. This is why gentle
+        # turns/curves never need to swerve at all: the full-lane-offset
+        # attempt at the ideal speed usually just works.
+        from_seg = network.segments[self.seg_idx]
+        full_lane_offset_m = from_seg.width / 4  # matches _apply_plain_segment_position
+        lane_offset_fractions = [1.0, 0.5, 0.0, -0.5]  # last one dips into the opposing lane
+        
+        plan = None
+        for candidate_speed in candidate_speeds:
+            for frac in lane_offset_fractions:
+                candidate = self.turning_system.plan_turn(
+                    candidate_speed, self.seg_idx, next_seg_idx, junction_node, network,
+                    lane_offset_m=full_lane_offset_m * frac,
+                )
+                if candidate:
+                    plan = candidate
+                    break
+            if plan:
+                break
+        
+        self.planned_turn = plan
+        self.planned_turn_key = key
+        
+        if plan is None:
             if not getattr(self, '_warned_no_arc_for_node', None) == junction_node:
                 self._warned_no_arc_for_node = junction_node
-                print(f"⚠️ Cannot plan turn {self.seg_idx} → {next_seg_idx} at {self.speed * 3.6:.0f} km/h: "
-                      f"no arc fits within road boundaries — braking hard")
-            self.speed = max(0.0, self.speed - config.CAR_BRAKING * dt)
-            self.target_speed = min(self.target_speed, self.speed)
-            self._braking = True
-            return
+                print(f"⚠️ Cannot plan turn {self.seg_idx} → {next_seg_idx}: "
+                      f"no radius fits within road length, even at the mechanical minimum "
+                      f"and using the opposing lane")
         
-        # Check feasibility AT CURRENT SPEED (re-evaluated every frame)
-        seg = network.segments[self.seg_idx]
-        feasibility = self.turning_system.check_turn_feasible(
-            self.speed, self.progress, seg.length, turn_plan, self.forward
-        )
-        
-        if not feasibility['feasible']:
-            # Too fast for this turn given remaining distance to the
-            # junction — brake hard (full braking force) and re-check next
-            # frame. If we run out of road before becoming feasible, the
-            # segment-end fallback (instant transition) kicks in instead of
-            # us blindly attempting an oversized, off-geometry arc.
-            self.speed = max(0.0, self.speed - config.CAR_BRAKING * dt)
-            self.target_speed = min(self.target_speed, self.speed)
-            self._braking = True
-            return
-        
-        # Feasible now (possibly after braking on previous frames) - start it
-        self.active_turn = turn_plan
-        print(f"🔄 Starting turn: {self.seg_idx} → {next_seg_idx} at progress {self.progress:.2f} "
-              f"(speed {self.speed * 3.6:.0f} km/h, radius {turn_plan.radius:.1f}m)")
+        return plan
     
     def _handle_segment_end(self, network, node_id: str):
         """Handle reaching end of current segment."""
@@ -460,6 +626,15 @@ class Car:
         diff = abs((self.heading - seg_heading + 180) % 360 - 180)
         self.forward = diff < 90
         
+        self.active_turn = None
+        self.planned_turn = None
+        self.planned_turn_key = None
+        self._lane_offset_factor = 1.0
+        self._recovery_start_factor = 1.0
+        # Apply the normal right-lane offset immediately - see the
+        # matching comment in teleport_to_named_point().
+        self._apply_plain_segment_position(seg)
+        
         # Clear trail
         self.trail.clear()
 
@@ -471,8 +646,6 @@ class Car:
         using validation.
         """
         x, y, heading, seg_idx, forward = network.get_start_point(name)
-        self.x = x
-        self.y = y
         self.heading = heading
         self.seg_idx = seg_idx
         self.progress = 0.0 if forward else 1.0
@@ -480,14 +653,33 @@ class Car:
         self.speed = 0
         self.target_speed = 0
         self.active_turn = None
+        self.planned_turn = None
+        self.planned_turn_key = None
+        self._lane_offset_factor = 1.0
+        self._recovery_start_factor = 1.0
+        # Apply the normal right-lane offset immediately (matching what
+        # continuous driving would show) instead of leaving the car at
+        # the raw centerline node coordinates - otherwise the very next
+        # physics frame "snaps" it sideways into its lane, which the
+        # (correctly strict) teleportation watchdog flags as a real jump.
+        self._apply_plain_segment_position(network.segments[seg_idx])
         self.trail.clear()
 
     def is_on_road(self, network) -> bool:
-        """Check if car is currently on any road."""
+        """Check if car is currently on any road.
+        
+        Matches what Renderer.draw_roads() actually paints: each segment's
+        rectangle, PLUS rounded end caps, PLUS (at real junctions, degree
+        3+) a widened corner-cutting fillet area (config.JUNCTION_WIDENING_M)
+        - real intersections have a much wider paved area at corners than
+        the connecting roads' width alone. Without this, a car sitting
+        exactly on the widened, visually-paved junction area could be
+        wrongly flagged as "off-road".
+        """
         pppm = config.PIXELS_PER_METER
         for seg in network.segments:
             half_width = (seg.width / 2) * pppm
-            # Simple point-to-segment distance check
+            # Point-to-segment distance (rectangle body)
             dx = seg.x2 - seg.x1
             dy = seg.y2 - seg.y1
             length_sq = dx * dx + dy * dy
@@ -499,6 +691,28 @@ class Car:
             dist = math.hypot(self.x - proj_x, self.y - proj_y)
             if dist <= half_width:
                 return True
+            # Rounded end caps (t was clamped to [0,1], so check the
+            # actual endpoints directly for the circular cap area beyond
+            # the rectangle's ends)
+            for ex, ey in ((seg.x1, seg.y1), (seg.x2, seg.y2)):
+                if math.hypot(self.x - ex, self.y - ey) <= half_width:
+                    return True
+        
+        # Widened junction fillets at real junctions (degree 3+)
+        for node_id, degree in network.node_degree.items():
+            if degree < 3:
+                continue
+            node_xy = network.nodes.get(node_id)
+            if node_xy is None:
+                continue
+            connected = network.node_connections.get(node_id, [])
+            if not connected:
+                continue
+            widest_seg = max((network.segments[i] for i in connected), key=lambda s: s.width)
+            radius_px = (widest_seg.width / 2 + config.JUNCTION_WIDENING_M) * pppm
+            if math.hypot(self.x - node_xy[0], self.y - node_xy[1]) <= radius_px:
+                return True
+        
         return False
     
     # --- Rendering ---

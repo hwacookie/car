@@ -111,8 +111,18 @@ class PhysicsValidator:
         pppm = config.PIXELS_PER_METER
         distance_m = distance_moved / pppm
         
-        # Maximum allowed: speed * dt * safety factor + margin for segment transitions
-        max_allowed_m = max(50, car.speed * dt * 3 + 20)
+        # Maximum allowed: the TRUE physical bound is exactly speed*dt (a
+        # car cannot travel further than that in one frame, full stop).
+        # Even with acceleration happening within the frame, using the
+        # post-update (higher) speed already over-estimates the true
+        # distance travelled, so speed*dt is a safe, tight upper bound -
+        # no multiplier is actually justified. The small extra margin here
+        # covers only floating-point noise and the straight-segment/arc
+        # split-frame hand-off (see Car._update_position_rails), not real
+        # bugs. Previous versions had a x3 multiplier + 3-50m FLOOR, which
+        # made obviously-wrong multi-meter jumps (backward snaps to stale
+        # tangent points, etc.) completely invisible.
+        max_allowed_m = car.speed * dt * 1.1 + 0.1
         
         if distance_m > max_allowed_m:
             import traceback
