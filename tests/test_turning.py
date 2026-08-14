@@ -148,7 +148,7 @@ class TurnTester:
             })
             
             # Check for instant heading snap (>30° in one frame at 60fps = 0.016s)
-            if heading_diff > 30.0 and frames_checked > 2:  # Skip first 2 frames (initialization)
+            if heading_diff > 30.0:
                 instant_snap_detected = True
                 violation_details = {
                     'type': 'instant_heading_snap',
