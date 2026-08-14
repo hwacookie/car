@@ -17,7 +17,6 @@ class TurnTester:
     """Automated turn tester with detailed violation reporting."""
     
     def __init__(self):
-        self.violations = []
         self.test_results = []
     
     def health_check(self) -> bool:
@@ -91,6 +90,7 @@ class TurnTester:
         state = self.get_state()
         initial_segment = state['segment']
         initial_pos = (state['x'], state['y'])
+        initial_heading = state['heading']
         print(f"   Starting at segment {initial_segment}")
         print(f"   Position: ({state['x']:.0f}, {state['y']:.0f})")
         print(f"   Heading: {state['heading']:.1f}°")
@@ -110,19 +110,30 @@ class TurnTester:
         print(f"   Reached {state['speed_kmh']:.0f} km/h")
         print(f"   {direction.upper()} blinker activated")
         print(f"\n🔍 Monitoring turn for {duration}s...")
-        print(f"   Checking for off-road violations every frame...")
+        print(f"   Checking for:")
+        print(f"     - Off-road violations")
+        print(f"     - Instant heading snaps (>30° per frame)")
+        print(f"     - Smooth circular arc progression")
         
         # Monitor turn
         start_time = time.time()
         frames_checked = 0
         segment_changed = False
         off_road_detected = False
+        instant_snap_detected = False
         violation_details = None
         positions = []
+        last_heading = initial_heading
+        max_heading_change_per_frame = 0.0
         
         while time.time() - start_time < duration:
             state = self.get_state()
             frames_checked += 1
+            current_heading = state['heading']
+            
+            # Calculate heading change (handle 360° wrap)
+            heading_diff = abs((current_heading - last_heading + 180) % 360 - 180)
+            max_heading_change_per_frame = max(max_heading_change_per_frame, heading_diff)
             
             # Record position
             positions.append({
@@ -130,15 +141,46 @@ class TurnTester:
                 'x': state['x'],
                 'y': state['y'],
                 'heading': state['heading'],
+                'heading_change': heading_diff,
                 'speed_kmh': state['speed_kmh'],
                 'segment': state['segment'],
                 'on_road': state['on_road']
             })
             
+            # Check for instant heading snap (>30° in one frame at 60fps = 0.016s)
+            if heading_diff > 30.0 and frames_checked > 2:  # Skip first 2 frames (initialization)
+                instant_snap_detected = True
+                violation_details = {
+                    'type': 'instant_heading_snap',
+                    'time': time.time() - start_time,
+                    'position': (state['x'], state['y']),
+                    'old_heading': last_heading,
+                    'new_heading': current_heading,
+                    'heading_change': heading_diff,
+                    'speed_kmh': state['speed_kmh'],
+                    'segment': state['segment'],
+                    'frame': frames_checked
+                }
+                
+                print(f"\n   ❌ INSTANT HEADING SNAP DETECTED!")
+                print(f"      Time: {violation_details['time']:.2f}s")
+                print(f"      Old heading: {last_heading:.1f}°")
+                print(f"      New heading: {current_heading:.1f}°")
+                print(f"      Change: {heading_diff:.1f}° (max allowed: 30°)")
+                print(f"      Position: ({violation_details['position'][0]:.0f}, {violation_details['position'][1]:.0f})")
+                print(f"      Speed: {violation_details['speed_kmh']:.0f} km/h")
+                
+                # Save screenshot
+                screenshot = self.save_violation_screenshot(f"{direction}_snap", state)
+                violation_details['screenshot'] = screenshot
+                
+                break
+            
             # Check for off-road violation
             if not state['on_road']:
                 off_road_detected = True
                 violation_details = {
+                    'type': 'off_road',
                     'time': time.time() - start_time,
                     'position': (state['x'], state['y']),
                     'heading': state['heading'],
@@ -155,7 +197,7 @@ class TurnTester:
                 print(f"      Segment: {violation_details['segment']}")
                 
                 # Save screenshot
-                screenshot = self.save_violation_screenshot(direction, state)
+                screenshot = self.save_violation_screenshot(f"{direction}_offroad", state)
                 violation_details['screenshot'] = screenshot
                 
                 break
@@ -167,8 +209,10 @@ class TurnTester:
                 print(f"      Segment changed: {initial_segment} → {state['segment']}")
                 print(f"      Time: {time.time() - start_time:.2f}s")
                 print(f"      Distance traveled: {((state['x'] - initial_pos[0])**2 + (state['y'] - initial_pos[1])**2)**0.5:.0f} pixels")
+                print(f"      Max heading change per frame: {max_heading_change_per_frame:.1f}°")
                 break
             
+            last_heading = current_heading
             time.sleep(0.05)  # Check at ~20 FPS
         
         # Stop car
@@ -184,18 +228,23 @@ class TurnTester:
             'final_segment': state['segment'],
             'segment_changed': segment_changed,
             'off_road_detected': off_road_detected,
+            'instant_snap_detected': instant_snap_detected,
+            'max_heading_change_per_frame': max_heading_change_per_frame,
             'violation_details': violation_details,
             'positions': positions,
-            'passed': segment_changed and not off_road_detected
+            'passed': segment_changed and not off_road_detected and not instant_snap_detected
         }
         
         # Summary
         print(f"\n{'─'*60}")
         print(f"   Frames checked: {frames_checked}")
         print(f"   Duration: {result['duration']:.2f}s")
+        print(f"   Max heading change per frame: {result['max_heading_change_per_frame']:.1f}°")
         
         if result['passed']:
-            print(f"   ✅ TEST PASSED: Turn completed, stayed on road")
+            print(f"   ✅ TEST PASSED: Smooth turn completed, stayed on road")
+        elif instant_snap_detected:
+            print(f"   ❌ TEST FAILED: Instant heading snap detected")
         elif off_road_detected:
             print(f"   ❌ TEST FAILED: Car went off-road")
         else:
@@ -204,8 +253,6 @@ class TurnTester:
         print(f"{'─'*60}\n")
         
         self.test_results.append(result)
-        if off_road_detected:
-            self.violations.append(violation_details)
         
         return result
     
@@ -260,20 +307,42 @@ class TurnTester:
         print("="*60)
         
         passed = sum(1 for r in self.test_results if r['passed'])
-        failed = sum(1 for r in self.test_results if r['off_road_detected'])
-        timeout = sum(1 for r in self.test_results if not r['segment_changed'] and not r['off_road_detected'])
+        failed_offroad = sum(1 for r in self.test_results if r['off_road_detected'])
+        failed_snap = sum(1 for r in self.test_results if r['instant_snap_detected'])
+        timeout = sum(1 for r in self.test_results if not r['segment_changed'] and not r['off_road_detected'] and not r['instant_snap_detected'])
         
         print(f"\nTotal tests: {len(self.test_results)}")
         print(f"  ✅ Passed: {passed}")
-        print(f"  ❌ Failed (off-road): {failed}")
+        print(f"  ❌ Failed (off-road): {failed_offroad}")
+        print(f"  ❌ Failed (instant snap): {failed_snap}")
         print(f"  ⚠️  Timeout (no turn): {timeout}")
         
-        if self.violations:
+        # Show detailed violations
+        snap_violations = [r for r in self.test_results if r['instant_snap_detected']]
+        offroad_violations = [r for r in self.test_results if r['off_road_detected']]
+        
+        if snap_violations:
             print(f"\n{'─'*60}")
-            print(f"VIOLATIONS DETECTED: {len(self.violations)}")
+            print(f"INSTANT HEADING SNAP VIOLATIONS: {len(snap_violations)}")
             print(f"{'─'*60}")
-            for i, v in enumerate(self.violations, 1):
-                print(f"\n{i}. Time: {v['time']:.2f}s")
+            for i, r in enumerate(snap_violations, 1):
+                v = r['violation_details']
+                print(f"\n{i}. {r['direction'].upper()} turn @ {r['target_speed_kmh']:.0f} km/h")
+                print(f"   Time: {v['time']:.2f}s")
+                print(f"   Heading change: {v['old_heading']:.1f}° → {v['new_heading']:.1f}° ({v['heading_change']:.1f}°)")
+                print(f"   Position: ({v['position'][0]:.0f}, {v['position'][1]:.0f})")
+                print(f"   Speed: {v['speed_kmh']:.0f} km/h")
+                if v.get('screenshot'):
+                    print(f"   Screenshot: {v['screenshot']}")
+        
+        if offroad_violations:
+            print(f"\n{'─'*60}")
+            print(f"OFF-ROAD VIOLATIONS: {len(offroad_violations)}")
+            print(f"{'─'*60}")
+            for i, r in enumerate(offroad_violations, 1):
+                v = r['violation_details']
+                print(f"\n{i}. {r['direction'].upper()} turn @ {r['target_speed_kmh']:.0f} km/h")
+                print(f"   Time: {v['time']:.2f}s")
                 print(f"   Position: ({v['position'][0]:.0f}, {v['position'][1]:.0f})")
                 print(f"   Speed: {v['speed_kmh']:.0f} km/h")
                 print(f"   Heading: {v['heading']:.1f}°")
@@ -282,10 +351,10 @@ class TurnTester:
         
         print("\n" + "="*60)
         
-        if failed == 0:
-            print("🎉 ALL TESTS PASSED! No off-road violations detected.")
+        if failed_offroad == 0 and failed_snap == 0:
+            print("🎉 ALL TESTS PASSED! Smooth turns, no violations.")
         else:
-            print(f"⚠️  {failed} test(s) failed. Review screenshots above.")
+            print(f"⚠️  {failed_offroad + failed_snap} test(s) failed. Review details above.")
         
         print("="*60 + "\n")
         
