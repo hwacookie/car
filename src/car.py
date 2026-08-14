@@ -13,6 +13,9 @@ from .turning_system import TurningSystem, TurnPlan
 class Car:
     """A car with physics, state, and rendering. Controlled by a Driver."""
     
+    # Class variable: cached sprite images
+    _sprite_cache = {}
+    
     def __init__(self, x: float, y: float, heading: float, seg_idx: int, driver=None):
         """x, y in world pixels. heading in degrees (0 = up/north)."""
         # Position and orientation
@@ -437,20 +440,54 @@ class Car:
         sx, sy = int(sx), int(sy)
         scale = camera.zoom
         
-        half_len = (config.CAR_LENGTH / 2) * config.PIXELS_PER_METER * scale
-        half_wid = (config.CAR_WIDTH / 2) * config.PIXELS_PER_METER * scale
+        # Load sprite (cached)
+        sprite = self._get_sprite(scale)
         
-        src = pygame.Surface((half_wid * 2 + 2, half_len * 2 + 2), pygame.SRCALPHA)
-        pygame.draw.rect(src, (180, 30, 30), pygame.Rect(1, 1, half_wid * 2, half_len * 2))
-        pygame.draw.rect(src, (215, 60, 60), pygame.Rect(1 + half_wid * 0.3, 1, half_wid * 1.4, half_len * 0.35))
+        # Rotate sprite
+        rotated = pygame.transform.rotate(sprite, -self.heading)
         
-        rotated = pygame.transform.rotozoom(src, -self.heading, 1)
-        surface.blit(rotated, (sx - rotated.get_width() // 2, sy - rotated.get_height() // 2))
+        # Center and draw
+        rect = rotated.get_rect(center=(sx, sy))
+        surface.blit(rotated, rect)
         
-        self._draw_headlights(surface, sx, sy, scale)
-        self._draw_taillights(surface, sx, sy, scale)
+        # Draw dynamic lights on top (blinkers, brake lights)
         if self.driver and self.driver.get_name() == "RAILS":
             self._draw_blinkers(surface, sx, sy, scale)
+    
+    def _get_sprite(self, zoom: float) -> pygame.Surface:
+        """Load and cache car sprite at appropriate size for zoom level."""
+        import os
+        from PIL import Image
+        
+        # Choose sprite size based on zoom
+        if zoom < 1.5:
+            sprite_file = 'car_32x64.png'
+        elif zoom < 3.0:
+            sprite_file = 'car_50x100.png'
+        else:
+            sprite_file = 'car_64x128.png'
+        
+        # Check cache
+        if sprite_file not in Car._sprite_cache:
+            # Load sprite using PIL (pygame doesn't have PNG support)
+            sprite_path = os.path.join(os.path.dirname(__file__), '..', 'assets', sprite_file)
+            if os.path.exists(sprite_path):
+                # Load with PIL
+                pil_image = Image.open(sprite_path).convert('RGBA')
+                # Convert PIL image to pygame surface
+                mode = pil_image.mode
+                size = pil_image.size
+                data = pil_image.tobytes()
+                surf = pygame.image.fromstring(data, size, mode)
+                Car._sprite_cache[sprite_file] = surf
+            else:
+                # Fallback: create simple colored rectangle if sprite not found
+                size = (32, 64) if '32' in sprite_file else (50, 100) if '50' in sprite_file else (64, 128)
+                surf = pygame.Surface(size, pygame.SRCALPHA)
+                pygame.draw.rect(surf, (180, 30, 30), surf.get_rect())
+                Car._sprite_cache[sprite_file] = surf
+        
+        return Car._sprite_cache[sprite_file]
     
     def _draw_headlights(self, surface: pygame.Surface, sx: float, sy: float, scale: float):
         half_wid = (config.CAR_WIDTH / 2) * config.PIXELS_PER_METER * scale

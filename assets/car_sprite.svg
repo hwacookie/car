@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 200" width="200" height="400">
+  <!-- Shadows -->
+  <rect x="12" y="15" width="76" height="175" rx="18" fill="#000000" opacity="0.25" />
+
+  <g id="car">
+    <!-- Wheels / Tires -->
+    <rect x="10" y="25" width="8" height="26" rx="3" fill="#1a1a1a" />
+    <rect x="82" y="25" width="8" height="26" rx="3" fill="#1a1a1a" />
+    <rect x="10" y="145" width="8" height="26" rx="3" fill="#1a1a1a" />
+    <rect x="82" y="145" width="8" height="26" rx="3" fill="#1a1a1a" />
+
+    <!-- Main Outer Body -->
+    <rect x="15" y="10" width="70" height="180" rx="20" fill="#d32f2f" stroke="#8e0000" stroke-width="2" />
+
+    <!-- Hood Lines -->
+    <path d="M 28 45 L 35 15 M 72 45 L 65 15" stroke="#b71c1c" stroke-width="2" fill="none" />
+    
+    <!-- Windshield (Front) -->
+    <path d="M 23 55 Q 50 48 77 55 L 73 80 Q 50 76 27 80 Z" fill="#263238" stroke="#102027" stroke-width="1.5" />
+    <!-- Front Windshield Reflection -->
+    <path d="M 28 57 Q 45 52 60 55 L 55 64 Q 42 62 29 64 Z" fill="#cfd8dc" opacity="0.4" />
+
+    <!-- Roof -->
+    <rect x="25" y="82" width="50" height="55" rx="6" fill="#e53935" />
+
+    <!-- Side Windows -->
+    <path d="M 21 62 L 24 82 L 24 135 L 21 130 Z" fill="#263238" />
+    <path d="M 79 62 L 76 82 L 76 135 L 79 130 Z" fill="#263238" />
+
+    <!-- Rear Window -->
+    <path d="M 27 140 Q 50 144 73 140 L 76 155 Q 50 160 24 155 Z" fill="#263238" stroke="#102027" stroke-width="1.5" />
+    <!-- Rear Window Reflection -->
+    <path d="M 30 143 Q 45 146 58 144 L 56 150 Q 44 152 31 150 Z" fill="#cfd8dc" opacity="0.3" />
+
+    <!-- Side Mirrors -->
+    <rect x="8" y="58" width="8" height="12" rx="3" fill="#d32f2f" />
+    <rect x="84" y="58" width="8" height="12" rx="3" fill="#d32f2f" />
+
+    <!-- Headlights -->
+    <rect x="20" y="11" width="12" height="6" rx="2" fill="#fff59d" />
+    <rect x="68" y="11" width="12" height="6" rx="2" fill="#fff59d" />
+
+    <!-- Taillights -->
+    <rect x="20" y="183" width="14" height="5" rx="1.5" fill="#ff1744" />
+    <rect x="66" y="183" width="14" height="5" rx="1.5" fill="#ff1744" />
+  </g>
+</svg>
