@@ -13,6 +13,7 @@ from .renderer import Renderer
 from .car import Car
 from .driver import Driver, KeyboardDriver, AIDriver
 from .physics_validator import PhysicsValidator
+from .rest_api import GameAPI
 
 
 def main(smoke_test_frames: int = 0):
@@ -50,6 +51,16 @@ def main(smoke_test_frames: int = 0):
     # --- Physics validator (can be toggled with V key) ---
     validator = PhysicsValidator(enabled=True)
     print("Physics validator: ENABLED (press V to toggle)")
+    
+    # --- REST API (optional, enable with --api flag) ---
+    api = None
+    if "--api" in sys.argv:
+        api = GameAPI()
+        api.start(port=5000)
+    elif not smoke_test_frames:
+        print("\n💡 Tip: Run with --api to enable REST API for remote control")
+        print("   Example: python -m src.main --api")
+        print("   Then: curl http://localhost:5000/state\n")
 
     # --- Camera + Renderer ---
     camera = Camera(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -136,9 +147,60 @@ def main(smoke_test_frames: int = 0):
         # In smoke test, simulate driving inputs
         if smoke_test_frames:
             keys = _FakeKeys(accel=True, right=(frame > smoke_test_frames // 2))
+        
+        # Handle API commands (if API enabled)
+        if api:
+            commands = api.get_commands()
+            
+            # Teleport command
+            if 'teleport' in commands:
+                teleport_params = commands['teleport']
+                if teleport_params.get('random'):
+                    car.teleport_random(network)
+                    validator.reset_car_state(car)
+                    print(f"\nAPI: Random teleport to segment {car.seg_idx}\n")
+                # TODO: Handle specific segment/progress teleport
+            
+            # Toggle command
+            if 'toggle' in commands:
+                toggle_params = commands['toggle']
+                if 'breadcrumbs' in toggle_params:
+                    car.trail_enabled = toggle_params['breadcrumbs']
+                    print(f"API: Breadcrumbs {'ON' if car.trail_enabled else 'OFF'}")
+                if 'validator' in toggle_params:
+                    if toggle_params['validator']:
+                        validator.enable()
+                    else:
+                        validator.disable()
+                if 'mode' in toggle_params:
+                    mode = toggle_params['mode']
+                    if mode == 'rails' and not isinstance(car.driver, AIDriver):
+                        car.driver = AIDriver()
+                        car.snap_to_road(network)
+                        print("API: Switched to RAILS mode")
+                    elif mode == 'free' and not isinstance(car.driver, KeyboardDriver):
+                        car.driver = KeyboardDriver()
+                        print("API: Switched to FREE mode")
 
-        # Get control input from driver
+        # Get control input from driver (keyboard or API)
         control_input = car.driver.get_control(car, network, dt, keys)
+        
+        # Merge API control inputs (if API enabled)
+        if api:
+            api_control = api.get_control()
+            # API control overrides keyboard for specific keys
+            if api_control['accelerate']:
+                control_input['accelerate'] = True
+            if api_control['brake']:
+                control_input['brake'] = True
+            if api_control['steer_left']:
+                control_input['steer_left'] = True
+            if api_control['steer_right']:
+                control_input['steer_right'] = True
+            if api_control['blinker_left']:
+                control_input['blinker_left'] = True
+            if api_control['blinker_right']:
+                control_input['blinker_right'] = True
         
         # Update car physics
         car.update(dt, network, control_input)
@@ -167,6 +229,36 @@ def main(smoke_test_frames: int = 0):
         car.draw(screen, camera)
 
         pygame.display.flip()
+        
+        # Update API state and screenshot (if API enabled)
+        if api:
+            api.update_state({
+                'frame': frame,
+                'time': frame * dt_fixed if smoke_test_frames else frame / 60.0,
+                'x': car.x,
+                'y': car.y,
+                'heading': car.heading,
+                'speed': car.speed,
+                'speed_kmh': car.speed * 3.6,
+                'segment': car.seg_idx,
+                'progress': car.progress,
+                'forward': car.forward,
+                'on_road': car.is_on_road(network),
+                'driver': car.driver.get_name(),
+                'trail_enabled': car.trail_enabled,
+                'validator_enabled': validator.enabled,
+                'camera_x': camera.x,
+                'camera_y': camera.y,
+                'camera_zoom': camera.zoom,
+            })
+            
+            # Update screenshot (every 10 frames to reduce overhead)
+            if frame % 10 == 0:
+                # Convert surface to PNG bytes
+                import io
+                png_io = io.BytesIO()
+                pygame.image.save(screen, png_io, 'car_frame.png')
+                api.update_screenshot(png_io.getvalue())
 
         # Debug: dump framebuffer after a few frames
         if "--dump" in sys.argv and frame == 30:
