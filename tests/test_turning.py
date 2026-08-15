@@ -110,8 +110,87 @@ class TurnTester:
             print(f"      ⚠️  Screenshot failed: {e}")
         return None
     
+    def _drive_to_segment_end_and_stop(self, target_segment: int, start_time: float,
+                                        max_extra_time: float = 25.0):
+        """Having just arrived on the designated target segment, keep
+        actually driving it (don't just release controls mid-segment) -
+        brake as we approach ITS far end and confirm the car really comes
+        to a full stop there, same as a human driver pulling in and
+        parking rather than abandoning the car halfway down the road.
+        
+        Returns (final_position, stopped_cleanly: bool, details: dict).
+        details may include off_road/instant_snap/teleport/game_crashed
+        flags and a violation_details dict, same shape as monitor_turn's
+        own violation reporting, for the caller to fold in.
+        """
+        details = {}
+        last_heading = None
+        last_pos = None
+        last_time = time.time()
+        braking_commanded = False
+        deadline = time.time() + max_extra_time
+        
+        while time.time() < deadline:
+            try:
+                state = self.get_state()
+            except requests.exceptions.RequestException as e:
+                details['game_crashed'] = True
+                details['violation_details'] = {'type': 'game_crashed', 'error': str(e)}
+                return (last_pos or (0, 0)), False, details
+            
+            pos = (state['x'], state['y'])
+            if last_heading is not None:
+                heading_diff = abs((state['heading'] - last_heading + 180) % 360 - 180)
+                if heading_diff > 30.0:
+                    details['instant_snap'] = True
+                    details['violation_details'] = {'type': 'instant_heading_snap', 'position': pos}
+                    return pos, False, details
+            last_heading = state['heading']
+            
+            if not state['on_road']:
+                details['off_road'] = True
+                details['violation_details'] = {'type': 'off_road', 'position': pos}
+                return pos, False, details
+            
+            now = time.time()
+            if last_pos is not None:
+                poll_dt = now - last_time
+                moved_m = ((pos[0] - last_pos[0]) ** 2 + (pos[1] - last_pos[1]) ** 2) ** 0.5 / 2.0
+                max_plausible_m = max(state['speed_kmh'] / 3.6, 50.0) * poll_dt * 1.5 + 1.0
+                if moved_m > max_plausible_m:
+                    details['teleport'] = True
+                    details['violation_details'] = {'type': 'teleport', 'position': pos, 'distance_m': moved_m}
+                    return pos, False, details
+            last_pos = pos
+            last_time = now
+            
+            if state['segment'] != target_segment:
+                # Drove clean through and out the other side without ever
+                # needing to brake (e.g. a very short target segment) -
+                # that's fine, nothing to stop for; treat as parked.
+                return pos, True, details
+            
+            progress = state.get('progress', 0.5)
+            forward = state.get('forward', True)
+            near_end = progress >= 0.92 if forward else progress <= 0.08
+            
+            if near_end or state['speed_kmh'] < 1.0:
+                braking_commanded = True
+                self.send_control(accelerate=False, brake=True)
+            elif not braking_commanded:
+                self.send_control(accelerate=True, brake=False)
+            
+            if braking_commanded and state['speed_kmh'] < 1.0:
+                self.send_control(accelerate=False, brake=False)
+                return pos, True, details
+            
+            time.sleep(0.05)
+        
+        # Ran out of time without coming to a stop on the target segment.
+        return (last_pos or (0, 0)), False, details
+    
     def monitor_turn(self, direction: str, duration: float = 15.0, target_speed: float = 50.0,
-                      start_point: str | None = None) -> dict:
+                      start_point: str | None = None, expected_end_segment: int | None = None) -> dict:
         """Monitor a turn for violations.
         
         Args:
@@ -120,6 +199,19 @@ class TurnTester:
             target_speed: Target speed in km/h
             start_point: If given, teleport to this deterministic named start
                 point (synthetic test map) instead of a random location.
+            expected_end_segment: If given, the test only PASSES if the car
+                ends up on exactly this segment - not just "any segment
+                change" (which would silently pass even if e.g. a LEFT
+                turn actually went RIGHT, as long as it went somewhere -
+                this is exactly the kind of bug that slipped through
+                before the API-blinker-routing fix). Monitoring keeps
+                running across MULTIPLE segment changes (e.g. a
+                roundabout: entry -> ring -> ring -> exit) until this
+                exact segment is reached, a violation occurs, or duration
+                runs out. If None (only used for the legacy random-
+                location suite, where there's no way to know the correct
+                answer in advance), falls back to the old "any change"
+                behavior.
         
         Returns:
             dict with test results
@@ -168,27 +260,98 @@ class TurnTester:
         
         print(f"   Reached {state['speed_kmh']:.0f} km/h")
         print(f"   {direction.upper()} blinker activated")
+        if expected_end_segment is not None:
+            print(f"   Expected end segment: {expected_end_segment}")
         print(f"\n🔍 Monitoring turn for {duration}s...")
         print(f"   Checking for:")
         print(f"     - Off-road violations")
         print(f"     - Instant heading snaps (>30° per frame)")
         print(f"     - Smooth circular arc progression")
+        print(f"     - Arriving at the {'expected' if expected_end_segment is not None else 'designated'} end segment")
         
         # Monitor turn
         start_time = time.time()
         frames_checked = 0
         segment_changed = False
+        reached_expected_segment = False
         off_road_detected = False
         instant_snap_detected = False
+        teleport_detected = False
+        game_crashed = False
+        stopped_ok = False
         violation_details = None
         positions = []
+        final_pos = initial_pos
         last_heading = initial_heading
         max_heading_change_per_frame = 0.0
+        last_poll_pos = initial_pos
+        last_poll_speed_kmh = 0.0
+        last_poll_time = time.time()
         
         while time.time() - start_time < duration:
-            state = self.get_state()
+            # A teleport-watchdog violation inside the game crashes that
+            # process outright (a deliberate hard invariant - see
+            # PhysicsValidator / docs/SPEC.md's "Physics Judge"
+            # philosophy) - which would otherwise take the WHOLE test
+            # suite down with an unhandled connection error. Treat losing
+            # the connection mid-test as its own violation (failing just
+            # this one test) instead of letting it kill everything after.
+            try:
+                state = self.get_state()
+            except requests.exceptions.RequestException as e:
+                game_crashed = True
+                violation_details = {
+                    'type': 'game_crashed',
+                    'time': time.time() - start_time,
+                    'error': str(e),
+                }
+                print(f"\n   ❌ GAME PROCESS CRASHED / CONNECTION LOST!")
+                print(f"      Time: {violation_details['time']:.2f}s")
+                print(f"      Likely cause: an internal teleportation-watchdog violation "
+                      f"(see the game's own console output/log)")
+                print(f"      Error: {e}")
+                break
             frames_checked += 1
             current_heading = state['heading']
+            
+            # Client-side teleport/jump check: an independent, coarser
+            # safety net alongside the game's own internal (per-physics-
+            # frame) teleportation watchdog - catches large jumps between
+            # POLLS too, using the actual measured wall-clock gap (not an
+            # assumed fixed frame dt, since polling isn't frame-locked).
+            now = time.time()
+            poll_dt = now - last_poll_time
+            moved_px = ((state['x'] - last_poll_pos[0]) ** 2 + (state['y'] - last_poll_pos[1]) ** 2) ** 0.5
+            moved_m = moved_px / 2.0  # PIXELS_PER_METER (see src/config.py)
+            # Generous margin: highest plausible speed (~50 m/s cruise)
+            # times the actual poll gap, plus slack for polling jitter
+            # and the accelerate-from-a-stop ramp-up.
+            max_plausible_m = max(last_poll_speed_kmh / 3.6, 50.0) * poll_dt * 1.5 + 1.0
+            if frames_checked > 1 and moved_m > max_plausible_m:
+                teleport_detected = True
+                violation_details = {
+                    'type': 'teleport',
+                    'time': now - start_time,
+                    'from_position': last_poll_pos,
+                    'to_position': (state['x'], state['y']),
+                    'distance_m': moved_m,
+                    'max_plausible_m': max_plausible_m,
+                    'speed_kmh': state['speed_kmh'],
+                    'segment': state['segment'],
+                }
+                print(f"\n   ❌ TELEPORTATION / UNEXPECTED JUMP DETECTED!")
+                print(f"      Time: {violation_details['time']:.2f}s")
+                print(f"      From: ({last_poll_pos[0]:.0f}, {last_poll_pos[1]:.0f}) "
+                      f"→ To: ({state['x']:.0f}, {state['y']:.0f})")
+                print(f"      Distance: {moved_m:.1f}m (max plausible: {max_plausible_m:.1f}m "
+                      f"over {poll_dt:.3f}s)")
+                print(f"      Speed: {violation_details['speed_kmh']:.0f} km/h")
+                screenshot = self.save_violation_screenshot(f"{direction}_teleport", state)
+                violation_details['screenshot'] = screenshot
+                break
+            last_poll_pos = (state['x'], state['y'])
+            last_poll_speed_kmh = state['speed_kmh']
+            last_poll_time = now
             
             # Calculate heading change (handle 360° wrap)
             heading_diff = abs((current_heading - last_heading + 180) % 360 - 180)
@@ -261,21 +424,67 @@ class TurnTester:
                 
                 break
             
-            # Check if segment changed (turn completed)
+            # Check if segment changed. If we have a SPECIFIC expected
+            # end segment, only that counts as arrival - a mere change to
+            # some OTHER segment (e.g. a wrong turn) is noted but keeps
+            # monitoring (the car might still be mid-maneuver, as on a
+            # roundabout: entry segment -> ring -> ring -> exit segment -
+            # only the last of those is "done"). Without an expected
+            # segment (legacy random-location mode only), any change at
+            # all is accepted, same as before.
             if state['segment'] != initial_segment:
-                segment_changed = True
-                print(f"\n   ✅ Turn completed!")
-                print(f"      Segment changed: {initial_segment} → {state['segment']}")
-                print(f"      Time: {time.time() - start_time:.2f}s")
-                print(f"      Distance traveled: {((state['x'] - initial_pos[0])**2 + (state['y'] - initial_pos[1])**2)**0.5:.0f} pixels")
-                print(f"      Max heading change per frame: {max_heading_change_per_frame:.1f}°")
-                break
+                if not segment_changed:
+                    segment_changed = True
+                    print(f"\n   ℹ️  Segment changed: {initial_segment} → {state['segment']} "
+                          f"(t={time.time() - start_time:.2f}s)")
+                if expected_end_segment is None or state['segment'] == expected_end_segment:
+                    reached_expected_segment = True
+                    print(f"\n   ✅ Reached designated end segment {state['segment']}!")
+                    print(f"      Time: {time.time() - start_time:.2f}s")
+                    print(f"      Max heading change per frame: {max_heading_change_per_frame:.1f}°")
+                    # Don't just stop watching the instant we arrive on
+                    # the target segment - actually drive all the way to
+                    # ITS far end and come to a stop there, so "arrived"
+                    # means a real, completed, parked maneuver (matching
+                    # what a human driver would do: pull all the way in
+                    # and stop, not abandon the car halfway down the new
+                    # road).
+                    final_pos, stopped_ok, stop_details = self._drive_to_segment_end_and_stop(
+                        state['segment'], start_time
+                    )
+                    if not stopped_ok:
+                        off_road_detected = off_road_detected or stop_details.get('off_road', False)
+                        instant_snap_detected = instant_snap_detected or stop_details.get('instant_snap', False)
+                        teleport_detected = teleport_detected or stop_details.get('teleport', False)
+                        game_crashed = game_crashed or stop_details.get('game_crashed', False)
+                        if stop_details.get('violation_details'):
+                            violation_details = stop_details['violation_details']
+                    print(f"      Start: ({initial_pos[0]:.0f}, {initial_pos[1]:.0f}) seg {initial_segment} "
+                          f"\u2192 End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}"
+                          f"{' (stopped)' if stopped_ok else ' (did NOT stop cleanly)'}")
+                    print(f"      Distance traveled: {((final_pos[0] - initial_pos[0])**2 + (final_pos[1] - initial_pos[1])**2)**0.5:.0f} pixels")
+                    break
             
             last_heading = current_heading
             time.sleep(0.05)  # Check at ~20 FPS
+        else:
+            final_pos = (state['x'], state['y'])
         
-        # Stop car
-        self.reset_controls()
+        # Stop car (best-effort - the game may have crashed, in which
+        # case this is just a no-op rather than another unhandled error)
+        try:
+            self.reset_controls()
+        except requests.exceptions.RequestException:
+            pass
+        
+        passed = (
+            reached_expected_segment
+            and stopped_ok
+            and not off_road_detected
+            and not instant_snap_detected
+            and not teleport_detected
+            and not game_crashed
+        )
         
         # Prepare results
         result = {
@@ -285,14 +494,21 @@ class TurnTester:
             'frames_checked': frames_checked,
             'duration': time.time() - start_time,
             'initial_segment': initial_segment,
+            'expected_end_segment': expected_end_segment,
             'final_segment': state['segment'],
+            'start_position': initial_pos,
+            'end_position': final_pos,
             'segment_changed': segment_changed,
+            'reached_expected_segment': reached_expected_segment,
+            'stopped_at_end': stopped_ok,
             'off_road_detected': off_road_detected,
             'instant_snap_detected': instant_snap_detected,
+            'teleport_detected': teleport_detected,
+            'game_crashed': game_crashed,
             'max_heading_change_per_frame': max_heading_change_per_frame,
             'violation_details': violation_details,
             'positions': positions,
-            'passed': segment_changed and not off_road_detected and not instant_snap_detected
+            'passed': passed
         }
         
         # Summary
@@ -301,14 +517,29 @@ class TurnTester:
         print(f"   Duration: {result['duration']:.2f}s")
         print(f"   Max heading change per frame: {result['max_heading_change_per_frame']:.1f}°")
         
+        print(f"   Start: ({initial_pos[0]:.0f}, {initial_pos[1]:.0f}) seg {initial_segment}  "
+              f"End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}"
+              + (f"  (expected seg {expected_end_segment})" if expected_end_segment is not None else ""))
+        
         if result['passed']:
-            print(f"   ✅ TEST PASSED: Smooth turn completed, stayed on road")
+            print(f"   ✅ TEST PASSED: Reached designated end segment, drove to its end "
+                  f"and stopped there, stayed on road, no violations")
+        elif game_crashed:
+            print(f"   ❌ TEST FAILED: Game process crashed / connection lost mid-test")
+        elif teleport_detected:
+            print(f"   ❌ TEST FAILED: Teleportation/unexpected jump detected")
         elif instant_snap_detected:
             print(f"   ❌ TEST FAILED: Instant heading snap detected")
         elif off_road_detected:
             print(f"   ❌ TEST FAILED: Car went off-road")
+        elif expected_end_segment is not None and segment_changed and not reached_expected_segment:
+            print(f"   ❌ TEST FAILED: Ended on segment {state['segment']}, "
+                  f"expected {expected_end_segment} (wrong turn/route!)")
+        elif reached_expected_segment and not stopped_ok:
+            print(f"   ❌ TEST FAILED: Reached the end segment but never came to a "
+                  f"clean stop at its far end")
         else:
-            print(f"   ⚠️  TEST TIMEOUT: No segment change in {duration}s")
+            print(f"   ⚠️  TEST TIMEOUT: Never reached the designated end segment in {duration}s")
         
         print(f"{'─'*60}\n")
         
@@ -386,7 +617,7 @@ class TurnTester:
         print("  5. Check for off-road violations and instant heading snaps")
         print("\n" + "="*60)
 
-        # (start_point, direction, speed_kmh)
+        # (start_point, direction, speed_kmh, expected_end_segment, duration=15.0)
         #
         # speed_kmh is just how fast we wait to reach before we start
         # watching - NOT a fixed cruising/cornering speed. In RAILS mode
@@ -399,28 +630,38 @@ class TurnTester:
         # doesn't exercise different driving behavior - it's the same
         # "floor it, brake only as needed for the corner" behavior every
         # time - hence one run per corner is enough.
+        #
+        # expected_end_segment is REQUIRED (not just "did some segment
+        # change happen") - a test only really passes if the car actually
+        # arrives at its designated destination segment. Without this,
+        # e.g. a LEFT turn that actually went RIGHT would still "pass" as
+        # long as it ended up SOMEWHERE else - which is exactly the kind
+        # of bug (API-driven blinkers not reaching the driver's actual
+        # routing logic) that slipped through before this was added.
+        # These segment indices come from src/test_maps.py's
+        # build_basic_test_map() and were verified against actual runs.
         tests = [
             # 90-degree corners (the classic reported bug)
-            ('corner_right_entry', 'right', 80),
-            ('corner_left_entry', 'left', 80),
+            ('corner_right_entry', 'right', 80, 2),
+            ('corner_left_entry', 'left', 80, 4),
             # T-junction (perpendicular 3-way)
-            ('tjunction_from_top', 'left', 80),
-            ('tjunction_from_top', 'right', 80),
+            ('tjunction_from_top', 'left', 80, 6),
+            ('tjunction_from_top', 'right', 80, 7),
             # Y-intersection (shallow ~40 degree diverging angles)
-            ('y_from_stem', 'left', 80),
-            ('y_from_stem', 'right', 80),
+            ('y_from_stem', 'left', 80, 9),
+            ('y_from_stem', 'right', 80, 10),
             # 4-way crossroads
-            ('crossroads_from_north', 'left', 80),
-            ('crossroads_from_north', 'right', 80),
-            ('crossroads_from_north', 'straight', 80),
+            ('crossroads_from_north', 'left', 80, 13),
+            ('crossroads_from_north', 'right', 80, 14),
+            ('crossroads_from_north', 'straight', 80, 12),
             # One-way street (legal direction)
-            ('oneway_entry', 'straight', 80),
+            ('oneway_entry', 'straight', 80, 16),
             # Simple curves (degree-2 nodes, no blinker needed)
-            ('s_curve', 'straight', 80),
-            ('hairpin_entry', 'straight', 80),
-            ('sweeping_curve', 'straight', 80),
+            ('s_curve', 'straight', 80, 20),
+            ('hairpin_entry', 'straight', 80, 25),
+            ('sweeping_curve', 'straight', 80, 27),
             # Hairpin, entered from the opposite end (reverse direction)
-            ('hairpin_exit', 'straight', 80),
+            ('hairpin_exit', 'straight', 80, 24),
             # Roundabout (one-way ring, 4 two-way spokes). 'straight'
             # (or 'left') at the entry just merges onto the ring and then
             # keeps circling it FOREVER - a one-way loop has no "next
@@ -428,19 +669,24 @@ class TurnTester:
             # actually exits onto a spoke. 'right' does that here
             # (verified: exits east, segments 36->28->29->37) - a real,
             # completed roundabout maneuver instead of an endless circle.
-            # Takes longer than a normal turn (~25s to go most of the way
-            # around before exiting), hence the longer duration override.
-            ('roundabout_from_north', 'right', 40, 30.0),
+            # Monitoring now correctly keeps running THROUGH the
+            # intermediate ring segments (28, 29) instead of stopping at
+            # the first one, since only 37 (the actual exit) counts as
+            # arrival. Takes longer than a normal turn (~25s to go most
+            # of the way around before exiting), hence the longer
+            # duration override.
+            ('roundabout_from_north', 'right', 40, 37, 30.0),
         ]
 
         for i, test in enumerate(tests, 1):
-            start_point, direction, speed = test[0], test[1], test[2]
-            duration = test[3] if len(test) > 3 else 15.0
+            start_point, direction, speed, expected_end_segment = test[0], test[1], test[2], test[3]
+            duration = test[4] if len(test) > 4 else 15.0
             print(f"\n\n{'#'*60}")
             print(f"# TEST {i}/{len(tests)}: '{start_point}' -> {direction.upper()} @ {speed} km/h")
             print(f"{'#'*60}")
 
-            self.monitor_turn(direction, duration=duration, target_speed=speed, start_point=start_point)
+            self.monitor_turn(direction, duration=duration, target_speed=speed, start_point=start_point,
+                               expected_end_segment=expected_end_segment)
 
             if i < len(tests):
                 print("\n⏸️  Pausing 1s before next test...")
@@ -457,13 +703,29 @@ class TurnTester:
         passed = sum(1 for r in self.test_results if r['passed'])
         failed_offroad = sum(1 for r in self.test_results if r['off_road_detected'])
         failed_snap = sum(1 for r in self.test_results if r['instant_snap_detected'])
-        timeout = sum(1 for r in self.test_results if not r['segment_changed'] and not r['off_road_detected'] and not r['instant_snap_detected'])
+        failed_teleport = sum(1 for r in self.test_results if r.get('teleport_detected'))
+        failed_crashed = sum(1 for r in self.test_results if r.get('game_crashed'))
+        failed_wrong_route = sum(
+            1 for r in self.test_results
+            if r['segment_changed'] and not r['reached_expected_segment']
+            and not r['off_road_detected'] and not r['instant_snap_detected']
+            and not r.get('teleport_detected') and not r.get('game_crashed')
+        )
+        timeout = sum(
+            1 for r in self.test_results
+            if not r['reached_expected_segment'] and not r['off_road_detected']
+            and not r['instant_snap_detected'] and not r.get('teleport_detected')
+            and not r.get('game_crashed') and not r['segment_changed']
+        )
         
         print(f"\nTotal tests: {len(self.test_results)}")
         print(f"  ✅ Passed: {passed}")
         print(f"  ❌ Failed (off-road): {failed_offroad}")
         print(f"  ❌ Failed (instant snap): {failed_snap}")
-        print(f"  ⚠️  Timeout (no turn): {timeout}")
+        print(f"  ❌ Failed (teleport/jump): {failed_teleport}")
+        print(f"  ❌ Failed (game crashed): {failed_crashed}")
+        print(f"  ❌ Failed (wrong end segment): {failed_wrong_route}")
+        print(f"  ⚠️  Timeout (never arrived): {timeout}")
         
         # Show detailed violations
         snap_violations = [r for r in self.test_results if r['instant_snap_detected']]

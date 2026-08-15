@@ -427,18 +427,20 @@ class Car:
             recovery_start = getattr(self, '_recovery_start_factor', 1.0)
             self._lane_offset_factor = recovery_start + (1.0 - recovery_start) * recovery_progress
             
-            # No turn plan means either a genuine dead end or nothing
-            # geometrically fits (even at the mechanical minimum) - in
-            # BOTH cases there's no arc to smoothly carry us past this
-            # junction, so brake toward a full stop by the time we get
-            # there instead of barreling into it at cruise speed (which
-            # used to be an instant, jarring stop - or worse, on a long
-            # dead-end segment, an actual position-teleport bug; see
-            # _handle_segment_end). Same full-strength braking math as
-            # the turn-approach case above, just targeting speed 0 at
-            # the junction itself rather than a fixed turn speed at the
-            # tangent point.
-            if self.speed > 0:
+            # Only brake to a full stop here for a GENUINE dead end (no
+            # next segment at all) - NOT merely "no smooth arc fit this
+            # junction" (a valid next segment can still exist then; the
+            # segment-end instant-transition fallback handles that case
+            # in _handle_segment_end). Conflating the two used to brake
+            # the car to a stop and leave it permanently stuck just short
+            # of perfectly ordinary junctions whenever no arc validated -
+            # a real regression once introduced. A genuine dead end
+            # brakes smoothly toward a full stop by the time we get there
+            # instead of barreling into it at cruise speed (which used to
+            # be an instant, jarring stop - or worse, on a long dead-end
+            # segment, an actual position-teleport bug; see
+            # _handle_segment_end).
+            if getattr(self, '_pending_junction_is_dead_end', False) and self.speed > 0:
                 braking_distance_m = (self.speed ** 2) / (2 * config.CAR_BRAKING)
                 safety_margin_m = 5.0
                 if remaining_to_junction_m <= braking_distance_m + safety_margin_m:
@@ -530,9 +532,22 @@ class Car:
         next_seg_idx = network.choose_next_segment(self.seg_idx, junction_node, turn)
         
         if next_seg_idx is None or next_seg_idx == self.seg_idx:
+            # A genuine dead end (no valid next segment at all) - as
+            # opposed to "a next segment exists but no smooth arc could
+            # be built for it" below, which is NOT a dead end and must
+            # NOT brake to a stop the same way (see the caller in
+            # _update_position_rails - conflating the two used to make
+            # the car brake to a stop and get permanently stuck just
+            # short of an ordinary junction whenever no arc validated,
+            # even though a perfectly valid next segment existed and the
+            # segment-end instant-transition fallback would have handled
+            # it fine).
+            self._pending_junction_is_dead_end = True
             self.planned_turn = None
             self.planned_turn_key = None
             return None
+        
+        self._pending_junction_is_dead_end = False
         
         key = (self.seg_idx, next_seg_idx, junction_node)
         if self.planned_turn_key == key and self.planned_turn is not None:
