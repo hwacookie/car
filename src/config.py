@@ -31,9 +31,9 @@ ROAD_EDGE_TOLERANCE_M = 0.5  # shared slack between planned-arc validation and l
 
 # Zoom limits: viewport width = WINDOW_WIDTH / (zoom * PIXELS_PER_METER)
 # MAX_ZOOM  -> ~40 m viewport (zoomed in)
-# MIN_ZOOM  -> ~1000 m viewport (zoomed out)
+# MIN_ZOOM  -> ~3000 m viewport (zoomed out)
 MAX_ZOOM = 16.0
-MIN_ZOOM = 0.64
+MIN_ZOOM = 0.12
 ZOOM_STEP = 1.15
 
 # --- Car ---

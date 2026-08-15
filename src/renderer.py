@@ -12,6 +12,30 @@ from .road_network import RoadNetwork
 from .camera import Camera
 
 
+def make_grass_background(w: int, h: int, tile_size: int = 32) -> pygame.Surface:
+    """Pre-render a tiled grass texture for the screen background, modeled
+    on the RQ 31 reference SVG: base #4c702e with sparse lighter grass
+    strokes (#6f963f) and a couple of small lighter/darker dots. Built
+    once and blitted as the full background each frame - static, since
+    the pattern is uniform and doesn't need to follow the camera."""
+    tile = pygame.Surface((tile_size, tile_size), pygame.SRCALPHA)
+    tile.fill((76, 112, 46, 255))                        # #4c702e base
+    stroke = (111, 150, 63, 140)                          # #6f963f @ ~55%
+    for (x1, y1, x2, y2) in (
+        (2, 8, 7, 5), (17, 5, 21, 11), (25, 25, 31, 21),
+        (5, 27, 8, 20), (20, 18, 28, 20),
+    ):
+        pygame.draw.line(tile, stroke, (x1, y1), (x2, y2), 1)
+    pygame.draw.circle(tile, (120, 158, 72, 153), (10, 17), 2)  # #789e48 @ 60%
+    pygame.draw.circle(tile, (54, 86, 37, 153), (28, 8), 1)     # #365625 @ 60%
+
+    bg = pygame.Surface((w, h))
+    for ty in range(0, h, tile_size):
+        for tx in range(0, w, tile_size):
+            bg.blit(tile, (tx, ty))
+    return bg
+
+
 class Renderer:
     # Cache of PIL fonts by size (class-level, shared across instances)
     _pil_fonts: dict[int, object] = {}
@@ -19,6 +43,12 @@ class Renderer:
     def __init__(self, network: RoadNetwork, camera: Camera):
         self.network = network
         self.camera = camera
+        # HUD text is re-rendered via PIL only every Nth frame (~0.1s at
+        # 60fps) - text rasterization is the most expensive part of the
+        # HUD, and a 10 Hz speed readout is indistinguishable from 60 Hz.
+        self._hud_frame = 0
+        self._HUD_TEXT_INTERVAL = 6
+        self._hud_texts: dict[str, pygame.Surface] = {}
         # Note: pygame.font is broken on some platforms (SDL_ttf import
         # issue). All text rendering goes through PIL instead — see
         # _text_surface() below.
@@ -103,13 +133,45 @@ class Renderer:
         w, h = surface.get_size()
         zoom = self.camera.zoom
         pppm = config.PIXELS_PER_METER
-        dash_m = 3.0
-        gap_m = 3.0
-        dash_px = dash_m * pppm
-        gap_px = gap_m * pppm
+        # Plain road centerlines vs. the Autobahn Leitlinie (RQ 31:
+        # 6 m dash / 12 m gap).
+        c_dash_px, c_gap_px = 3.0 * pppm, 3.0 * pppm
+        l_dash_px, l_gap_px = 6.0 * pppm, 12.0 * pppm
 
-        for coords in self.network.get_centerlines():
-            self._draw_dashed_polyline(surface, coords, dash_px, gap_px, w, h)
+        # Fade the markings out as zoom decreases: a dash's on-screen
+        # length (dash_px * zoom) below ~1 px is just flickering noise.
+        # Fully opaque at >= 4 px, fully transparent at <= 1 px.
+        def dash_alpha(dash_px: float) -> int:
+            d = dash_px * zoom
+            return int(255 * max(0.0, min(1.0, (d - 1.0) / 3.0)))
+
+        a_c = dash_alpha(c_dash_px)
+        lane_marks = self.network.get_lane_markings()
+        a_l = dash_alpha(l_dash_px) if lane_marks else 0
+        if a_c > 0 or a_l > 0:
+            # Any alpha < 255 needs a per-pixel-alpha overlay; full
+            # opacity can draw straight onto the screen surface.
+            need_overlay = (0 < a_c < 255) or (0 < a_l < 255)
+            target = surface if not need_overlay else pygame.Surface((w, h), pygame.SRCALPHA)
+            if a_c > 0:
+                for coords in self.network.get_centerlines():
+                    self._draw_dashed_polyline(target, coords, c_dash_px, c_gap_px, w, h, a_c)
+            if a_l > 0:
+                # Multi-lane one-way carriageways, RQ 31: narrow solid
+                # median-side edge, dashed Leitlinie, broad solid
+                # Breitstrich at the stop lane, guardrails on medians.
+                # (get_centerlines() skips oneway roads, so no double
+                # draw.)
+                for style, coords, width_m in lane_marks:
+                    if style == "dashed":
+                        self._draw_dashed_polyline(target, coords, l_dash_px, l_gap_px, w, h, a_l)
+                    elif style == "solid":
+                        self._draw_solid_polyline(target, coords, w, h, a_l, width_m)
+                    else:  # guardrail
+                        self._draw_solid_polyline(
+                            target, coords, w, h, a_l, 0.15, (183, 189, 186))
+            if target is not surface:
+                surface.blit(target, (0, 0))
 
         dot_radius_px = 4
         for node_id, degree in self.network.node_degree.items():
@@ -124,11 +186,14 @@ class Renderer:
                 continue
             pygame.draw.circle(surface, (255, 255, 255), (int(sx), int(sy)), dot_radius_px)
 
-    def _draw_dashed_polyline(self, surface, coords, dash_px, gap_px, w, h):
+    def _draw_dashed_polyline(self, surface, coords, dash_px, gap_px, w, h,
+                              alpha=255):
         """Walk a polyline (world coords) at constant arc length, drawing
         alternating dash/gap segments - works for the rounded-corner
         centerlines (many short segments approximating an arc) just as
-        well as a single long straight stretch."""
+        well as a single long straight stretch. `alpha` fades the dashes
+        out at low zoom (see draw_road_markings); when it is < 255 the
+        surface must be SRCALPHA."""
         period = dash_px + gap_px
         if period <= 0:
             return
@@ -159,10 +224,28 @@ class Renderer:
                             (say < 0 and sby < 0) or (say > h and sby > h)):
                         # Real lane markings are ~0.15m wide, not 2m.
                         line_w = max(1, int(0.15 * config.PIXELS_PER_METER * self.camera.zoom))
-                        pygame.draw.line(surface, (255, 255, 255), (sax, say), (sbx, sby), line_w)
+                        pygame.draw.line(surface, (255, 255, 255, alpha), (sax, say), (sbx, sby), line_w)
 
                 traveled += step
                 distance_into_period += step
+
+    def _draw_solid_polyline(self, surface, coords, w, h, alpha=255,
+                             width_m: float = 0.15,
+                             color: tuple = (251, 251, 245)):
+        """Draw a solid line along a world-coordinate polyline - the
+        RQ 31 edge lines / Breitstrich / median guardrails of multi-lane
+        carriageways (see RoadNetwork.get_lane_markings). width_m >= 0.25
+        (the Breitstrich) is drawn at twice the normal line thickness.
+        When alpha < 255 the surface must be SRCALPHA."""
+        cam = self.camera
+        thin_w = max(1, int(0.15 * config.PIXELS_PER_METER * cam.zoom))
+        line_w = max(2, 2 * thin_w) if width_m >= 0.25 else thin_w
+        for i in range(len(coords) - 1):
+            ax, ay = cam.world_to_screen(*coords[i])
+            bx, by = cam.world_to_screen(*coords[i + 1])
+            if not ((ax < 0 and bx < 0) or (ax > w and bx > w) or
+                    (ay < 0 and by < 0) or (ay > h and by > h)):
+                pygame.draw.line(surface, (*color, alpha), (ax, ay), (bx, by), line_w)
 
     # --- Breadcrumb Trail ---
     # Fixed rainbow gradient (oldest -> newest) applied to the most recent
@@ -231,6 +314,17 @@ class Renderer:
             pygame.draw.line(surface, color, (right_x, right_y), (tip_x, tip_y), 2)
 
     # --- HUD / Dashboard ---
+    def _hud_text(self, key: str, text: str, size: int, color: tuple[int, int, int]) -> pygame.Surface:
+        """Cached HUD text: re-rendered via PIL only every Nth frame.
+        The previous surface is blitted in the meantime, so between
+        re-renders the (up to 0.1s) stale text is shown."""
+        self._hud_frame += 1
+        cached = self._hud_texts.get(key)
+        if cached is None or self._hud_frame % self._HUD_TEXT_INTERVAL == 0:
+            cached = self._text_surface(text, size, color)
+            self._hud_texts[key] = cached
+        return cached
+
     def draw_hud(self, surface: pygame.Surface, car):
         """Draw speedometer HUD in bottom-left corner of main window."""
         # Panel background
@@ -244,7 +338,7 @@ class Renderer:
         # top-right of the main window so it doesn't crowd the speedometer.
         label = getattr(self, 'hud_label', None)
         if label:
-            label_surf = self._text_surface(str(label), 28, (255, 255, 0))
+            label_surf = self._hud_text("label", str(label), 28, (255, 255, 0))
             lx = surface.get_width() - config.MINIMAP_MARGIN - label_surf.get_width() - 10
             ly = config.MINIMAP_MARGIN + config.MINIMAP_SIZE + 10
             pygame.draw.rect(surface, (20, 20, 20, 200),
@@ -265,12 +359,12 @@ class Renderer:
         driver_name = car.driver.get_name() if car.driver else "NONE"
         mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
 
-        surface.blit(self._text_surface(driver_name, 20, mode_color), (panel_x + 10, panel_y + 5))
-        surface.blit(self._text_surface("(TAB)", 12, (100, 100, 100)), (panel_x + 120, panel_y + 8))
+        surface.blit(self._hud_text("mode", driver_name, 20, mode_color), (panel_x + 10, panel_y + 5))
+        surface.blit(self._hud_text("tab", "(TAB)", 12, (100, 100, 100)), (panel_x + 120, panel_y + 8))
 
         # Speed number (large) + unit
-        surface.blit(self._text_surface(f"{kmh}", 54, color), (panel_x + 10, panel_y + 28))
-        surface.blit(self._text_surface("km/h", 20, (200, 200, 200)), (panel_x + 10, panel_y + 100))
+        surface.blit(self._hud_text("speed", f"{kmh}", 54, color), (panel_x + 10, panel_y + 28))
+        surface.blit(self._hud_text("unit", "km/h", 20, (200, 200, 200)), (panel_x + 10, panel_y + 100))
 
         # Speedometer arc (right side of panel)
         cx = panel_x + 170
@@ -308,19 +402,19 @@ class Renderer:
         # Brake
         if getattr(car, '_braking', False):
             pygame.draw.circle(surface, (255, 0, 0), (panel_x + panel_w - 25, indicator_y), 5)
-            surface.blit(self._text_surface("B", 12, (255, 255, 255)), (panel_x + panel_w - 29, indicator_y - 7))
+            surface.blit(self._hud_text("ind_b", "B", 12, (255, 255, 255)), (panel_x + panel_w - 29, indicator_y - 7))
         # Accel
         if getattr(car, '_accelerating', False):
             pygame.draw.circle(surface, (0, 255, 0), (panel_x + panel_w - 50, indicator_y), 5)
-            surface.blit(self._text_surface("A", 12, (255, 255, 255)), (panel_x + panel_w - 54, indicator_y - 7))
+            surface.blit(self._hud_text("ind_a", "A", 12, (255, 255, 255)), (panel_x + panel_w - 54, indicator_y - 7))
         # Blinker left
         if blinker_left:
             pygame.draw.circle(surface, (255, 180, 0), (panel_x + panel_w - 75, indicator_y), 5)
-            surface.blit(self._text_surface("L", 12, (255, 255, 255)), (panel_x + panel_w - 78, indicator_y - 7))
+            surface.blit(self._hud_text("ind_l", "L", 12, (255, 255, 255)), (panel_x + panel_w - 78, indicator_y - 7))
         # Blinker right
         if blinker_right:
             pygame.draw.circle(surface, (255, 180, 0), (panel_x + panel_w - 100, indicator_y), 5)
-            surface.blit(self._text_surface("R", 12, (255, 255, 255)), (panel_x + panel_w - 104, indicator_y - 7))
+            surface.blit(self._hud_text("ind_r", "R", 12, (255, 255, 255)), (panel_x + panel_w - 104, indicator_y - 7))
 
     # --- Minimap ---
     def draw_minimap(self, surface: pygame.Surface, car):
@@ -332,6 +426,11 @@ class Renderer:
         mm_rect = pygame.Rect(mm_x, mm_y, mm_w, mm_h)
         pygame.draw.rect(surface, config.MINIMAP_BG, mm_rect)
         pygame.draw.rect(surface, config.MINIMAP_BORDER, mm_rect, 2)
+
+        # Clip all map content to the minimap box - at low zoom the
+        # yellow viewport rectangle alone can be larger than the box.
+        prev_clip = surface.get_clip()
+        surface.set_clip(mm_rect)
 
         bounds = self.network.bounds
         sx = mm_w / bounds[2]
@@ -356,5 +455,7 @@ class Renderer:
         vp_y = mm_y + mm_h - (self.camera.y + (surface.get_height() / 2) / self.camera.zoom) * sy
         pygame.draw.rect(surface, (255, 255, 0), (int(vp_x), int(vp_y), int(vp_w), int(vp_h)), 2)
 
+        surface.set_clip(prev_clip)
+
         speed_kmh = int(car.speed * 3.6)
-        surface.blit(self._text_surface(f"{speed_kmh} km/h", 14, (255, 255, 255)), (mm_x + 6, mm_y + mm_h - 22))
+        surface.blit(self._hud_text("mm_speed", f"{speed_kmh} km/h", 14, (255, 255, 255)), (mm_x + 6, mm_y + mm_h - 22))

@@ -24,6 +24,11 @@ class RoadSegment:
     start_node: str = ""   # node id at (x1, y1)
     end_node: str = ""     # node id at (x2, y2)
     length: float = 0.0    # metres
+    lanes: int = 0         # lanes in the direction of travel; > 0 marks a
+                           # multi-lane one-way carriageway that gets
+                           # offset lane markings instead of a plain
+                           # dashed centerline
+    shoulder: float = 0.0  # metres of stop lane (shoulder) on the right
 
 
 @dataclass
@@ -362,6 +367,26 @@ class RoadNetwork:
             self._centerlines_cache = _build_centerlines(self)
         return self._centerlines_cache
 
+    def get_lane_markings(self):
+        """Lane markings for multi-lane one-way carriageways (segments
+        with lanes > 0), per the German RQ 31 layout (right-hand
+        traffic, from the median outward):
+
+          'solid'     narrow (0.15 m)  edge of the overtaking lane
+          'dashed'    (0.15 m, drawn with a 6 m / 12 m dash by the
+                      renderer) between the two driving lanes
+          'solid'     broad (0.30 m, Breitstrich) between the travel
+                      lane and the stop lane (no line on the outer
+                      edge of the stop lane)
+          'guardrail' light-gray crash barrier at each edge of a
+                      central median between two parallel carriageways
+
+        Returns a list of (style, coords, width_m) tuples.
+        Cached - the road network never changes at runtime."""
+        if getattr(self, "_lane_markings_cache", None) is None:
+            self._lane_markings_cache = _build_lane_markings(self)
+        return self._lane_markings_cache
+
     def random_road_point(self) -> tuple[float, float, float, int, str]:
         """Return a random (x, y, heading, seg_idx, node_id) on any road segment.
         Heading in degrees, 0=up. node_id is the start node."""
@@ -466,6 +491,123 @@ def _build_centerlines(network: "RoadNetwork"):
     _merge_and_round_lines(only_two_way=...)."""
     groups = _merge_and_round_lines(network, only_two_way=True)
     return [coords for lines in groups.values() for coords in lines]
+
+
+def _build_lane_markings(network: "RoadNetwork"):
+    """Offset lane-marking lines for multi-lane one-way carriageways.
+
+    For a carriageway of total width W with S metres of stop lane on the
+    right (right-hand traffic), measured as distances from the centerline
+    in the direction of travel (+ = left of travel):
+
+      solid   +W/2        left edge (edge of the overtaking lane)
+      dashed  +S/2        between the two driving lanes
+      solid  -(W/2 - S)   between the travel lane and the stop lane
+
+    The lines are Shapely offset curves of the same corner-rounded
+    centerlines the pavement is buffered from, so the markings follow the
+    road's curves exactly. (W - S) / lanes is the driving-lane width; the
+    dashed divider lands at +S/2 because the driving strip spans from
+    +W/2 (left edge) to -(W/2 - S) (right edge).
+
+    NOTE on signs: Shapely's offset_curve uses the standard math
+    convention where a positive offset lands on the LEFT of the line's
+    direction - but our world has Y pointing DOWN (south), which mirrors
+    that convention, so a positive offset_curve distance actually lands
+    on the RIGHT of travel here. The calls below therefore use negated
+    distances.
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import linemerge
+
+    pppm = config.PIXELS_PER_METER
+    corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
+
+    groups: dict[tuple, list] = {}
+    for seg in network.segments:
+        if seg.lanes <= 0:
+            continue
+        if math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1) < 1e-6:
+            continue
+        groups.setdefault((seg.highway, seg.width, seg.lanes, seg.shoulder), []).append(seg)
+
+    markings: list[tuple[str, list, float]] = []
+    for (_hw, width_m, _lanes, shoulder_m), segs in groups.items():
+        W = width_m * pppm
+        S = shoulder_m * pppm
+        lines = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in segs]
+        merged = linemerge(lines) if len(lines) > 1 else lines[0]
+        merged_lines = merged.geoms if hasattr(merged, "geoms") else [merged]
+
+        oriented: list[list] = []
+        for line in merged_lines:
+            coords = _round_polyline_corners(list(line.coords), corner_radius_px)
+            # linemerge does not preserve our direction of travel - re-
+            # orient the line so its first point is a segment START
+            # (start_node side), i.e. the line runs the way traffic flows.
+            sx, sy = coords[0]
+            if not any(abs(s.x1 - sx) < 1e-6 and abs(s.y1 - sy) < 1e-6 for s in segs):
+                coords = list(reversed(coords))
+            oriented.append(coords)
+
+        def offset_of(coords: list, dist: float) -> list:
+            try:
+                oc = LineString(coords).offset_curve(dist, join_style="round")
+            except Exception:
+                return []
+            if oc is None or oc.is_empty:
+                return []
+            geoms = oc.geoms if hasattr(oc, "geoms") else [oc]
+            return [list(g.coords) for g in geoms if not g.is_empty]
+
+        for coords in oriented:
+            markings.extend(("solid", c, 0.15) for c in offset_of(coords, -W / 2))
+            markings.extend(("dashed", c, 0.15) for c in offset_of(coords, -S / 2))
+            markings.extend(("solid", c, 0.30) for c in offset_of(coords, W / 2 - S))
+
+        # Central median: two carriageways of this group that run
+        # roughly parallel within a couple of metres of each other form
+        # a median strip; put a light-gray crash barrier (Schutzplanke)
+        # on each carriageway's edge of that median.
+        for i in range(len(oriented)):
+            for j in range(i + 1, len(oriented)):
+                if _line_distance(oriented[i], oriented[j]) >= 15.0 * pppm:
+                    continue
+                for a, b in ((oriented[i], oriented[j]), (oriented[j], oriented[i])):
+                    s = _toward_sign(a, _midpoint(b))
+                    for c in offset_of(a, s * (W / 2)):
+                        markings.append(("guardrail", c, 0.15))
+    return markings
+
+
+def _midpoint(coords: list) -> tuple[float, float]:
+    return coords[len(coords) // 2]
+
+
+def _toward_sign(coords: list, target: tuple[float, float]) -> int:
+    """+1 or -1: which offset_curve() side of `coords` points toward
+    `target`. offset_curve() follows the standard (y-up) math
+    convention, so its positive-offset normal in coordinate space is
+    (-dy, dx) of the line direction."""
+    i = max(1, len(coords) // 2 - 1)
+    dx = coords[i + 1][0] - coords[i][0]
+    dy = coords[i + 1][1] - coords[i][1]
+    L = math.hypot(dx, dy) or 1.0
+    nx, ny = -dy / L, dx / L
+    mx, my = _midpoint(coords)
+    return 1 if nx * (target[0] - mx) + ny * (target[1] - my) > 0 else -1
+
+
+def _line_distance(c1: list, c2: list) -> float:
+    """Mean distance from sample points of polyline c1 to polyline c2
+    (small iff the two polylines run parallel close together)."""
+    n = max(4, len(c1) // 5)
+    total = 0.0
+    for k in range(n):
+        px, py = c1[int(k * (len(c1) - 1) / (n - 1))]
+        total += min(point_to_segment(px, py, *c2[a], *c2[a + 1])[0]
+                     for a in range(len(c2) - 1))
+    return total / n
 
 
 def _build_road_polygons(network: "RoadNetwork"):

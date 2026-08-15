@@ -32,11 +32,16 @@ class Camera:
             self.x += (target_x - self.x) * self.lerp_factor
             self.y += (target_y - self.y) * self.lerp_factor
 
-        # Clamp so camera never shows outside the world
+        # Clamp so camera never shows outside the world.
+        # If the world is smaller than the viewport along an axis, the
+        # clamp below is meaningless (half > world - half) - center the
+        # camera on the world along that axis instead.
         half_w = (self.width / 2) / self.zoom
         half_h = (self.height / 2) / self.zoom
-        self.x = max(half_w, min(world_w - half_w, self.x))
-        self.y = max(half_h, min(world_h - half_h, self.y))
+        self.x = world_w / 2 if world_w <= 2 * half_w else \
+                 max(half_w, min(world_w - half_w, self.x))
+        self.y = world_h / 2 if world_h <= 2 * half_h else \
+                 max(half_h, min(world_h - half_h, self.y))
 
     def snap_to(self, x: float, y: float, world_w: float, world_h: float):
         """Instantly snap camera to a position (e.g., when pressing 'c')."""
@@ -44,8 +49,10 @@ class Camera:
         self.y = y
         half_w = (self.width / 2) / self.zoom
         half_h = (self.height / 2) / self.zoom
-        self.x = max(half_w, min(world_w - half_w, self.x))
-        self.y = max(half_h, min(world_h - half_h, self.y))
+        self.x = world_w / 2 if world_w <= 2 * half_w else \
+                 max(half_w, min(world_w - half_w, self.x))
+        self.y = world_h / 2 if world_h <= 2 * half_h else \
+                 max(half_h, min(world_h - half_h, self.y))
 
     def world_to_screen(self, wx: float, wy: float) -> tuple[float, float]:
         sx = (wx - self.x) * self.zoom + self.width / 2

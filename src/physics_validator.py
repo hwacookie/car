@@ -111,18 +111,19 @@ class PhysicsValidator:
         pppm = config.PIXELS_PER_METER
         distance_m = distance_moved / pppm
         
-        # Maximum allowed: the TRUE physical bound is exactly speed*dt (a
-        # car cannot travel further than that in one frame, full stop).
-        # Even with acceleration happening within the frame, using the
-        # post-update (higher) speed already over-estimates the true
-        # distance travelled, so speed*dt is a safe, tight upper bound -
-        # no multiplier is actually justified. The small extra margin here
-        # covers only floating-point noise and the straight-segment/arc
-        # split-frame hand-off (see Car._update_position_rails), not real
-        # bugs. Previous versions had a x3 multiplier + 3-50m FLOOR, which
-        # made obviously-wrong multi-meter jumps (backward snaps to stale
-        # tangent points, etc.) completely invisible.
-        max_allowed_m = car.speed * dt * 1.1 + 0.1
+        # Maximum allowed: the TRUE physical bound is
+        # v_old*dt + 0.5*a*dt^2 (a car cannot travel further than that in
+        # one frame, full stop). The post-update speed already includes
+        # this frame's acceleration, so post_speed*dt over-estimates the
+        # true distance by exactly 0.5*a*dt - which on a LONG dt (e.g. a
+        # 0.2s hitch while loading data) can be a full meter. So the
+        # bound is post_speed*dt (safe: covers the acceleration term) +
+        # a dt-scaled margin for the straight-segment/arc split-frame
+        # hand-off (see Car._update_position_rails) + a tiny constant
+        # floor for float noise. The previous flat speed*dt*1.1 + 0.1
+        # bound flagged perfectly legal motion on hitches (1.5m over
+        # 1.47m at dt=0.215s -> crash).
+        max_allowed_m = car.speed * dt + 0.1 * dt + 0.01
         
         if distance_m > max_allowed_m:
             import traceback

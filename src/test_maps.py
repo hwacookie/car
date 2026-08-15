@@ -35,8 +35,18 @@ class MapBuilder:
         n2: str,
         highway: str = "residential",
         oneway: bool = False,
+        width: float | None = None,
+        lanes: int = 0,
+        shoulder: float = 0.0,
     ) -> None:
-        """Add a road segment between two named nodes."""
+        """Add a road segment between two named nodes.
+
+        width (metres) overrides the ROAD_TYPES-derived width. lanes > 0
+        marks the segment as a multi-lane one-way carriageway: the
+        renderer draws a dashed divider between the driving lanes plus
+        solid lines at both edges of the driving lanes, with `shoulder`
+        metres of stop lane on the right (right-hand traffic).
+        """
         x1_m, y1_m = self._nodes_m[n1]
         x2_m, y2_m = self._nodes_m[n2]
         pppm = self.pppm
@@ -44,11 +54,11 @@ class MapBuilder:
         x1, y1 = x1_m * pppm, y1_m * pppm
         x2, y2 = x2_m * pppm, y2_m * pppm
 
-        road_cfg = config.ROAD_TYPES.get(highway)
-        if road_cfg:
-            width = road_cfg["width_1way"] if oneway else road_cfg["width_2way"]
-        else:
-            width = 3.5
+        if width is None:
+            road_cfg = config.ROAD_TYPES.get(highway)
+            width = (
+                road_cfg["width_1way"] if oneway else road_cfg["width_2way"]
+            ) if road_cfg else 3.5
 
         length_m = math.hypot(x2_m - x1_m, y2_m - y1_m)
 
@@ -61,6 +71,8 @@ class MapBuilder:
             start_node=n1,
             end_node=n2,
             length=length_m,
+            lanes=lanes,
+            shoulder=shoulder,
         ))
         self._next_seg_id += 1
 
@@ -89,11 +101,13 @@ class MapBuilder:
                 nid: (x - min_x, y - min_y)
                 for nid, (x, y) in self._nodes_m.items()
             }
-            # Shift all segment endpoints (stored in px)
+            # Shift all segment endpoints (stored in px).
+            # Same direction as the node shift above: new = old - min.
+            # (sdx/sdy are already scaled to px and negative, so SUBTRACT.)
             sdx, sdy = min_x * pppm, min_y * pppm
             for seg in self._segments:
-                seg.x1 += sdx; seg.y1 += sdy
-                seg.x2 += sdx; seg.y2 += sdy
+                seg.x1 -= sdx; seg.y1 -= sdy
+                seg.x2 -= sdx; seg.y2 -= sdy
 
         nodes = {nid: (x * pppm, y * pppm) for nid, (x, y) in self._nodes_m.items()}
 
@@ -160,54 +174,60 @@ class MapBuilder:
 
 
 def build_autobahn_kreuz() -> RoadNetwork:
-    """Simple Autobahnkreuz: two crossing highways.
+    """Autobahnkreuz: two crossing highways, each split into two
+    one-way carriageways (right-hand traffic):
 
-    A1: N-S Autobahn (on top = overpass), 2 lanes each direction (14 m wide)
-    A2: E-W Autobahn (underpass), 2 lanes each direction (14 m wide)
+      A1: N-S Autobahn (on top = overpass)
+      A2: E-W Autobahn (underpass)
 
-    Start points at the four cardinal approaches.
+    Each carriageway is a 10 m wide strip: two 3.5 m driving lanes
+    (overtake on the LEFT, travel lane on the right) plus a 3 m stop
+    lane on the far right, drawn with a dashed line between the two
+    driving lanes and solid lines at both edges of the driving lanes.
+    The two carriageways of a highway are 8 m apart (central median),
+    so opposing traffic never touches.
+
+    Start points at the four cardinal approaches, each on the one-way
+    carriageway that matches the direction of travel.
     """
     b = MapBuilder()
 
-    # ---- A1: north-south (slight eastward curve) ----
-    a1_nodes = [
-        ("a1_s1",   -20, -1200),
-        ("a1_s2",   -15, -900),
-        ("a1_s3",   -10, -600),
-        ("a1_s4",    -5, -300),
-        ("a1_s5",     0,    0),   # crosses A2
-        ("a1_n1",    10,  300),
-        ("a1_n2",    20,  600),
-        ("a1_n3",    30,  900),
-        ("a1_n4",    30, 1200),
-    ]
-    for nid, x, y in a1_nodes:
-        b.node(nid, x, y)
-    for i in range(len(a1_nodes) - 1):
-        b.road(a1_nodes[i][0], a1_nodes[i + 1][0], highway="motorway")
+    LANE_W = 3.5
+    SHOULDER_W = 3.0
+    CARRIAGEWAY_W = 2 * LANE_W + SHOULDER_W   # 10.0 m
+    SEP = 6.0   # m from highway axis to carriageway centerline
+               # (5 m half carriageway + 1 m half median gap = 2 m green)
 
-    # ---- A2: east-west (straight) ----
-    a2_nodes = [
-        ("a2_w1", -1200,    0),
-        ("a2_w2",  -900,    0),
-        ("a2_w3",  -600,    0),
-        ("a2_w4",  -300,    0),
-        ("a2_w5",     0,    0),   # crosses A1
-        ("a2_e1",   300,    0),
-        ("a2_e2",   600,    0),
-        ("a2_e3",   900,    0),
-        ("a2_e4",  1200,    0),
-    ]
-    for nid, x, y in a2_nodes:
-        b.node(nid, x, y)
-    for i in range(len(a2_nodes) - 1):
-        b.road(a2_nodes[i][0], a2_nodes[i + 1][0], highway="motorway")
+    # NOTE: y grows SOUTH (down on screen), so the a1_axis list below
+    # runs from the NORTH end (y=-1200) to the SOUTH end (y=+1200) -
+    # i.e. it is in direction of travel for SOUTHBOUND traffic.
+    a1_axis = [(-20, -1200), (-15, -900), (-10, -600), (-5, -300), (0, 0),
+               (10, 300), (20, 600), (30, 900), (30, 1200)]
+    a2_axis = [(-1200, 0), (-900, 0), (-600, 0), (-300, 0), (0, 0),
+               (300, 0), (600, 0), (900, 0), (1200, 0)]
 
-    # ---- Start points (endpoints = degree-1 nodes) ----
-    b.start("autobahn_north", "a1_n4")   # entering A1 from north
-    b.start("autobahn_south", "a1_s1")   # entering A1 from south
-    b.start("autobahn_east", "a2_e4")    # entering A2 from east
-    b.start("autobahn_west", "a2_w1")    # entering A2 from west
+    def carriageway(prefix: str, points: list[tuple[float, float]],
+                    start_name: str) -> None:
+        """Add one one-way carriageway; `points` in direction of travel.
+        (The start point is registered at the first point automatically.)"""
+        ids = [f"{prefix}_{i}" for i in range(len(points))]
+        for nid, (x, y) in zip(ids, points):
+            b.node(nid, x, y)
+        for i in range(len(ids) - 1):
+            b.road(ids[i], ids[i + 1], highway="motorway", oneway=True,
+                   width=CARRIAGEWAY_W, lanes=2, shoulder=SHOULDER_W)
+        b.start(start_name, ids[0])
+
+    # A1 (N-S, overpass), right-hand traffic: southbound (travel +y,
+    # list order) keeps WEST (x - SEP), northbound (travel -y, reversed
+    # order) keeps EAST (x + SEP).
+    carriageway("a1_sb", [(x - SEP, y) for x, y in a1_axis], "autobahn_north")
+    carriageway("a1_nb", [(x + SEP, y) for x, y in reversed(a1_axis)], "autobahn_south")
+
+    # A2 (E-W, underpass): eastbound traffic keeps SOUTH (y + SEP),
+    # westbound keeps NORTH (y - SEP).
+    carriageway("a2_eb", [(x, y + SEP) for x, y in a2_axis], "autobahn_west")
+    carriageway("a2_wb", [(x, y - SEP) for x, y in reversed(a2_axis)], "autobahn_east")
 
     return b.build()
 
