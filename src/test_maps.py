@@ -297,6 +297,43 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("sweeping_curve", "sweep_a")
     b.start("sweeping_curve_reverse", "sweep_b")
 
+    # --- Tile (3,2): Roundabout (one-way ring, 4 two-way spokes) ---
+    ox, oy = origin(3, 2)
+    cx, cy = ox + 250, oy + 220
+    R = 100.0
+    D = R * 0.7071  # diagonal offset (NE/SE/SW/NW), R*cos(45deg)
+    SPOKE = 150.0   # distance from ring out to each approach's far end
+
+    # 8-node ring, alternating cardinal (spoke-bearing) and diagonal
+    # (pure corner) nodes, for a reasonably round look once the corner
+    # rounding is applied. One-way, all in the same rotational sense.
+    b.node("rb_n", cx, cy - R)
+    b.node("rb_ne", cx + D, cy - D)
+    b.node("rb_e", cx + R, cy)
+    b.node("rb_se", cx + D, cy + D)
+    b.node("rb_s", cx, cy + R)
+    b.node("rb_sw", cx - D, cy + D)
+    b.node("rb_w", cx - R, cy)
+    b.node("rb_nw", cx - D, cy - D)
+    ring = ["rb_n", "rb_ne", "rb_e", "rb_se", "rb_s", "rb_sw", "rb_w", "rb_nw"]
+    for a, b_node in zip(ring, ring[1:] + ring[:1]):
+        b.road(a, b_node, oneway=True)
+
+    # Four two-way spokes, one per cardinal ring node.
+    b.node("rb_north_far", cx, cy - R - SPOKE)
+    b.node("rb_east_far", cx + R + SPOKE, cy)
+    b.node("rb_south_far", cx, cy + R + SPOKE)
+    b.node("rb_west_far", cx - R - SPOKE, cy)
+    b.road("rb_north_far", "rb_n")
+    b.road("rb_east_far", "rb_e")
+    b.road("rb_south_far", "rb_s")
+    b.road("rb_west_far", "rb_w")
+
+    b.start("roundabout_from_north", "rb_north_far")
+    b.start("roundabout_from_east", "rb_east_far")
+    b.start("roundabout_from_south", "rb_south_far")
+    b.start("roundabout_from_west", "rb_west_far")
+
     return b.build()
 
 

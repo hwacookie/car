@@ -55,156 +55,114 @@ class Renderer:
         self.draw_trail(surface, car)  # Draw breadcrumb trail
         self.draw_minimap(surface, car)
         self.draw_hud(surface, car)
-
     # --- Roads ---
     def draw_roads(self, surface: pygame.Surface):
-        """Draw every road segment as a filled polygon with rounded caps.
-        Camera transform applied per-vertex — no texture scaling, no pixelation."""
+        """Draw the road network as filled polygons with properly rounded
+        bends and caps.
+
+        Rather than hand-rolling trigonometry for each junction corner
+        (which turned into an unreliable mess of "fillet" hacks), the
+        roads are built with the standard, well-tested approach for this
+        exact problem: treat each road as a stroked line and use
+        Shapely's `buffer()` with round joins/caps. Contiguous same-width
+        segments are merged (via `linemerge`) into one continuous line
+        first, so a 90-degree bend becomes a single interior vertex of
+        one LineString - buffering that naturally produces a smooth
+        circular arc on the outer side and a clean single point on the
+        inner side, exactly like a normal road/curb. This is computed
+        once (cached) since the road network never changes at runtime.
+        """
+        w, h = surface.get_size()
+
+        for color, polys in self.network.get_road_polygons_by_color():
+            for ext, holes in polys:
+                screen_pts = [self.camera.world_to_screen(x, y) for x, y in ext]
+                xs = [p[0] for p in screen_pts]
+                ys = [p[1] for p in screen_pts]
+                if max(xs) < 0 or min(xs) > w or max(ys) < 0 or min(ys) > h:
+                    continue
+                pygame.draw.polygon(surface, color, [(int(x), int(y)) for x, y in screen_pts])
+                # Punch out any holes (e.g. a roundabout's island) with
+                # the background color - pygame can't fill a polygon
+                # with a hole in one call, so paint the exterior first
+                # and then re-paint each hole over it.
+                for hole in holes:
+                    hole_pts = [self.camera.world_to_screen(x, y) for x, y in hole]
+                    pygame.draw.polygon(surface, config.BG_COLOR, [(int(x), int(y)) for x, y in hole_pts])
+
+        self.draw_road_markings(surface)
+
+    def draw_road_markings(self, surface: pygame.Surface):
+        """Dashed white centerline down the middle of each road (the same
+        merged, corner-rounded centerlines the paved-area polygons are
+        buffered from - see RoadNetwork.get_centerlines() - so the dashes
+        follow the actual curve through a bend instead of cutting
+        straight across it), plus a single white dot at the middle of
+        every real (3+-way) junction instead of trying to dash through
+        the intersection itself."""
         w, h = surface.get_size()
         zoom = self.camera.zoom
         pppm = config.PIXELS_PER_METER
+        dash_m = 3.0
+        gap_m = 3.0
+        dash_px = dash_m * pppm
+        gap_px = gap_m * pppm
 
-        for seg in self.network.segments:
-            color = config.ROAD_TYPES.get(seg.highway, {}).get("color", (150, 150, 150))
-            half_w = (seg.width / 2) * pppm * zoom
-            r = max(1, int(half_w))
+        for coords in self.network.get_centerlines():
+            self._draw_dashed_polyline(surface, coords, dash_px, gap_px, w, h)
 
-            # Transform to screen coordinates
-            sx1, sy1 = self.camera.world_to_screen(seg.x1, seg.y1)
-            sx2, sy2 = self.camera.world_to_screen(seg.x2, seg.y2)
-
-            # Cull if completely off-screen
-            if (sx1 < -r and sx2 < -r) or (sx1 > w + r and sx2 > w + r) or \
-               (sy1 < -r and sy2 < -r) or (sy1 > h + r and sy2 > h + r):
+        dot_radius_px = 4
+        for node_id, degree in self.network.node_degree.items():
+            if degree < 3:
                 continue
-
-            # Compute perpendicular offset
-            dx = sx2 - sx1
-            dy = sy2 - sy1
-            length = math.hypot(dx, dy)
-            if length < 0.5:
+            node_xy = self.network.nodes.get(node_id)
+            if node_xy is None:
                 continue
-
-            nx = -dy / length
-            ny = dx / length
-
-            # Build rectangle polygon
-            pts = [
-                (sx1 + nx * half_w, sy1 + ny * half_w),
-                (sx1 - nx * half_w, sy1 - ny * half_w),
-                (sx2 - nx * half_w, sy2 - ny * half_w),
-                (sx2 + nx * half_w, sy2 + ny * half_w),
-            ]
-            pygame.draw.polygon(surface, color, [(int(p[0]), int(p[1])) for p in pts])
-
-            # Rounded caps at both ends
-            pygame.draw.circle(surface, color, (int(sx1), int(sy1)), r)
-            pygame.draw.circle(surface, color, (int(sx2), int(sy2)), r)
-        
-        # Widened junction fillets: real intersections have a much wider
-        # paved "corner-cutting" area than the roads' own width suggests
-        # (curb radii flare the pavement out - confirmed via satellite
-        # imagery, see docs/SPEC.md). A plain circle at the junction node
-        # looks like an unnatural blob and can bulge into areas with no
-        # actual road; instead, for each PAIR of adjacent roads (by angle
-        # around the junction) we compute a proper tangent-arc fillet -
-        # the same "circle tangent to two lines" geometry used for the
-        # car's own turning arc, but with a fixed curb radius instead of a
-        # speed-dependent one - and fill the resulting rounded wedge.
-        # This naturally handles any junction degree (2-way corners,
-        # 3-way, 4-way crossroads) and skips near-straight continuations
-        # (no real corner to round off).
-        for node_id, connected in self.network.node_connections.items():
-            if len(connected) < 2:
+            sx, sy = self.camera.world_to_screen(*node_xy)
+            if sx < -dot_radius_px or sx > w + dot_radius_px or \
+               sy < -dot_radius_px or sy > h + dot_radius_px:
                 continue
-            self._draw_junction_fillets(surface, node_id, connected, pppm, zoom, w, h)
+            pygame.draw.circle(surface, (255, 255, 255), (int(sx), int(sy)), dot_radius_px)
 
-    def _draw_junction_fillets(self, surface, node_id, connected, pppm, zoom, w, h):
-        """Draw rounded curb-radius fillets in every 'corner' gap between
-        adjacent roads meeting at a junction node."""
-        node_xy = self.network.nodes.get(node_id)
-        if node_xy is None:
+    def _draw_dashed_polyline(self, surface, coords, dash_px, gap_px, w, h):
+        """Walk a polyline (world coords) at constant arc length, drawing
+        alternating dash/gap segments - works for the rounded-corner
+        centerlines (many short segments approximating an arc) just as
+        well as a single long straight stretch."""
+        period = dash_px + gap_px
+        if period <= 0:
             return
-        node_x, node_y = node_xy
-        
-        # Spoke = direction AWAY from the junction along each connected
-        # road, plus that road's own segment (for width/color).
-        spokes = []
-        for seg_idx in connected:
-            seg = self.network.segments[seg_idx]
-            if seg.start_node == node_id:
-                away_dx, away_dy = seg.x2 - seg.x1, seg.y2 - seg.y1
-            else:
-                away_dx, away_dy = seg.x1 - seg.x2, seg.y1 - seg.y2
-            length = math.hypot(away_dx, away_dy)
-            if length < 1e-6:
+        distance_into_period = 0.0  # where in the dash/gap cycle we are
+
+        for i in range(len(coords) - 1):
+            x1, y1 = coords[i]
+            x2, y2 = coords[i + 1]
+            seg_len = math.hypot(x2 - x1, y2 - y1)
+            if seg_len < 1e-9:
                 continue
-            angle = math.atan2(away_dy, away_dx)
-            spokes.append((angle, away_dx / length, away_dy / length, seg))
-        
-        if len(spokes) < 2:
-            return
-        spokes.sort(key=lambda s: s[0])
-        
-        MIN_GAP_DEG = 15.0   # skip near-parallel/duplicate spokes
-        MAX_GAP_DEG = 155.0  # skip near-straight continuations (no real corner)
-        
-        n = len(spokes)
-        for i in range(n):
-            angle_a, ax, ay, seg_a = spokes[i]
-            angle_b, bx, by, seg_b = spokes[(i + 1) % n]
-            gap = (angle_b - angle_a) % (2 * math.pi)
-            gap_deg = math.degrees(gap)
-            if gap_deg < MIN_GAP_DEG or gap_deg > MAX_GAP_DEG:
-                continue
-            
-            widest = seg_a if seg_a.width >= seg_b.width else seg_b
-            radius_m = widest.width / 2 + config.JUNCTION_WIDENING_M
-            
-            half_gap = gap / 2
-            tangent_dist_m = radius_m * math.tan(half_gap)
-            center_dist_m = radius_m / math.cos(half_gap)
-            
-            bis_x, bis_y = ax + bx, ay + by
-            bis_len = math.hypot(bis_x, bis_y)
-            if bis_len < 1e-9:
-                continue
-            bis_x, bis_y = bis_x / bis_len, bis_y / bis_len
-            
-            pppm_full = pppm  # already includes PIXELS_PER_METER
-            center_x = node_x + center_dist_m * pppm_full * bis_x
-            center_y = node_y + center_dist_m * pppm_full * bis_y
-            tangent1_x = node_x + tangent_dist_m * pppm_full * ax
-            tangent1_y = node_y + tangent_dist_m * pppm_full * ay
-            tangent2_x = node_x + tangent_dist_m * pppm_full * bx
-            tangent2_y = node_y + tangent_dist_m * pppm_full * by
-            
-            start_angle = math.atan2(tangent1_y - center_y, tangent1_x - center_x)
-            end_angle = math.atan2(tangent2_y - center_y, tangent2_x - center_x)
-            sweep = (end_angle - start_angle) % (2 * math.pi)
-            if sweep > math.pi:
-                sweep -= 2 * math.pi
-            
-            # Build filled polygon: node -> tangent1 -> arc points -> tangent2 -> back to node
-            radius_px = radius_m * pppm_full * zoom
-            poly_world = [(node_x, node_y), (tangent1_x, tangent1_y)]
-            num_arc_pts = 10
-            for k in range(1, num_arc_pts + 1):
-                a = start_angle + sweep * (k / num_arc_pts)
-                ax_pt = center_x + radius_m * pppm_full * math.cos(a)
-                ay_pt = center_y + radius_m * pppm_full * math.sin(a)
-                poly_world.append((ax_pt, ay_pt))
-            
-            poly_screen = [self.camera.world_to_screen(px, py) for px, py in poly_world]
-            
-            # Cull if entirely off-screen
-            xs = [p[0] for p in poly_screen]
-            ys = [p[1] for p in poly_screen]
-            if max(xs) < 0 or min(xs) > w or max(ys) < 0 or min(ys) > h:
-                continue
-            
-            color = config.ROAD_TYPES.get(widest.highway, {}).get("color", (150, 150, 150))
-            pygame.draw.polygon(surface, color, [(int(px), int(py)) for px, py in poly_screen])
+            ux, uy = (x2 - x1) / seg_len, (y2 - y1) / seg_len
+
+            traveled = 0.0
+            while traveled < seg_len:
+                phase = distance_into_period % period
+                drawing = phase < dash_px
+                # Distance remaining in the current dash/gap phase
+                remaining_in_phase = (dash_px - phase) if drawing else (period - phase)
+                step = min(remaining_in_phase, seg_len - traveled)
+
+                if drawing:
+                    ax, ay = x1 + ux * traveled, y1 + uy * traveled
+                    bx, by = x1 + ux * (traveled + step), y1 + uy * (traveled + step)
+                    sax, say = self.camera.world_to_screen(ax, ay)
+                    sbx, sby = self.camera.world_to_screen(bx, by)
+                    if not ((sax < 0 and sbx < 0) or (sax > w and sbx > w) or
+                            (say < 0 and sby < 0) or (say > h and sby > h)):
+                        # Real lane markings are ~0.15m wide, not 2m.
+                        line_w = max(1, int(0.15 * config.PIXELS_PER_METER * self.camera.zoom))
+                        pygame.draw.line(surface, (255, 255, 255), (sax, say), (sbx, sby), line_w)
+
+                traveled += step
+                distance_into_period += step
 
     # --- Breadcrumb Trail ---
     # Fixed rainbow gradient (oldest -> newest) applied to the most recent
@@ -280,6 +238,20 @@ class Renderer:
         panel_x, panel_y = 15, surface.get_height() - panel_h - 15
         pygame.draw.rect(surface, (20, 20, 20, 200), (panel_x, panel_y, panel_w, panel_h))
         pygame.draw.rect(surface, (80, 80, 80), (panel_x, panel_y, panel_w, panel_h), 2)
+
+        # Optional short label (e.g. "2/3" for the test map row/col
+        # currently under test) - set remotely via POST /label, shown
+        # top-right of the main window so it doesn't crowd the speedometer.
+        label = getattr(self, 'hud_label', None)
+        if label:
+            label_surf = self._text_surface(str(label), 28, (255, 255, 0))
+            lx = surface.get_width() - config.MINIMAP_MARGIN - label_surf.get_width() - 10
+            ly = config.MINIMAP_MARGIN + config.MINIMAP_SIZE + 10
+            pygame.draw.rect(surface, (20, 20, 20, 200),
+                              (lx - 10, ly, label_surf.get_width() + 20, label_surf.get_height() + 12))
+            pygame.draw.rect(surface, (80, 80, 80),
+                              (lx - 10, ly, label_surf.get_width() + 20, label_surf.get_height() + 12), 2)
+            surface.blit(label_surf, (lx, ly + 6))
 
         # Speed number
         kmh = int(car.speed * 3.6)

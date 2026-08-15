@@ -12,6 +12,38 @@ from pathlib import Path
 
 API_URL = "http://localhost:5000"
 
+# Sequential, 1-based position of each named start point's map tile,
+# counted from the TOP-LEFT of the minimap, left-to-right then
+# top-to-bottom (1 = top-left, 2 = top row/second from left, etc.) -
+# used only to show a short number in the HUD via POST /label while a
+# test runs, purely a visual aid to see where on the map the current
+# test is happening. The descriptive start-point names themselves are
+# unaffected.
+#
+# NOTE: the minimap draws with north (small world y) at the BOTTOM and
+# south (large world y) at the TOP (Renderer.draw_minimap flips y), so
+# this numbering is the reverse of the tiles' internal world-grid row
+# (see src/test_maps.py:build_basic_test_map's docstring) - world-grid
+# row 0 appears at the bottom of the minimap (numbers 9-12) and
+# world-grid row 2 at the top (numbers 1-4).
+START_POINT_NUMBER = {
+    'dead_end_approach': 1,
+    'hairpin_entry': 2, 'hairpin_exit': 2,
+    'sweeping_curve': 3, 'sweeping_curve_reverse': 3,
+    'roundabout_from_north': 4, 'roundabout_from_east': 4,
+    'roundabout_from_south': 4, 'roundabout_from_west': 4,
+    'y_from_stem': 5, 'y_from_left': 5, 'y_from_right': 5,
+    'crossroads_from_north': 6, 'crossroads_from_south': 6,
+    'crossroads_from_east': 6, 'crossroads_from_west': 6,
+    'oneway_entry': 7, 'oneway_wrong_way': 7,
+    'oneway_cross_from_north': 7, 'oneway_cross_from_south': 7,
+    's_curve': 8, 's_curve_reverse': 8,
+    'straight': 9, 'straight_reverse': 9,
+    'corner_right_entry': 10, 'corner_right_exit': 10,
+    'corner_left_entry': 11, 'corner_left_exit': 11,
+    'tjunction_from_top': 12, 'tjunction_from_left': 12, 'tjunction_from_right': 12,
+}
+
 
 class TurnTester:
     """Automated turn tester with detailed violation reporting."""
@@ -54,6 +86,10 @@ class TurnTester:
         """Teleport to a deterministic named start point (synthetic test maps)."""
         requests.post(f"{API_URL}/teleport", json={'start_point': name})
         time.sleep(0.3)  # Wait for teleport to complete
+    
+    def set_hud_label(self, text: str | None):
+        """Show (or clear) a short text label in the game's HUD."""
+        requests.post(f"{API_URL}/label", json={'text': text})
     
     def get_start_points(self) -> dict:
         """List available deterministic start points from the loaded map."""
@@ -100,9 +136,12 @@ class TurnTester:
         if start_point:
             print(f"📍 Teleporting to named start point '{start_point}'...")
             self.teleport_to_start_point(start_point)
+            number = START_POINT_NUMBER.get(start_point)
+            self.set_hud_label(str(number) if number is not None else start_point)
         else:
             print("📍 Teleporting to random location...")
             self.teleport_random()
+            self.set_hud_label(None)
         
         state = self.get_state()
         initial_segment = state['segment']
@@ -348,38 +387,60 @@ class TurnTester:
         print("\n" + "="*60)
 
         # (start_point, direction, speed_kmh)
+        #
+        # speed_kmh is just how fast we wait to reach before we start
+        # watching - NOT a fixed cruising/cornering speed. In RAILS mode
+        # the car always accelerates toward top speed whenever the
+        # accelerator is held, except while actively executing a turn's
+        # arc (capped to that arc's own planned speed); the automatic
+        # pre-turn braking logic is what actually slows it down in time
+        # for the corner, then it goes right back to accelerating flat
+        # out afterwards. So testing the same corner at 30/50/80 km/h
+        # doesn't exercise different driving behavior - it's the same
+        # "floor it, brake only as needed for the corner" behavior every
+        # time - hence one run per corner is enough.
         tests = [
             # 90-degree corners (the classic reported bug)
-            ('corner_right_entry', 'right', 30),
-            ('corner_right_entry', 'right', 50),
             ('corner_right_entry', 'right', 80),
-            ('corner_left_entry', 'left', 30),
-            ('corner_left_entry', 'left', 50),
             ('corner_left_entry', 'left', 80),
             # T-junction (perpendicular 3-way)
-            ('tjunction_from_top', 'left', 50),
-            ('tjunction_from_top', 'right', 50),
+            ('tjunction_from_top', 'left', 80),
+            ('tjunction_from_top', 'right', 80),
             # Y-intersection (shallow ~40 degree diverging angles)
-            ('y_from_stem', 'left', 50),
-            ('y_from_stem', 'right', 50),
+            ('y_from_stem', 'left', 80),
+            ('y_from_stem', 'right', 80),
             # 4-way crossroads
-            ('crossroads_from_north', 'left', 50),
-            ('crossroads_from_north', 'right', 50),
-            ('crossroads_from_north', 'straight', 50),
+            ('crossroads_from_north', 'left', 80),
+            ('crossroads_from_north', 'right', 80),
+            ('crossroads_from_north', 'straight', 80),
             # One-way street (legal direction)
-            ('oneway_entry', 'straight', 40),
+            ('oneway_entry', 'straight', 80),
             # Simple curves (degree-2 nodes, no blinker needed)
-            ('s_curve', 'straight', 40),
-            ('hairpin_entry', 'straight', 20),
-            ('sweeping_curve', 'straight', 60),
+            ('s_curve', 'straight', 80),
+            ('hairpin_entry', 'straight', 80),
+            ('sweeping_curve', 'straight', 80),
+            # Hairpin, entered from the opposite end (reverse direction)
+            ('hairpin_exit', 'straight', 80),
+            # Roundabout (one-way ring, 4 two-way spokes). 'straight'
+            # (or 'left') at the entry just merges onto the ring and then
+            # keeps circling it FOREVER - a one-way loop has no "next
+            # different segment" to naturally stop at unless the car
+            # actually exits onto a spoke. 'right' does that here
+            # (verified: exits east, segments 36->28->29->37) - a real,
+            # completed roundabout maneuver instead of an endless circle.
+            # Takes longer than a normal turn (~25s to go most of the way
+            # around before exiting), hence the longer duration override.
+            ('roundabout_from_north', 'right', 40, 30.0),
         ]
 
-        for i, (start_point, direction, speed) in enumerate(tests, 1):
+        for i, test in enumerate(tests, 1):
+            start_point, direction, speed = test[0], test[1], test[2]
+            duration = test[3] if len(test) > 3 else 15.0
             print(f"\n\n{'#'*60}")
             print(f"# TEST {i}/{len(tests)}: '{start_point}' -> {direction.upper()} @ {speed} km/h")
             print(f"{'#'*60}")
 
-            self.monitor_turn(direction, duration=15.0, target_speed=speed, start_point=start_point)
+            self.monitor_turn(direction, duration=duration, target_speed=speed, start_point=start_point)
 
             if i < len(tests):
                 print("\n⏸️  Pausing 1s before next test...")

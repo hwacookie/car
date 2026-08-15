@@ -26,6 +26,8 @@ PIXELS_PER_METER = 2
 # half-width when rendering junction nodes and when validating whether a
 # turning arc stays on paved surface.
 JUNCTION_WIDENING_M = 4.0
+ROAD_CORNER_RADIUS_M = 6.0  # visible curb-style rounding radius at road bends
+ROAD_EDGE_TOLERANCE_M = 0.5  # shared slack between planned-arc validation and live off-road checks
 
 # Zoom limits: viewport width = WINDOW_WIDTH / (zoom * PIXELS_PER_METER)
 # MAX_ZOOM  -> ~40 m viewport (zoomed in)

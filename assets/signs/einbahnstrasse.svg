@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 250" width="100%" height="100%">
+  <!-- Blue Background Rectangle -->
+  <rect x="10" y="10" width="580" height="230" rx="15" ry="15" fill="#0055A5" stroke="#FFFFFF" stroke-width="6"/>
+  <!-- White Border Inner -->
+  <rect x="15" y="15" width="570" height="220" rx="10" ry="10" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+  
+  <!-- Big White Arrow -->
+  <path d="M 40 125 L 440 125 L 440 60 L 550 125 L 440 190 L 440 125 Z" fill="#FFFFFF" />
+  
+  <!-- Black Bold Text "EINBAHNSTRASSE" inside the arrow -->
+  <text x="240" y="137" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="34" fill="#000000" text-anchor="middle" letter-spacing="2">EINBAHNSTRASSE</text>
+</svg>

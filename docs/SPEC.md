@@ -16,6 +16,7 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 | Layer | Technology |
 |-------|-----------|
 | Game engine | **Pygame 2.6.1** |
+| Road geometry | **Shapely** (line merging, corner rounding, buffering into paved-area polygons - shared by rendering AND on-road physics checks) |
 | OSM data source | **OSM-Wars PostgreSQL DB** (PostGIS, `road_geometry` table, Brandenburg schema) |
 | DB access | **psycopg3** |
 | Language | **Python 3.14** |
@@ -157,6 +158,50 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 **Physics**: Centripetal force `F = mv²/r` means faster speed requires wider radius to keep lateral acceleration within design limits.
 
 **Note**: This is a **design constraint** for the turning system (how we calculate turns), NOT a validation check. External forces (collisions, explosions) CAN exceed this limit—that's physically possible!
+
+**Target speed per turn severity** (`TurningSystem.decide_target_speed_for_turn`),
+calibrated against real-world guidance for turning a small car (~5.5m
+wall-to-wall turning circle) through an intersection:
+
+| Turn angle | Target speed | Notes |
+|------------|---------------|-------|
+| ≥ 90° (right angle or sharper) | ~15 km/h | Matches real-world guidance for a tight right-angle corner (roughly 10-15 km/h, tighter still without swinging wide) |
+| ≥ 60° | ~25 km/h | |
+| ≥ 30° | ~45 km/h | |
+| < 30° | cruise speed | Gentle enough that no dedicated slow-down is needed |
+
+This used to target ~40 km/h for a 90° corner, which would need a ~25m
+turning radius — wildly more than an ordinary street corner's curb
+radius provides. That mismatch forced the planner to fall back through
+several slower/lane-shifted attempts and could still end up visibly
+cutting across into the centerline/opposing lane just to make the
+(too-large) arc geometrically fit. At the corrected ~15 km/h target, the
+arc fits comfortably within the car's own lane.
+
+#### On-Road Check: Single Source of Truth
+
+The rendered road, the turn-planner's arc validation, and the live
+per-frame off-road check used to be **three separate, independently
+approximated** implementations (in `road_network.py`, `car.py`, and
+`turning_system.py` respectively) that could disagree with each other -
+e.g. an arc that visibly followed the smooth rendered curve through a
+bend could still get flagged as off-road, because the physics-side
+checks only knew about sharp-cornered rectangles and a cruder
+fixed-radius junction circle.
+
+This is now unified:
+- `RoadNetwork.get_paved_polygon()` builds (and caches) **one** Shapely
+  polygon covering the entire drivable paved area - the exact same
+  geometry used for rendering (rounded bends and junction fillets
+  included).
+- `RoadNetwork.is_on_road(x, y)` and `Car.is_on_road()` (which now just
+  delegates to it) both test against this polygon.
+- `TurningSystem.validate_arc_on_road()` also tests candidate arcs
+  against this same polygon.
+- All three share one tolerance constant, `config.ROAD_EDGE_TOLERANCE_M`
+  (0.5m), instead of the planner silently allowing more slack than the
+  live check honored (which used to cause plans that passed validation
+  to immediately register as off-road once actually driven).
 
 #### Geometry-Based Turn Validation
 
@@ -302,7 +347,31 @@ Only roads with these highway types are loaded:
 
 ### Rendering
 - **Style**: Direct polygon rendering (no texture scaling)
-- **Geometry**: Rectangle + rounded caps per segment
+- **Geometry**: Real Shapely-based paved-area polygons, not plain
+  per-segment rectangles:
+  - Contiguous same-width/same-highway segments are merged
+    (`shapely.ops.linemerge`) into one continuous line wherever they
+    pass through a plain degree-2 node (an ordinary bend, not a real
+    junction).
+  - Before buffering, the merged line's own **centerline corners are
+    rounded** with a real tangent arc (`RoadNetwork._round_polyline_corners`,
+    radius `config.ROAD_CORNER_RADIUS_M`, default 6m) - this is
+    deliberately done to the centerline itself, not just relied on via
+    a buffer's "round join", because a round join only curves the
+    *outer/convex* edge of a bend and leaves the inner edge a perfectly
+    sharp mitre. Rounding the centerline first means **both** edges of
+    the road curve smoothly through a bend, like a real paved corner.
+  - The (now smooth) line is then buffered by half the road width with
+    round joins/caps (`resolution=8`) into the final fillable polygon.
+  - At real junctions (degree ≥ 3: T-junctions, Y-intersections,
+    crossroads), `linemerge` can't merge across the branching node, so
+    each adjacent pair of roads (by angle, skipping near-straight
+    pass-throughs and near-duplicate spokes) gets its own small virtual
+    3-point polyline through the junction node, rounded and buffered
+    the same way, to fillet that corner too.
+  - All of the above is built **once** and cached
+    (`RoadNetwork.get_road_polygons_by_color()` / `.get_paved_polygon()`)
+    since the road network never changes at runtime.
 - **Per frame**: Roads drawn as vector polygons (no pixelation on zoom)
 - **Performance**: 109 FPS with 1970 segments at 4× zoom
 
@@ -397,6 +466,13 @@ MINIMAP_MARGIN = 10
 MINIMAP_BG = (20, 20, 20, 150)
 MINIMAP_BORDER = (100, 100, 100)
 MINIMAP_CAR_COLOR = (100, 150, 255)
+```
+
+### Road Geometry
+```python
+JUNCTION_WIDENING_M = 4.0      # curb-radius flare added at real (degree 3+) junctions
+ROAD_CORNER_RADIUS_M = 6.0     # visible curb-style rounding radius at road bends
+ROAD_EDGE_TOLERANCE_M = 0.5    # shared slack between planned-arc validation and live on-road checks
 ```
 
 ### Bounding Box (Kleinmachnow)
@@ -755,8 +831,15 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ---
 
-**Last Updated**: 2026-01-10  
-**Status**: 🚧 Active development - debugging arc turning system  
-**Version**: 0.95 (fully playable, comprehensive test suite, professional sprite, REST API)  
-**Test Results**: 5/6 turn tests passing (1 instant snap detected)  
-**Lines of Code**: ~6000 lines (including 982 lines of test infrastructure)
+### Why Shapely-Based Paved-Area Polygons (not per-segment rectangles + ad-hoc fillets)?
+- Hand-rolled trigonometric "fillet" patches for junction corners went through several buggy iterations (wrong-side circles, self-intersecting arcs from a `cos`/`sin` mix-up, reflex-angle loops) before landing on the current approach
+- Buffering an already-corner-rounded centerline with Shapely is the standard, well-tested way to get a smooth curve on **both** edges of a bend, not just the outer one
+- Building one authoritative polygon and sharing it between rendering AND the on-road physics checks eliminates an entire class of "looks fine but registers as off-road" (or vice versa) bugs from independently-approximated geometry
+
+---
+
+**Last Updated**: 2026-01-15  
+**Status**: ✅ Actively maintained - road corner rendering + on-road physics unified and calibrated against real-world turning behavior  
+**Version**: 0.96 (fully playable, comprehensive test suite, professional sprite, REST API, Shapely-based road geometry)  
+**Test Results**: `corner_right_entry` right-turn test passing (smooth arc, stays on road, realistic ~15 km/h corner speed)  
+**Lines of Code**: ~6000+ lines (including test infrastructure)

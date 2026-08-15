@@ -98,6 +98,18 @@ Content-Type: application/json
 {"segment": 42, "progress": 0.5}
 ```
 
+### Set HUD Label
+```bash
+POST /label
+Content-Type: application/json
+
+{"text": "4"}
+```
+Shows (or, with `{"text": null}` / `{}`, clears) a short text label in
+the game's HUD, just below the minimap. Purely a visual aid - e.g.
+`tests/test_turning.py` uses it to show which map tile/scenario the
+currently running test is on.
+
 ### Toggle Features
 ```bash
 POST /toggle

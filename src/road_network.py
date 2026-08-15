@@ -233,12 +233,22 @@ class RoadNetwork:
         if not candidates:
             return None
 
-        # For oneway roads, respect direction
+        # For oneway roads, respect direction: a oneway segment may only
+        # be ENTERED at its own start_node (that's the only way to then
+        # travel start->end, the one legal direction) - entering it at
+        # its end_node would mean driving it backward. This used to be a
+        # no-op (every candidate was let through regardless), which was
+        # invisible on simple one-way streets (the only other option at
+        # that junction was usually also fine) but broke badly on a
+        # roundabout's all-oneway ring: the car could get routed the
+        # wrong way around a ring segment, which the turn-planning
+        # geometry doesn't handle (it assumes normal forward traversal),
+        # producing tangent-point mismatches and position jumps.
         filtered = []
         for idx, angle in candidates:
             seg = self.segments[idx]
-            # Simple check: if oneway, only allow if we're going with the flow
-            # (this is approximate; proper check would need edge direction)
+            if seg.oneway and seg.start_node != node_id:
+                continue
             filtered.append((idx, angle))
 
         if not filtered:
@@ -268,11 +278,21 @@ class RoadNetwork:
 
     def is_on_road(self, wx: float, wy: float) -> bool:
         """Check if a world position is on any road.
-        
-        Includes the widened junction corner-cutting fillet area at real
-        junctions (config.JUNCTION_WIDENING_M) - see Renderer.draw_roads()
-        and docs/SPEC.md.
+
+        Uses the exact same paved-area polygon that gets rendered (see
+        get_paved_polygon() / Renderer.draw_roads()) - rounded bends and
+        junction fillets included - instead of a cruder, independent
+        rectangle+circle approximation that used to let the visual road
+        and the actual drivable area disagree (e.g. a car following the
+        smooth rendered curve through a bend could get flagged as
+        off-road because the old check only knew about sharp-cornered
+        rectangles).
         """
+        from shapely.geometry import Point
+        tolerance_px = config.ROAD_EDGE_TOLERANCE_M * config.PIXELS_PER_METER
+        return self.get_paved_polygon().distance(Point(wx, wy)) <= tolerance_px
+
+    def _old_is_on_road(self, wx: float, wy: float) -> bool:
         pppm = config.PIXELS_PER_METER
         for seg in self.segments:
             half_width = (seg.width / 2) * pppm
@@ -281,7 +301,7 @@ class RoadNetwork:
                 return True
         
         for node_id, degree in self.node_degree.items():
-            if degree < 3:
+            if degree < 2:
                 continue
             node_xy = self.nodes.get(node_id)
             if node_xy is None:
@@ -295,6 +315,52 @@ class RoadNetwork:
                 return True
         
         return False
+
+    # --- Paved-area geometry (shared by physics AND the renderer, so
+    # the drivable area always exactly matches what's painted) ---
+
+    def get_road_polygons_by_color(self):
+        """Build (color, [(exterior_coords, [hole_coords, ...]), ...])
+        groups for drawing. Holes matter for closed-loop roads (e.g. a
+        roundabout's ring) - a plain buffered ring genuinely has a hole
+        in the middle (the roundabout's island), and dropping that hole
+        would render/treat it as a solid filled disk instead. Cached -
+        the road network never changes at runtime."""
+        if getattr(self, "_road_polygons_cache", None) is None:
+            self._road_polygons_cache = _build_road_polygons(self)
+        return self._road_polygons_cache
+
+    def get_paved_polygon(self):
+        """A single unioned Shapely (Multi)Polygon covering the entire
+        drivable paved area (every road, rounded bends and junction
+        fillets included, holes like a roundabout's island properly
+        excluded) - the authoritative geometry for on-road checks, built
+        from the exact same per-color polygons used for rendering.
+        Cached - the road network never changes at runtime."""
+        if getattr(self, "_paved_polygon_cache", None) is None:
+            from shapely.geometry import Polygon
+            from shapely.ops import unary_union
+            polys = [
+                Polygon(ext, holes)
+                for _color, exteriors in self.get_road_polygons_by_color()
+                for ext, holes in exteriors
+            ]
+            self._paved_polygon_cache = unary_union(polys) if polys else Polygon()
+        return self._paved_polygon_cache
+
+    def get_centerlines(self):
+        """Merged, corner-rounded road CENTERLINES (no buffering) - used
+        for drawing the dashed lane-marking line down the middle of each
+        road. Reuses the exact same merge-through-plain-bends +
+        corner-rounding logic as the paved-area polygons (see
+        _build_road_polygons), so the markings visually follow the same
+        smooth curve as the road edges instead of cutting straight across
+        a rounded bend. Returns a list of coordinate lists (one per
+        merged line). Cached - the road network never changes at
+        runtime."""
+        if getattr(self, "_centerlines_cache", None) is None:
+            self._centerlines_cache = _build_centerlines(self)
+        return self._centerlines_cache
 
     def random_road_point(self) -> tuple[float, float, float, int, str]:
         """Return a random (x, y, heading, seg_idx, node_id) on any road segment.
@@ -349,6 +415,246 @@ def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: fl
     """Shortest distance from point to line segment."""
     d, _, _ = point_to_segment(px, py, x1, y1, x2, y2)
     return d
+
+
+def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False):
+    """Group segments by (highway, width), merge contiguous ones through
+    plain degree-2 nodes, and round each merged line's own corners (see
+    _round_polyline_corners). Shared by both _build_road_polygons
+    (buffers these into fillable polygons) and _build_centerlines (draws
+    them directly as the dashed lane-marking line) so the two always
+    agree exactly on where the road curves.
+
+    only_two_way: skip oneway segments entirely - a single-lane one-way
+    street has no opposing lane to divide, so it gets no center dashed
+    line (used by _build_centerlines; _build_road_polygons still wants
+    the pavement itself regardless of oneway).
+
+    Returns {(highway, width): [smoothed_coords, ...]}.
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import linemerge
+
+    pppm = config.PIXELS_PER_METER
+    corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
+
+    groups: dict[tuple[str, float], list] = {}
+    for seg in network.segments:
+        if only_two_way and seg.oneway:
+            continue
+        length = math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
+        if length < 1e-6:
+            continue
+        groups.setdefault((seg.highway, seg.width), []).append(seg)
+
+    result: dict[tuple[str, float], list] = {}
+    for key, segs in groups.items():
+        lines = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in segs]
+        merged = linemerge(lines) if len(lines) > 1 else lines[0]
+        merged_lines = merged.geoms if hasattr(merged, "geoms") else [merged]
+        result[key] = [
+            _round_polyline_corners(list(line.coords), corner_radius_px)
+            for line in merged_lines
+        ]
+    return result
+
+
+def _build_centerlines(network: "RoadNetwork"):
+    """Flatten _merge_and_round_lines()'s per-group coordinate lists into
+    one plain list of polylines (color/width no longer matter for a
+    lane-marking line). One-way segments are excluded - see
+    _merge_and_round_lines(only_two_way=...)."""
+    groups = _merge_and_round_lines(network, only_two_way=True)
+    return [coords for lines in groups.values() for coords in lines]
+
+
+def _build_road_polygons(network: "RoadNetwork"):
+    """Merge connected same-width road segments into continuous lines,
+    round off the CENTERLINE's own corners with a real arc of visible
+    radius at every bend (a plain buffer's 'round join' only curves the
+    outer/convex edge of a bend and leaves the inner edge a perfectly
+    sharp mitre - correct for a generic stroke, but not what an actual
+    paved road corner looks like), and only then buffer the
+    already-smooth line into a fillable polygon. Grouped by (highway
+    type, width) for coloring. Returns a list of
+    (color, [exterior_ring_coords, ...]) - polygon holes are ignored
+    (roads in practice don't produce meaningful ones)."""
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+
+    pppm = config.PIXELS_PER_METER
+    groups = _merge_and_round_lines(network)
+
+    result = []
+    for (highway, width), smooth_lines in groups.items():
+        half_w_px = (width / 2) * pppm
+
+        buffered_parts = []
+        for smooth_coords in smooth_lines:
+            smooth_line = LineString(smooth_coords)
+            buffered_parts.append(
+                smooth_line.buffer(half_w_px, cap_style="round", join_style="round", resolution=8)
+            )
+        buffered = unary_union(buffered_parts)
+
+        color = config.ROAD_TYPES.get(highway, {}).get("color", (150, 150, 150))
+        polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]
+        exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors]) for p in polys if not p.is_empty]
+        result.append((color, exteriors))
+
+    result.extend(_build_multiway_junction_fillets(network, pppm))
+    return result
+
+
+def _build_multiway_junction_fillets(network: "RoadNetwork", pppm: float):
+    """Round the corners at 3-/4-way junctions (T, Y, crossroads) too.
+    linemerge() only merges through degree-2 nodes, so at a real
+    junction each connected road stays a separate segment/line with
+    nothing rounding the gap between adjacent ones. For every pair of
+    roads meeting at a shallow-enough angle (a real 'corner', not a
+    near-straight pass-through or a near-duplicate), build a short
+    virtual 3-point polyline through the junction node, run it through
+    the exact same corner-rounding + buffer logic used for plain bends,
+    and add the resulting little capsule patch - it blends in seamlessly
+    since it's the same color and geometry construction as everything
+    else."""
+    from shapely.geometry import LineString
+
+    MIN_GAP_DEG = 15.0
+    MAX_GAP_DEG = 155.0
+    corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
+
+    extras = []
+    for node_id, connected in network.node_connections.items():
+        if len(connected) < 3:
+            continue  # degree-2 bends are already handled via linemerge
+        node_xy = network.nodes.get(node_id)
+        if node_xy is None:
+            continue
+        node_x, node_y = node_xy
+
+        spokes = []
+        for seg_idx in connected:
+            seg = network.segments[seg_idx]
+            if seg.start_node == node_id:
+                away_dx, away_dy = seg.x2 - seg.x1, seg.y2 - seg.y1
+            else:
+                away_dx, away_dy = seg.x1 - seg.x2, seg.y1 - seg.y2
+            length = math.hypot(away_dx, away_dy)
+            if length < 1e-6:
+                continue
+            angle = math.atan2(away_dy, away_dx)
+            spokes.append((angle, away_dx / length, away_dy / length, seg))
+        if len(spokes) < 2:
+            continue
+        spokes.sort(key=lambda s: s[0])
+
+        n = len(spokes)
+        for i in range(n):
+            _, ax, ay, seg_a = spokes[i]
+            _, bx, by, seg_b = spokes[(i + 1) % n]
+            gap = math.acos(max(-1.0, min(1.0, ax * bx + ay * by)))
+            gap_deg = math.degrees(gap)
+            if gap_deg < MIN_GAP_DEG or gap_deg > MAX_GAP_DEG:
+                continue
+
+            half_w_px = (min(seg_a.width, seg_b.width) / 2) * pppm
+            reach = corner_radius_px * 3 + half_w_px
+            virtual_line = [
+                (node_x + reach * ax, node_y + reach * ay),
+                (node_x, node_y),
+                (node_x + reach * bx, node_y + reach * by),
+            ]
+            smooth = _round_polyline_corners(virtual_line, corner_radius_px)
+            buffered = LineString(smooth).buffer(
+                half_w_px, cap_style="round", join_style="round", resolution=8
+            )
+            color = config.ROAD_TYPES.get(seg_a.highway, {}).get("color", (150, 150, 150))
+            polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]
+            exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors]) for p in polys if not p.is_empty]
+            extras.append((color, exteriors))
+    return extras
+
+
+def _round_polyline_corners(coords, radius, arc_steps=10):
+    """Replace every interior vertex of a polyline with a circular arc
+    of the given radius, tangent to both adjoining edges - i.e. actually
+    round the line's own corners, not just its eventual stroke outline.
+    Endpoints are left untouched."""
+    if len(coords) < 3 or radius <= 0:
+        return coords
+
+    result = [coords[0]]
+    for i in range(1, len(coords) - 1):
+        px, py = coords[i - 1]
+        vx, vy = coords[i]
+        nx, ny = coords[i + 1]
+
+        ax, ay = px - vx, py - vy
+        bx, by = nx - vx, ny - vy
+        a_len = math.hypot(ax, ay)
+        b_len = math.hypot(bx, by)
+        if a_len < 1e-9 or b_len < 1e-9:
+            result.append((vx, vy))
+            continue
+        ax, ay = ax / a_len, ay / a_len
+        bx, by = bx / b_len, by / b_len
+
+        # Angle between the two edges (both pointing away from the vertex).
+        dot = max(-1.0, min(1.0, ax * bx + ay * by))
+        gap = math.acos(dot)
+        if gap < 1e-6 or gap > math.pi - 1e-6:
+            # Straight-through (or fully doubled-back) - no real corner.
+            result.append((vx, vy))
+            continue
+
+        half_gap = gap / 2
+        tangent_dist = radius / math.tan(half_gap)
+        # Cap the tangent distance so it never eats more than half of
+        # either adjoining edge (avoids self-overlap on short segments).
+        tangent_dist = min(tangent_dist, a_len / 2, b_len / 2)
+        actual_radius = tangent_dist * math.tan(half_gap)
+
+        center_dist = actual_radius / math.sin(half_gap)
+        bis_x, bis_y = ax + bx, ay + by
+        bis_len = math.hypot(bis_x, bis_y)
+        if bis_len < 1e-9:
+            result.append((vx, vy))
+            continue
+        bis_x, bis_y = bis_x / bis_len, bis_y / bis_len
+
+        center_x = vx + center_dist * bis_x
+        center_y = vy + center_dist * bis_y
+        t1x, t1y = vx + tangent_dist * ax, vy + tangent_dist * ay
+        t2x, t2y = vx + tangent_dist * bx, vy + tangent_dist * by
+
+        angle_t1 = math.atan2(t1y - center_y, t1x - center_x)
+        angle_t2 = math.atan2(t2y - center_y, t2x - center_x)
+
+        # The correct arc sweep is always the EXTERIOR turn angle
+        # (pi - gap) - a small, sharp corner (gap near 0) needs a wide
+        # near-180 deg arc, a nearly-straight corner (gap near pi) needs
+        # a tiny arc. Of the two possible *rotation directions* around
+        # the circle from t1 to t2, pick whichever one's size actually
+        # matches that value. Importantly, t1 must ALWAYS be emitted
+        # before t2 - t1 lies on the incoming edge, t2 on the outgoing
+        # edge, so swapping their order self-intersects the line.
+        fwd_sweep = (angle_t2 - angle_t1) % (2 * math.pi)
+        expected_sweep = math.pi - gap
+        if abs(fwd_sweep - expected_sweep) < abs((2 * math.pi - fwd_sweep) - expected_sweep):
+            direction, sweep = 1, fwd_sweep
+        else:
+            direction, sweep = -1, (2 * math.pi) - fwd_sweep
+
+        result.append((t1x, t1y))
+        for s in range(1, arc_steps):
+            a = angle_t1 + direction * sweep * (s / arc_steps)
+            result.append((center_x + actual_radius * math.cos(a),
+                           center_y + actual_radius * math.sin(a)))
+        result.append((t2x, t2y))
+
+    result.append(coords[-1])
+    return result
 
 
 def snap_endpoints(segments: list[RoadSegment], pppm: float, snap_m: float = 8.0) -> int:

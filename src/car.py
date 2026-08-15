@@ -46,6 +46,12 @@ class Car:
         # rather than snapping from lane position to centerline instantly.
         self._lane_offset_factor: float = 1.0
         self._recovery_start_factor: float = 1.0
+        # Where (segment + progress) the recovery blend above started
+        # from - see _advance_active_turn() / the recovery-blend branch of
+        # _update_position_rails() for why this must be measured from the
+        # actual hand-off point, not from the segment's start.
+        self._recovery_start_seg_idx: int | None = None
+        self._recovery_start_progress: float = 0.0
         
         # The turn plan for an upcoming junction, decided ONCE (fixed
         # target speed, fixed geometry) as soon as we know which way we're
@@ -255,6 +261,22 @@ class Car:
             # (no swerve needed at all) would still get yanked down to a
             # fresh, wrong, distance-based factor on the very next frame.
             self._recovery_start_factor = self._lane_offset_factor
+            # Also remember WHERE (segment + progress) this hand-off
+            # happened - the tangent-fillet arc can end well past the
+            # segment's own start (to_tangent_offset_m can easily exceed
+            # the 20m recovery blend distance below, as it does on tight
+            # corners with a long tangent distance), so the blend must be
+            # measured from THIS point, not from the segment's start.
+            # Using "distance from segment start" there previously made
+            # the blend already mathematically "complete" (capped to 1.0)
+            # by the very next frame whenever to_tangent_offset_m alone
+            # exceeded the blend distance - snapping the lane factor
+            # straight from its hand-off value to 1.0 in a single frame
+            # instead of easing there, which is exactly the kind of
+            # sudden sideways jump the teleportation watchdog is (rightly)
+            # designed to catch.
+            self._recovery_start_seg_idx = self.seg_idx
+            self._recovery_start_progress = self.progress
             
             # Clear active turn
             self.active_turn = None
@@ -386,10 +408,43 @@ class Car:
             # now, since the "if turn_plan" branch above already handles
             # that with a precise, tangent-point-anchored blend.)
             SWERVE_DISTANCE_M = 20.0
-            distance_from_seg_start_m = seg.length * (self.progress if self.forward else 1.0 - self.progress)
-            recovery_progress = max(0.0, min(1.0, distance_from_seg_start_m / SWERVE_DISTANCE_M))
+            # Measured from the hand-off point (segment + progress
+            # recorded in _advance_active_turn when the last turn
+            # completed), NOT from this segment's start - the hand-off
+            # itself can already be well past the 20m mark (e.g. a tight
+            # corner with a long tangent distance), which would otherwise
+            # make the blend "already complete" the very next frame and
+            # snap the lane factor straight to 1.0 instead of easing there.
+            recovery_start_seg = getattr(self, '_recovery_start_seg_idx', None)
+            if recovery_start_seg == self.seg_idx:
+                recovery_start_progress = getattr(self, '_recovery_start_progress', 0.0)
+                distance_since_handoff_m = seg.length * abs(self.progress - recovery_start_progress)
+            else:
+                # Already moved on to a later segment without needing
+                # another turn - the blend is long done.
+                distance_since_handoff_m = SWERVE_DISTANCE_M
+            recovery_progress = max(0.0, min(1.0, distance_since_handoff_m / SWERVE_DISTANCE_M))
             recovery_start = getattr(self, '_recovery_start_factor', 1.0)
             self._lane_offset_factor = recovery_start + (1.0 - recovery_start) * recovery_progress
+            
+            # No turn plan means either a genuine dead end or nothing
+            # geometrically fits (even at the mechanical minimum) - in
+            # BOTH cases there's no arc to smoothly carry us past this
+            # junction, so brake toward a full stop by the time we get
+            # there instead of barreling into it at cruise speed (which
+            # used to be an instant, jarring stop - or worse, on a long
+            # dead-end segment, an actual position-teleport bug; see
+            # _handle_segment_end). Same full-strength braking math as
+            # the turn-approach case above, just targeting speed 0 at
+            # the junction itself rather than a fixed turn speed at the
+            # tangent point.
+            if self.speed > 0:
+                braking_distance_m = (self.speed ** 2) / (2 * config.CAR_BRAKING)
+                safety_margin_m = 5.0
+                if remaining_to_junction_m <= braking_distance_m + safety_margin_m:
+                    self.speed = max(0.0, self.speed - config.CAR_BRAKING * dt)
+                    self.target_speed = 0.0
+                    self._braking = True
         
         # Normal plain-segment movement (no turn starting this frame)
         distance_frac = distance_m / seg.length if seg.length > 0 else 0
@@ -492,24 +547,55 @@ class Car:
         ideal_speed = self.turning_system.decide_target_speed_for_turn(turn_angle_deg, cruise_speed_mps)
         min_speed = math.sqrt(self.turning_system.max_lateral_accel * self.turning_system.MIN_MECHANICAL_RADIUS_M)
         
-        candidate_speeds = [ideal_speed, max(ideal_speed * 0.6, min_speed), min_speed]
-        # De-dupe while preserving order (a plain set() would shuffle the
-        # try-ideal-first-then-fallback order we actually want)
+        # Several speeds between ideal and the mechanical minimum - not
+        # just 3 coarse steps - so "slow down further" has a real chance
+        # to succeed within our OWN lane before ever considering the
+        # opposing lane (see below). Descending, deduped, always ends
+        # exactly at min_speed.
+        candidate_speeds = [ideal_speed]
+        steps = 6
+        for i in range(1, steps + 1):
+            frac = 1.0 - i / steps
+            candidate_speeds.append(max(min_speed, ideal_speed * frac))
         seen = set()
+        candidate_speeds = [round(s, 6) for s in candidate_speeds]
         candidate_speeds = [s for s in candidate_speeds if not (s in seen or seen.add(s))]
         
-        # For EACH speed attempt, try to stay fully within our own lane
-        # first, only reducing toward centerline (and, if truly necessary,
-        # into the opposing lane) if that doesn't fit. This is why gentle
-        # turns/curves never need to swerve at all: the full-lane-offset
-        # attempt at the ideal speed usually just works.
+        # Other traffic may be coming the other way at any time - the
+        # opposing lane is NEVER just a free way to take a turn faster.
+        # It's only used as an absolute last resort, and only once EVERY
+        # speed (all the way down to the mechanical minimum) has been
+        # tried fully within our own lane first. This is why a real slow
+        # crawl through even a tight hairpin stays entirely in-lane - it's
+        # only speeds that would need to swerve that get rejected before
+        # ever reaching the opposing-lane fallback.
+        #
+        # Full-street swerving (the reduced/centerline lane offsets below
+        # full, while STILL >= 0 - i.e. still our own side) is kept for
+        # when it's genuinely needed at a chosen speed and there's no
+        # reason to think anything's coming - this is what gives
+        # comfortable, natural-looking wide turns their own-lane swing on
+        # open roads with no oncoming traffic yet modeled.
         from_seg = network.segments[self.seg_idx]
-        full_lane_offset_m = from_seg.width / 4  # matches _apply_plain_segment_position
-        lane_offset_fractions = [1.0, 0.5, 0.0, -0.5]  # last one dips into the opposing lane
+        to_seg = network.segments[next_seg_idx]
+        # A one-way (single-lane) road has no lane to offset within -
+        # _apply_plain_segment_position always forces lane_offset to 0
+        # there, so the turn plan must too, or the fillet's own tangent
+        # point ends up built for a lane position the car is never
+        # actually at (a fixed offset-width mismatch every time, which on
+        # short/tight geometry - e.g. a roundabout's ring - is large
+        # enough to trip the teleportation watchdog at the hand-off).
+        # Applies if EITHER end of the turn is one-way: a single fillet
+        # geometry can't have a lane offset on one end and centerline on
+        # the other, so if either side forces centerline, the whole arc
+        # has to be built for centerline.
+        full_lane_offset_m = (from_seg.width / 4) if not (from_seg.oneway or to_seg.oneway) else 0.0
+        own_lane_fractions = [1.0, 0.5, 0.0]
+        opposing_lane_fractions = [-0.5]
         
         plan = None
-        for candidate_speed in candidate_speeds:
-            for frac in lane_offset_fractions:
+        for frac in own_lane_fractions:
+            for candidate_speed in candidate_speeds:
                 candidate = self.turning_system.plan_turn(
                     candidate_speed, self.seg_idx, next_seg_idx, junction_node, network,
                     lane_offset_m=full_lane_offset_m * frac,
@@ -519,6 +605,19 @@ class Car:
                     break
             if plan:
                 break
+        
+        if plan is None:
+            for frac in opposing_lane_fractions:
+                for candidate_speed in candidate_speeds:
+                    candidate = self.turning_system.plan_turn(
+                        candidate_speed, self.seg_idx, next_seg_idx, junction_node, network,
+                        lane_offset_m=full_lane_offset_m * frac,
+                    )
+                    if candidate:
+                        plan = candidate
+                        break
+                if plan:
+                    break
         
         self.planned_turn = plan
         self.planned_turn_key = key
@@ -553,10 +652,29 @@ class Car:
             if self.driver and hasattr(self.driver, 'clear_blinker_if_turned'):
                 self.driver.clear_blinker_if_turned(self, network, old_seg, next_seg)
         else:
-            # Dead end - turn around
+            # Dead end - turn around. Nudge progress by a small FIXED
+            # DISTANCE back onto the road, staying on the SAME side we
+            # actually arrived at (node_id) - not a fixed 0.9/0.1
+            # FRACTION of the segment based on the (already-flipped) new
+            # forward direction, which put the car at the position ~1.0
+            # or ~0.0 as if it had always been driving that way, rather
+            # than the small nudge back from wherever it physically just
+            # arrived. On a short segment the difference is tiny and
+            # invisible; on a long one (e.g. a 150m roundabout spoke) the
+            # old code silently teleported the car ~135-150m down the
+            # road, tripping the teleportation watchdog and crashing the
+            # game the first time anything actually drove all the way to
+            # a long dead end.
+            seg = network.segments[self.seg_idx]
+            arrived_at_start = (node_id == seg.start_node)
             self.heading = (self.heading + 180) % 360
             self.forward = not self.forward
-            self.progress = 0.9 if self.forward else 0.1
+            nudge_m = min(2.0, seg.length / 4) if seg.length > 0 else 0.0
+            nudge_frac = (nudge_m / seg.length) if seg.length > 0 else 0.0
+            # Stay near the end we actually arrived at (node_id), just
+            # nudged back onto the road - NOT wherever the new (flipped)
+            # forward direction would imply for a normal in-progress drive.
+            self.progress = nudge_frac if arrived_at_start else 1.0 - nudge_frac
             self.speed = 0
             if self.driver and hasattr(self.driver, 'blinker_left'):
                 self.driver.blinker_left = False
@@ -641,6 +759,8 @@ class Car:
         self.planned_turn_key = None
         self._lane_offset_factor = 1.0
         self._recovery_start_factor = 1.0
+        self._recovery_start_seg_idx = None
+        self._recovery_start_progress = 0.0
         # Apply the normal right-lane offset immediately - see the
         # matching comment in teleport_to_named_point().
         self._apply_plain_segment_position(seg)
@@ -667,6 +787,8 @@ class Car:
         self.planned_turn_key = None
         self._lane_offset_factor = 1.0
         self._recovery_start_factor = 1.0
+        self._recovery_start_seg_idx = None
+        self._recovery_start_progress = 0.0
         # Apply the normal right-lane offset immediately (matching what
         # continuous driving would show) instead of leaving the car at
         # the raw centerline node coordinates - otherwise the very next
@@ -677,53 +799,17 @@ class Car:
 
     def is_on_road(self, network) -> bool:
         """Check if car is currently on any road.
-        
-        Matches what Renderer.draw_roads() actually paints: each segment's
-        rectangle, PLUS rounded end caps, PLUS (at real junctions, degree
-        3+) a widened corner-cutting fillet area (config.JUNCTION_WIDENING_M)
-        - real intersections have a much wider paved area at corners than
-        the connecting roads' width alone. Without this, a car sitting
-        exactly on the widened, visually-paved junction area could be
-        wrongly flagged as "off-road".
+
+        Delegates entirely to RoadNetwork.is_on_road(), which tests
+        against the exact same paved-area polygon that gets rendered
+        (rounded bends and junction fillets included). This used to be a
+        separate, independently-approximated rectangle+circle check here
+        that could disagree with what was actually drawn (e.g. flagging
+        a car as off-road while it was visibly still on the smooth
+        rendered curve through a bend) - now there's a single source of
+        truth for "where the road actually is".
         """
-        pppm = config.PIXELS_PER_METER
-        for seg in network.segments:
-            half_width = (seg.width / 2) * pppm
-            # Point-to-segment distance (rectangle body)
-            dx = seg.x2 - seg.x1
-            dy = seg.y2 - seg.y1
-            length_sq = dx * dx + dy * dy
-            if length_sq == 0:
-                continue
-            t = max(0, min(1, ((self.x - seg.x1) * dx + (self.y - seg.y1) * dy) / length_sq))
-            proj_x = seg.x1 + t * dx
-            proj_y = seg.y1 + t * dy
-            dist = math.hypot(self.x - proj_x, self.y - proj_y)
-            if dist <= half_width:
-                return True
-            # Rounded end caps (t was clamped to [0,1], so check the
-            # actual endpoints directly for the circular cap area beyond
-            # the rectangle's ends)
-            for ex, ey in ((seg.x1, seg.y1), (seg.x2, seg.y2)):
-                if math.hypot(self.x - ex, self.y - ey) <= half_width:
-                    return True
-        
-        # Widened junction fillets at real junctions (degree 3+)
-        for node_id, degree in network.node_degree.items():
-            if degree < 3:
-                continue
-            node_xy = network.nodes.get(node_id)
-            if node_xy is None:
-                continue
-            connected = network.node_connections.get(node_id, [])
-            if not connected:
-                continue
-            widest_seg = max((network.segments[i] for i in connected), key=lambda s: s.width)
-            radius_px = (widest_seg.width / 2 + config.JUNCTION_WIDENING_M) * pppm
-            if math.hypot(self.x - node_xy[0], self.y - node_xy[1]) <= radius_px:
-                return True
-        
-        return False
+        return network.is_on_road(self.x, self.y)
     
     # --- Rendering ---
     

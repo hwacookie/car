@@ -78,6 +78,18 @@ class GameAPI:
                 self.commands['teleport'] = data
             return jsonify({'ok': True, 'command': 'teleport', 'params': data})
         
+        @self.app.route('/label', methods=['POST'])
+        def label():
+            """Set (or clear) a short text label shown in the HUD - handy for
+            test scripts to show which test/map-tile is currently running.
+            
+            Body: {"text": "2/3"} or {"text": null} / {} to clear.
+            """
+            data = request.get_json(silent=True) or {}
+            with self.lock:
+                self.commands['label'] = data.get('text')
+            return jsonify({'ok': True, 'command': 'label', 'params': data})
+        
         @self.app.route('/start_points', methods=['GET'])
         def start_points():
             """List named deterministic start points (synthetic test maps only).

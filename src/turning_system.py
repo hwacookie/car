@@ -186,12 +186,23 @@ class TurningSystem:
         Returns:
             Target speed in m/s for this specific turn
         """
-        if turn_angle_deg > 90:
+        # Calibrated against real-world guidance for turning a small car
+        # (~5.5m wall-to-wall turning circle) through an intersection: a
+        # true right-angle corner is realistically taken at roughly
+        # 10-15 km/h (tighter still, close to walking pace, if you can't
+        # swing wide into the target road), NOT the ~40 km/h this used to
+        # assume - that speed would need a ~25m turning radius, wildly
+        # more than an ordinary street corner's curb radius provides,
+        # which is exactly why the planner used to have to fall back
+        # through slower/lane-shifted attempts and still end up visibly
+        # cutting across into the centerline/opposing lane just to make
+        # the (too-large) arc fit.
+        if turn_angle_deg >= 90:
+            safe_speed = 15 / 3.6
+        elif turn_angle_deg >= 60:
             safe_speed = 25 / 3.6
-        elif turn_angle_deg > 60:
-            safe_speed = 40 / 3.6
-        elif turn_angle_deg > 30:
-            safe_speed = 55 / 3.6
+        elif turn_angle_deg >= 30:
+            safe_speed = 45 / 3.6
         else:
             # Gentle enough that no dedicated slow-down is needed
             safe_speed = cruise_speed_mps
@@ -515,11 +526,7 @@ class TurningSystem:
             True if entire arc is on road, False otherwise
         """
         pppm = config.PIXELS_PER_METER
-        
-        # Get the two segments we're transitioning between
-        from_seg = network.segments[turn_plan.from_seg_idx]
-        to_seg = network.segments[turn_plan.to_seg_idx]
-        
+
         # Small buffer (not the earlier 5m one, which let arcs visibly
         # clip the grass): this covers the residual mismatch between the
         # arc's anchor (the car's current LANE position, offset ~1.75m
@@ -527,62 +534,23 @@ class TurningSystem:
         # geometric fillet would use. Real roads have comparable
         # curb/shoulder slack beyond the marked lane width, so this stays
         # physically reasonable while resolving marginal (~0.3m) rejections.
-        buffer_margin = 0.5
-        
-        # Junction node cap: the renderer draws a ROUNDED CAP (circle of
-        # radius = half road width) at every segment endpoint, including
-        # the shared junction node — this fills in the diagonal "notch"
-        # between two roads meeting at an angle with actual rendered road
-        # surface. Without checking this, arcs that legitimately cut
-        # through that notch (exactly where a real corner fillet would go)
-        # were being wrongly rejected as off-road, even though the visual
-        # road surface covers that area. Use whichever segment's cap is
-        # bigger, matching what's actually drawn.
-        junction_xy = network.nodes.get(turn_plan.junction_node)
-        # Matches the widened junction rendering in Renderer.draw_roads():
-        # real intersections have a much wider paved corner-cutting area
-        # than the roads' own width (config.JUNCTION_WIDENING_M).
-        junction_cap_radius = (
-            (max(from_seg.width, to_seg.width) / 2 + config.JUNCTION_WIDENING_M) * pppm
-            if junction_xy else 0.0
-        )
-        
+        buffer_margin_px = config.ROAD_EDGE_TOLERANCE_M * pppm
+
+        # Test against the exact same paved-area polygon that gets
+        # rendered (rounded bends and junction fillets included) instead
+        # of an independent rectangle+circle approximation - this used to
+        # be able to disagree with what's actually drawn/driveable.
+        from shapely.geometry import Point
+        paved = network.get_paved_polygon()
+
         failed_points = []
-        
+
         for i in range(num_samples + 1):
             progress = i / num_samples
             x, y, _ = turn_plan.get_point_on_arc(progress)
-            
-            # Check if point is near EITHER from_seg OR to_seg with generous buffer
-            on_road = False
-            
-            for seg in [from_seg, to_seg]:
-                # Use generous buffer = half width + margin
-                buffer = (seg.width / 2 + buffer_margin) * pppm
-                
-                # Point-to-segment distance
-                dx = seg.x2 - seg.x1
-                dy = seg.y2 - seg.y1
-                length_sq = dx * dx + dy * dy
-                if length_sq == 0:
-                    continue
-                
-                # Project point onto segment
-                t = max(0, min(1, ((x - seg.x1) * dx + (y - seg.y1) * dy) / length_sq))
-                proj_x = seg.x1 + t * dx
-                proj_y = seg.y1 + t * dy
-                dist = math.hypot(x - proj_x, y - proj_y)
-                
-                if dist <= buffer:
-                    on_road = True
-                    break
-            
-            # Also accept points within the junction's rounded cap circle
-            if not on_road and junction_xy is not None:
-                dist_to_node = math.hypot(x - junction_xy[0], y - junction_xy[1])
-                if dist_to_node <= junction_cap_radius:
-                    on_road = True
-            
+
+            on_road = paved.distance(Point(x, y)) <= buffer_margin_px
+
             if not on_road:
                 failed_points.append((i, progress, x, y))
         

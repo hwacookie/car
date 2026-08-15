@@ -127,6 +127,7 @@ def main(smoke_test_frames: int = 0):
     camera = Camera(WINDOW_WIDTH, WINDOW_HEIGHT)
     camera.x, camera.y = car.x, car.y   # snap to car at start
     renderer = Renderer(network, camera)
+    renderer.hud_label = None  # optional short text (e.g. "2/3") set via API /label
 
     # --- Game loop ---
     frame = 0
@@ -262,6 +263,10 @@ def main(smoke_test_frames: int = 0):
                     elif mode == 'free' and not isinstance(car.driver, KeyboardDriver):
                         car.driver = KeyboardDriver()
                         print("API: Switched to FREE mode")
+            
+            # Label command (short HUD text, e.g. "2/3" for a test's map tile)
+            if 'label' in commands:
+                renderer.hud_label = commands['label']
 
         # Get control input from driver (keyboard or API)
         control_input = car.driver.get_control(car, network, dt, keys)
@@ -282,6 +287,37 @@ def main(smoke_test_frames: int = 0):
                 control_input['blinker_left'] = True
             if api_control['blinker_right']:
                 control_input['blinker_right'] = True
+            
+            # The AIDriver's actual turn CHOICE (which segment to take at
+            # a junction) comes from its own `pending_turn` attribute -
+            # which get_control() above only ever sets from real keyboard
+            # key-edge-detection (K_LEFT/K_a, K_RIGHT/K_d). Merging the
+            # API's blinker flags into control_input alone only affected
+            # cosmetic blinker-light rendering elsewhere; it never told
+            # the driver which way to actually turn, so API-controlled
+            # turns silently fell back to whatever `pending_turn` already
+            # was (usually None -> "straight", or whatever the keyboard
+            # last set) regardless of which blinker the API requested.
+            # Explicitly sync pending_turn/blinker state from the API's
+            # request here so a remote-controlled turn actually steers
+            # the requested direction at the next junction.
+            if hasattr(car.driver, 'pending_turn'):
+                if api_control['blinker_left']:
+                    car.driver.pending_turn = 'left'
+                    car.driver.blinker_left = True
+                    car.driver.blinker_right = False
+                elif api_control['blinker_right']:
+                    car.driver.pending_turn = 'right'
+                    car.driver.blinker_right = True
+                    car.driver.blinker_left = False
+                elif not (keys[pygame.K_LEFT] or keys[pygame.K_a] or
+                          keys[pygame.K_RIGHT] or keys[pygame.K_d]):
+                    # Neither the API nor the keyboard is requesting a
+                    # turn right now - make sure a previous API-driven
+                    # blinker doesn't stay stuck on.
+                    car.driver.pending_turn = None
+                    car.driver.blinker_left = False
+                    car.driver.blinker_right = False
         
         # Update car physics
         car.update(dt, network, control_input)
