@@ -78,6 +78,23 @@ class MapBuilder:
         """Finalize and return the RoadNetwork."""
         pppm = self.pppm
 
+        # ── Shift so world starts at (0, 0) — handle negative coords ──
+        # Must happen FIRST, before any coordinate computation.
+        xs_raw = [x for x, y in self._nodes_m.values()]
+        ys_raw = [y for x, y in self._nodes_m.values()]
+        min_x, min_y = min(xs_raw), min(ys_raw)
+        if min_x < 0 or min_y < 0:
+            # Shift all nodes
+            self._nodes_m = {
+                nid: (x - min_x, y - min_y)
+                for nid, (x, y) in self._nodes_m.items()
+            }
+            # Shift all segment endpoints (stored in px)
+            sdx, sdy = min_x * pppm, min_y * pppm
+            for seg in self._segments:
+                seg.x1 += sdx; seg.y1 += sdy
+                seg.x2 += sdx; seg.y2 += sdy
+
         nodes = {nid: (x * pppm, y * pppm) for nid, (x, y) in self._nodes_m.items()}
 
         # node_connections + node_degree
@@ -140,6 +157,59 @@ class MapBuilder:
             node_max_width=node_info,
             start_points=start_points,
         )
+
+
+def build_autobahn_kreuz() -> RoadNetwork:
+    """Simple Autobahnkreuz: two crossing highways.
+
+    A1: N-S Autobahn (on top = overpass), 2 lanes each direction (14 m wide)
+    A2: E-W Autobahn (underpass), 2 lanes each direction (14 m wide)
+
+    Start points at the four cardinal approaches.
+    """
+    b = MapBuilder()
+
+    # ---- A1: north-south (slight eastward curve) ----
+    a1_nodes = [
+        ("a1_s1",   -20, -1200),
+        ("a1_s2",   -15, -900),
+        ("a1_s3",   -10, -600),
+        ("a1_s4",    -5, -300),
+        ("a1_s5",     0,    0),   # crosses A2
+        ("a1_n1",    10,  300),
+        ("a1_n2",    20,  600),
+        ("a1_n3",    30,  900),
+        ("a1_n4",    30, 1200),
+    ]
+    for nid, x, y in a1_nodes:
+        b.node(nid, x, y)
+    for i in range(len(a1_nodes) - 1):
+        b.road(a1_nodes[i][0], a1_nodes[i + 1][0], highway="motorway")
+
+    # ---- A2: east-west (straight) ----
+    a2_nodes = [
+        ("a2_w1", -1200,    0),
+        ("a2_w2",  -900,    0),
+        ("a2_w3",  -600,    0),
+        ("a2_w4",  -300,    0),
+        ("a2_w5",     0,    0),   # crosses A1
+        ("a2_e1",   300,    0),
+        ("a2_e2",   600,    0),
+        ("a2_e3",   900,    0),
+        ("a2_e4",  1200,    0),
+    ]
+    for nid, x, y in a2_nodes:
+        b.node(nid, x, y)
+    for i in range(len(a2_nodes) - 1):
+        b.road(a2_nodes[i][0], a2_nodes[i + 1][0], highway="motorway")
+
+    # ---- Start points (endpoints = degree-1 nodes) ----
+    b.start("autobahn_north", "a1_n4")   # entering A1 from north
+    b.start("autobahn_south", "a1_s1")   # entering A1 from south
+    b.start("autobahn_east", "a2_e4")    # entering A2 from east
+    b.start("autobahn_west", "a2_w1")    # entering A2 from west
+
+    return b.build()
 
 
 def build_basic_test_map() -> RoadNetwork:
@@ -340,6 +410,7 @@ def build_basic_test_map() -> RoadNetwork:
 # Registry of all available test maps
 TEST_MAPS = {
     "basic": build_basic_test_map,
+    "autobahn": build_autobahn_kreuz,
 }
 
 
