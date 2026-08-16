@@ -32,7 +32,7 @@ START_POINT_NUMBER = {
     'sweeping_curve': 3, 'sweeping_curve_reverse': 3,
     'roundabout_from_north': 4, 'roundabout_from_east': 4,
     'roundabout_from_south': 4, 'roundabout_from_west': 4,
-    'y_from_stem': 5, 'y_from_left': 5, 'y_from_right': 5,
+    'y_from_stem': 5, 'y_from_sw': 5, 'y_from_se': 5,
     'crossroads_from_north': 6, 'crossroads_from_south': 6,
     'crossroads_from_east': 6, 'crossroads_from_west': 6,
     'oneway_entry': 7, 'oneway_wrong_way': 7,
@@ -41,7 +41,8 @@ START_POINT_NUMBER = {
     'straight': 9, 'straight_reverse': 9,
     'corner_right_entry': 10, 'corner_right_exit': 10,
     'corner_left_entry': 11, 'corner_left_exit': 11,
-    'tjunction_from_top': 12, 'tjunction_from_left': 12, 'tjunction_from_right': 12,
+    'tjunction_from_top': 12, 'tjunction_from_west': 12, 'tjunction_from_east': 12,
+    'sliver_approach': 13, 'sliver_from_west': 13, 'sliver_from_east': 13,
 }
 
 
@@ -353,9 +354,19 @@ class TurnTester:
             last_poll_speed_kmh = state['speed_kmh']
             last_poll_time = now
             
-            # Calculate heading change (handle 360° wrap)
-            heading_diff = abs((current_heading - last_heading + 180) % 360 - 180)
-            max_heading_change_per_frame = max(max_heading_change_per_frame, heading_diff)
+            # Calculate heading change (handle 360° wrap). Skip the very
+            # first poll: `last_heading` was initialised to the TELEPORT
+            # heading, but the car has already driven (and turned smoothly)
+            # during the unmonitored "accelerate to speed" phase, so
+            # comparing the first poll to the teleport heading would flag a
+            # legitimate accumulated turn as an instant snap. The teleport/
+            # jump position check below already skips the first poll for the
+            # same reason (frames_checked > 1).
+            if frames_checked > 1:
+                heading_diff = abs((current_heading - last_heading + 180) % 360 - 180)
+                max_heading_change_per_frame = max(max_heading_change_per_frame, heading_diff)
+            else:
+                heading_diff = 0.0
             
             # Record position
             positions.append({
@@ -370,7 +381,7 @@ class TurnTester:
             })
             
             # Check for instant heading snap (>30° in one frame at 60fps = 0.016s)
-            if heading_diff > 30.0:
+            if frames_checked > 1 and heading_diff > 30.0:
                 instant_snap_detected = True
                 violation_details = {
                     'type': 'instant_heading_snap',
@@ -640,24 +651,32 @@ class TurnTester:
         # routing logic) that slipped through before this was added.
         # These segment indices come from src/test_maps.py's
         # build_basic_test_map() and were verified against actual runs.
+        # NOTE on left/right: the test map now uses the OSM coordinate
+        # system (Y grows north, same as the real OSM map), so the
+        # handedness of junctions is the reverse of the original map
+        # (which had Y growing south). The expected end segments below were
+        # re-verified against actual bicycle-mode runs on the new map.
         tests = [
             # 90-degree corners (the classic reported bug)
             ('corner_right_entry', 'right', 80, 2),
             ('corner_left_entry', 'left', 80, 4),
             # T-junction (perpendicular 3-way)
-            ('tjunction_from_top', 'left', 80, 6),
-            ('tjunction_from_top', 'right', 80, 7),
+            ('tjunction_from_top', 'left', 80, 7),
+            ('tjunction_from_top', 'right', 80, 6),
             # Y-intersection (shallow ~40 degree diverging angles)
-            ('y_from_stem', 'left', 80, 9),
-            ('y_from_stem', 'right', 80, 10),
+            ('y_from_stem', 'left', 80, 10),
+            ('y_from_stem', 'right', 80, 9),
             # 4-way crossroads
-            ('crossroads_from_north', 'left', 80, 13),
-            ('crossroads_from_north', 'right', 80, 14),
+            ('crossroads_from_north', 'left', 80, 14),
+            ('crossroads_from_north', 'right', 80, 13),
             ('crossroads_from_north', 'straight', 80, 12),
             # One-way street (legal direction)
             ('oneway_entry', 'straight', 80, 16),
-            # Simple curves (degree-2 nodes, no blinker needed)
-            ('s_curve', 'straight', 80, 20),
+            # Simple curves (degree-2 nodes, no blinker needed). The S-curve
+            # is ~470 m long, so at cruise (~58 km/h) the car needs ~30 s to
+            # traverse it - longer than the default 15 s monitor window, hence
+            # the duration override.
+            ('s_curve', 'straight', 80, 20, 40.0),
             ('hairpin_entry', 'straight', 80, 25),
             ('sweeping_curve', 'straight', 80, 27),
             # Hairpin, entered from the opposite end (reverse direction)
@@ -667,15 +686,27 @@ class TurnTester:
             # keeps circling it FOREVER - a one-way loop has no "next
             # different segment" to naturally stop at unless the car
             # actually exits onto a spoke. 'right' does that here
-            # (verified: exits east, segments 36->28->29->37) - a real,
-            # completed roundabout maneuver instead of an endless circle.
-            # Monitoring now correctly keeps running THROUGH the
-            # intermediate ring segments (28, 29) instead of stopping at
-            # the first one, since only 37 (the actual exit) counts as
-            # arrival. Takes longer than a normal turn (~25s to go most
-            # of the way around before exiting), hence the longer
-            # duration override.
-            ('roundabout_from_north', 'right', 40, 37, 30.0),
+            # (verified: exits west, segments 28) - a real, completed
+            # roundabout maneuver instead of an endless circle.
+            # The ring is COUNTER-CLOCKWISE (correct for Germany / right-hand
+            # traffic: the island stays on your left). Entering from the north
+            # and going counter-clockwise, the first exit encountered is WEST
+            # (seg 28). Monitoring keeps running THROUGH the intermediate ring
+            # segments instead of stopping at the first one, since only 28
+            # (the actual exit) counts as arrival. Takes longer than a normal
+            # turn (~25s to go most of the way around before exiting), hence
+            # the longer duration override.
+            ('roundabout_from_north', 'right', 40, 28, 30.0),
+            # Sliver junction (the real-world segment-815 layout: a 4.16 m
+            # approach stub meeting a 3-way junction where one exit is a
+            # near-90-degree turn). The car must get through the tiny
+            # stub and onto the correct exit without clipping the junction.
+            # NOTE: segment indices shifted from 41/42/43 to 97/96/99 due to
+            # the 64-node roundabout ring adding many segments before the
+            # sliver junction.
+            ('sliver_approach', 'straight', 80, 97),
+            ('sliver_approach', 'right', 80, 98),
+            ('sliver_approach', 'left', 80, 99),
         ]
 
         for i, test in enumerate(tests, 1):

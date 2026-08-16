@@ -12,7 +12,7 @@ from .road_network import RoadNetwork
 from .camera import Camera
 from .renderer import Renderer, make_grass_background
 from .car import Car
-from .driver import Driver, KeyboardDriver, AIDriver
+from .driver import Driver, KeyboardDriver, AIDriver, BicycleDriver
 from .physics_validator import PhysicsValidator
 from .rest_api import GameAPI
 from .test_maps import build_test_map, TEST_MAPS
@@ -89,8 +89,15 @@ def main(smoke_test_frames: int = 0):
 
     # --- Car with AI driver on random road ---
     rx, ry, rh, seg_idx, node_id = network.random_road_point()
-    driver = AIDriver()  # Start in RAILS mode
+    # --bicycle selects the kinematic bicycle model (src/bicycle_nav.py)
+    # instead of the rail model; the REST-API test framework is identical.
+    use_bicycle = "--bicycle" in sys.argv
+    driver = BicycleDriver() if use_bicycle else AIDriver()
     car = Car(rx, ry, rh, seg_idx, driver)
+    if use_bicycle:
+        print("Navigation model: BICYCLE (kinematic, free particle)")
+    else:
+        print("Navigation model: RAILS (rail-following)")
     car.progress = 0.5
     # Apply the normal right-lane offset immediately (matching what
     # continuous driving would show), instead of leaving the car exactly
@@ -267,6 +274,10 @@ def main(smoke_test_frames: int = 0):
                         car.driver = AIDriver()
                         car.snap_to_road(network)
                         print("API: Switched to RAILS mode")
+                    elif mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
+                        car.driver = BicycleDriver()
+                        car.bicycle_nav = None
+                        print("API: Switched to BICYCLE mode")
                     elif mode == 'free' and not isinstance(car.driver, KeyboardDriver):
                         car.driver = KeyboardDriver()
                         print("API: Switched to FREE mode")

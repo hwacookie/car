@@ -37,7 +37,7 @@ MIN_ZOOM = 0.12
 ZOOM_STEP = 1.15
 
 # --- Car ---
-CAR_SPEED = 50          # meters/second = 180 km/h
+CAR_SPEED = 55.6        # meters/second = 200 km/h (top speed of a normal car)
 CAR_ACCELERATION = 2.8  # m/s²  → 0-100 km/h in ~10s (normales Auto)
 CAR_BRAKING = 10.0      # m/s²  → starke Bremsung mit ABS (~1g)
 CAR_TURN_SPEED = 180    # degrees/second

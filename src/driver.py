@@ -153,15 +153,40 @@ class AIDriver(Driver):
         """Clear blinker if actually turned in the signaled direction."""
         if from_seg == to_seg:
             return
-        
+
         turn_angle = network.get_exit_angle(from_seg, to_seg)
-        
+
         if self.blinker_left and turn_angle < -30:
             self.blinker_left = False
             self.pending_turn = None
         elif self.blinker_right and turn_angle > 30:
             self.blinker_right = False
             self.pending_turn = None
-    
+
     def get_name(self) -> str:
         return "RAILS"
+
+
+class BicycleDriver(AIDriver):
+    """Autonomous driver for BICYCLE mode.
+
+    Provides exactly the same high-level intent as AIDriver (accelerate /
+    brake / which way to turn, from the keyboard or the REST API) so the
+    test framework is unchanged - but the car executes it with the
+    kinematic bicycle model (src/bicycle_nav.py) instead of the rail
+    model. The rail model's automatic pre-turn braking is NOT used here:
+    the bicycle navigation plans its own corner speed from the reference
+    line's curvature, so we suppress it to avoid double braking.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.name = "BICYCLE"
+
+    def _should_brake_for_turn(self, car, network, dt) -> bool:
+        # The bicycle nav computes its own corner speed profile - no
+        # rail-style pre-turn braking here.
+        return False
+
+    def get_name(self) -> str:
+        return "BICYCLE"

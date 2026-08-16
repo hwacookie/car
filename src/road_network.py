@@ -297,6 +297,34 @@ class RoadNetwork:
         tolerance_px = config.ROAD_EDGE_TOLERANCE_M * config.PIXELS_PER_METER
         return self.get_paved_polygon().distance(Point(wx, wy)) <= tolerance_px
 
+    def is_car_on_road(self, wx: float, wy: float, heading_deg: float,
+                       length_m: float = 4.5, width_m: float = 1.8) -> bool:
+        """Check if a 4-wheel car (not just its center point) is on the road.
+
+        A bicycle-style check (center point only) lets the car's body/wheels
+        overhang the road edge without being detected. This checks all FOUR
+        CORNERS of the car's bounding box against the same paved polygon, so
+        any wheel leaving the road is flagged. The corners are computed from
+        the car's center, heading, length and width (north-up frame: heading
+        0 = north, forward = (sin h, cos h), right = (cos h, -sin h)).
+        """
+        from shapely.geometry import Point
+        tolerance_px = config.ROAD_EDGE_TOLERANCE_M * config.PIXELS_PER_METER
+        h = math.radians(heading_deg)
+        fx, fy = math.sin(h), math.cos(h)   # forward
+        rx, ry = math.cos(h), -math.sin(h)  # right
+        pppm = config.PIXELS_PER_METER
+        half_l = (length_m / 2.0) * pppm
+        half_w = (width_m / 2.0) * pppm
+        poly = self.get_paved_polygon()
+        for sfx in (1.0, -1.0):
+            for srx in (1.0, -1.0):
+                cx = wx + (sfx * fx * half_l + srx * rx * half_w)
+                cy = wy + (sfx * fy * half_l + srx * ry * half_w)
+                if poly.distance(Point(cx, cy)) > tolerance_px:
+                    return False
+        return True
+
     def _old_is_on_road(self, wx: float, wy: float) -> bool:
         pppm = config.PIXELS_PER_METER
         for seg in self.segments:

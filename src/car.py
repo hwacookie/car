@@ -35,6 +35,10 @@ class Car:
         # Driver controlling this car
         self.driver = driver
         
+        # Bicycle-model navigation (BICYCLE mode; created lazily on first
+        # use - see update()). None in RAILS/FREE mode.
+        self.bicycle_nav = None
+        
         # Turning system
         self.turning_system = TurningSystem(max_lateral_accel=5.0)
         self.active_turn: TurnPlan | None = None
@@ -64,6 +68,21 @@ class Car:
         self.planned_turn: TurnPlan | None = None
         self.planned_turn_key: tuple | None = None  # (from_seg_idx, to_seg_idx, junction_node)
         self._warned_no_arc_for_node: str | None = None
+        # Set (by _get_or_create_planned_turn) when the driver's signaled
+        # next segment at the upcoming junction exists but NO arc radius
+        # fits for it (not even at the mechanical minimum) - i.e. the
+        # blinker was set too late to make that turn. _handle_segment_end
+        # then slides the car past the junction on the straight
+        # continuation (or crashes into the dead-end obstacle) instead of
+        # force-entering the unreachable segment - see
+        # docs/TURN_REWORK_PLAN.md (blinkers mean "next REACHABLE
+        # decision point", never "force this one").
+        self._pending_no_arc_next_seg: int | None = None
+        
+        # Crash state (dead-end T, see _crash_into_obstacle): frames of
+        # impact deceleration still to apply.
+        self._crash_frames_left = 0
+        self._crash_decel = 0.0
         
         # Visual state
         self._braking = False
@@ -75,6 +94,13 @@ class Car:
         self._heading_start = 0.0
         self._heading_target = 0.0
         self._heading_transition_duration = 0.3
+        # Rate-limited transition state (see
+        # _begin_heading_transition_for_segment): degrees of rotation
+        # still to perform (signed), time elapsed, and the radius (m)
+        # the rotation rate is capped to keep (v / omega >= r).
+        self._heading_transition_remaining = 0.0
+        self._heading_transition_elapsed = 0.0
+        self._heading_transition_radius_m = 4.0
         
         # Debug trail
         self.trail = []
@@ -101,7 +127,13 @@ class Car:
         self._accelerating = control_input.get('accelerate', False)
         
         # Choose update mode based on driver type
-        if self.driver and self.driver.get_name() == "RAILS":
+        name = self.driver.get_name() if self.driver else "FREE"
+        if name == "BICYCLE":
+            if self.bicycle_nav is None:
+                from .bicycle_nav import BicycleNav
+                self.bicycle_nav = BicycleNav(self, network)
+            self.bicycle_nav.update(dt, control_input)
+        elif name == "RAILS":
             self._update_rails_mode(dt, network, control_input)
         else:
             self._update_free_mode(dt, control_input)
@@ -167,21 +199,32 @@ class Car:
         # still allowed to reduce speed further at any time.
         speed_cap = self.active_turn.target_speed_mps if self.active_turn else config.CAR_SPEED
         
-        # Speed control
-        if accel:
-            self.target_speed = min(self.target_speed + config.CAR_ACCELERATION * dt, speed_cap)
-        elif brake:
-            self.target_speed = max(self.target_speed - config.CAR_BRAKING * dt, 0)
-            # Direct braking
-            self.speed -= config.CAR_BRAKING * dt
-        
-        # Approach target speed
-        if self.speed < self.target_speed:
-            self.speed += config.CAR_ACCELERATION * dt
-        elif self.speed > self.target_speed:
-            self.speed -= config.CAR_BRAKING * dt * 0.3
-        
-        self.speed = max(0, min(speed_cap, self.speed))
+        # Crash into obstacle (dead-end T): the impact drains speed
+        # directly, overriding any driver input (see _crash_into_obstacle).
+        if self._crash_frames_left > 0:
+            self.speed = max(0.0, self.speed - self._crash_decel * dt)
+            self.target_speed = 0.0
+            self._braking = True
+            if self.speed <= 0.0:
+                self._crash_frames_left = 0
+            else:
+                self._crash_frames_left -= 1
+        else:
+            # Speed control
+            if accel:
+                self.target_speed = min(self.target_speed + config.CAR_ACCELERATION * dt, speed_cap)
+            elif brake:
+                self.target_speed = max(self.target_speed - config.CAR_BRAKING * dt, 0)
+                # Direct braking
+                self.speed -= config.CAR_BRAKING * dt
+            
+            # Approach target speed
+            if self.speed < self.target_speed:
+                self.speed += config.CAR_ACCELERATION * dt
+            elif self.speed > self.target_speed:
+                self.speed -= config.CAR_BRAKING * dt * 0.3
+            
+            self.speed = max(0, min(speed_cap, self.speed))
         
         # Move along road
         if self.speed > 0:
@@ -191,6 +234,13 @@ class Car:
             else:
                 # Normal segment following
                 self._update_position_rails(dt, network)
+        
+        # Advance any smooth heading transition started by a segment-end
+        # hand-off (see _begin_heading_transition_for_segment). Runs
+        # AFTER the position update, which suppresses its own heading
+        # write while a transition is active (see
+        # _apply_plain_segment_position).
+        self._update_heading_transition(dt)
     
     def _execute_active_turn(self, dt: float, network):
         """Execute current turn using circular arc (this frame's full distance)."""
@@ -252,14 +302,36 @@ class Car:
                     self.active_turn.to_seg_idx
                 )
             
-            # Remember the lane-offset factor the just-completed turn
-            # actually used (self._lane_offset_factor is untouched by arc
-            # execution, so it's still exactly the plan's target_factor
-            # here) - the recovery blend on the new segment eases FROM
-            # this value toward 1.0, instead of assuming it always starts
-            # from 0. Without this, a turn that used the FULL lane offset
-            # (no swerve needed at all) would still get yanked down to a
-            # fresh, wrong, distance-based factor on the very next frame.
+            # Preserve the arc's ABSOLUTE lateral position across the
+            # hand-off. _lane_offset_factor is a FRACTION of the CURRENT
+            # segment's width/4, so the same factor number means a
+            # different absolute offset on segments of different width:
+            # a turn from a 7 m road onto a 3.5 m road ends the arc
+            # 1.75 m from the new road's centerline, which there is
+            # factor 2.0 (the road edge - still on the paved surface,
+            # the arc was validated against it). Keeping the old factor
+            # (a fraction of the WIDE road's quarter width) would
+            # re-render the car at 0.87 m from centerline on the narrow
+            # road - a ~0.9 m lateral teleport, which the watchdog
+            # rightly killed the game for. Derive the factor from the
+            # arc's own absolute lane offset instead: by construction
+            # the arc's endpoint lies exactly lane_offset_m to the right
+            # of the TO road's centerline, so the matching factor is
+            # lane_offset_m / (to_seg.width / 4). It can exceed 1.0
+            # (road edge on a narrower exit road) or be negative
+            # (opposing-lane plans); the recovery blend below eases it
+            # back toward 1.0 (own-lane center) over the next 20 m, so
+            # the car naturally settles from wherever the arc left it.
+            if not to_seg.oneway and to_seg.width > 0:
+                self._lane_offset_factor = (
+                    self.active_turn.lane_offset_m / (to_seg.width / 4.0)
+                )
+            
+            # Remember the lane-offset factor the car is actually at
+            # after the hand-off (see above) - the recovery blend on the
+            # new segment eases FROM this value toward 1.0, instead of
+            # assuming it always starts from 0 or from a stale fraction
+            # of a different road's width.
             self._recovery_start_factor = self._lane_offset_factor
             # Also remember WHERE (segment + progress) this hand-off
             # happened - the tangent-fillet arc can end well past the
@@ -357,7 +429,50 @@ class Car:
             blend = max(0.0, min(1.0, distance_to_tangent_m / SWERVE_DISTANCE_M))
             # blend=1.0 (far from tangent point) -> stay at full lane;
             # blend=0.0 (exactly at tangent point) -> reach target_factor
-            self._lane_offset_factor = target_factor + (1.0 - target_factor) * blend
+            planned_factor = target_factor + (1.0 - target_factor) * blend
+            # If this plan's junction is the FIRST one after a hand-off
+            # (recorded in _handle_segment_end / _advance_active_turn),
+            # the car may not actually be at full lane offset (1.0) yet:
+            # after a no-arc hand-off it is on the centerline (factor ~0,
+            # the no-plan recovery blend still easing it back), and after
+            # a tight-arc hand-off it is at whatever reduced factor that
+            # arc used. The "stay at full lane" assumption above would
+            # then snap the factor from its true hand-off value to the
+            # planned one in a single frame - a sideways jump of up to
+            # half a meter.
+            #
+            # So ease from the ACTUAL hand-off factor toward the planned
+            # blend's value, completing the ease EXACTLY at the tangent
+            # point: the arc that starts there is built from the tangent
+            # point at the PLAN'S lane offset, so the car must be at
+            # exactly target_factor when the arc begins - otherwise the
+            # first arc frame teleports the car sideways to the arc's
+            # start. The ease distance is the hand-off-to-tangent
+            # distance capped at 20 m (a hand-off far from the tangent
+            # point eases over a comfortable 20 m and then holds the
+            # planned blend; a close hand-off eases over the shorter
+            # distance it actually has). Both easings are anchored to
+            # the same point (the tangent) and are smooth in it, so the
+            # composed factor is continuous all the way to the arc.
+            recovery_start_seg = getattr(self, '_recovery_start_seg_idx', None)
+            if recovery_start_seg == self.seg_idx:
+                recovery_start_progress = getattr(self, '_recovery_start_progress', 0.0)
+                # Distance from the hand-off to the tangent point (fixed
+                # for this plan) - the ease must span exactly this.
+                tangent_progress = 1.0 - (turn_plan.from_tangent_offset_m / seg.length) if seg.length > 0 else 1.0
+                handoff_to_tangent_m = max(0.1, seg.length * abs(tangent_progress - recovery_start_progress))
+                ease_distance_m = min(20.0, handoff_to_tangent_m)
+                distance_since_handoff_m = seg.length * abs(self.progress - recovery_start_progress)
+                recovery_progress = max(0.0, min(1.0, distance_since_handoff_m / ease_distance_m))
+            else:
+                # No hand-off on this segment (or already moved on) - the
+                # car is long since at full lane offset.
+                recovery_progress = 1.0
+            recovery_start = getattr(self, '_recovery_start_factor', 1.0)
+            if recovery_progress < 1.0 and abs(recovery_start - 1.0) > 1e-6:
+                self._lane_offset_factor = recovery_start + (planned_factor - recovery_start) * recovery_progress
+            else:
+                self._lane_offset_factor = planned_factor
             
             if distance_to_tangent_m <= distance_m:
                 # This frame crosses the tangent point. Split the movement
@@ -394,19 +509,37 @@ class Car:
                     self._advance_active_turn(leftover_distance_m, network)
                 return
         else:
-            # No turn planned here (straight continuation, dead end, or no
-            # radius fits even at the mechanical minimum). Blend the lane
-            # offset back toward 1.0 (full right-lane) as we get further
-            # into the segment, EASING FROM WHATEVER FACTOR THE LAST
-            # COMPLETED TURN ACTUALLY USED (see _recovery_start_factor,
-            # set in _advance_active_turn on completion) - not from an
-            # assumed 0. A turn that needed the FULL lane offset (no
-            # swerve at all) correctly stays at 1.0 the whole time instead
-            # of being yanked down to a fresh, wrong, distance-based value.
-            # (The old formula also blended down near the far end of the
-            # segment "just in case" another turn was coming - redundant
-            # now, since the "if turn_plan" branch above already handles
-            # that with a precise, tangent-point-anchored blend.)
+            # No turn planned here. This covers three distinct situations:
+            #   (a) GENUINE dead end (no next segment at all) - the car
+            #       brakes to a full stop before the node (below).
+            #   (b) Unreachable signaled turn: a valid next segment exists
+            #       (e.g. the left turn the blinker points at) but NO arc
+            #       radius fits, even at the mechanical minimum - the
+            #       blinker was set too late to make it. The car does NOT
+            #       force-enter that segment: it slides past the junction
+            #       on the straight continuation (or crashes into the
+            #       obstacle at a dead-end T), blinker still on, looking
+            #       for the next reachable decision point (see
+            #       _handle_segment_end / docs/TURN_REWORK_PLAN.md).
+            #   (c) Near-straight continuation (<10 deg, where
+            #       plan_turn deliberately declines to build an arc) or a
+            #       plain hand-off - a routine segment swap.
+            #
+            # Lane offset: first EASE back toward 1.0 (full right-lane)
+            # from whatever factor the last completed turn actually used
+            # (see _recovery_start_factor, set in _advance_active_turn on
+            # completion) - not from an assumed 0. A turn that needed the
+            # FULL lane offset (no swerve at all) correctly stays at 1.0
+            # the whole time instead of being yanked down to a fresh,
+            # wrong, distance-based value. THEN, for every junction the
+            # car is about to cross WITHOUT an executed arc ((a) and (b)
+            # and (c) alike), blend the factor down to 0 (centerline) over
+            # the last ~20 m before the node: on the centerline both
+            # segments share the exact node point, so the segment-end
+            # hand-off has NO lateral jump, ever - regardless of how much
+            # the two segments' lane-offset directions differ (this is
+            # what used to teleport the car 2.4 m sideways when an
+            # unreachable 90 deg turn was force-entered at the node).
             SWERVE_DISTANCE_M = 20.0
             # Measured from the hand-off point (segment + progress
             # recorded in _advance_active_turn when the last turn
@@ -425,13 +558,20 @@ class Car:
                 distance_since_handoff_m = SWERVE_DISTANCE_M
             recovery_progress = max(0.0, min(1.0, distance_since_handoff_m / SWERVE_DISTANCE_M))
             recovery_start = getattr(self, '_recovery_start_factor', 1.0)
-            self._lane_offset_factor = recovery_start + (1.0 - recovery_start) * recovery_progress
+            recovery_factor = recovery_start + (1.0 - recovery_start) * recovery_progress
+            # Approach blend to the centerline: 1.0 far from the junction,
+            # 0.0 exactly at it. Taking the MIN with the recovery factor
+            # keeps the recovery easing intact while it is still below the
+            # approach value (junction close after a hand-off) and always
+            # lands exactly on 0.0 at the node.
+            approach_to_centerline = max(0.0, min(1.0, remaining_to_junction_m / SWERVE_DISTANCE_M))
+            self._lane_offset_factor = min(recovery_factor, approach_to_centerline)
             
             # Only brake to a full stop here for a GENUINE dead end (no
             # next segment at all) - NOT merely "no smooth arc fit this
             # junction" (a valid next segment can still exist then; the
-            # segment-end instant-transition fallback handles that case
-            # in _handle_segment_end). Conflating the two used to brake
+            # slide-past/crash logic in _handle_segment_end handles that
+            # case). Conflating the two used to brake
             # the car to a stop and leave it permanently stuck just short
             # of perfectly ordinary junctions whenever no arc validated -
             # a real regression once introduced. A genuine dead end
@@ -498,11 +638,16 @@ class Car:
                 self.x += nx * lane_offset
                 self.y += ny * lane_offset
         
-        # Heading (smooth from segment direction, will be overridden during turn)
-        if self.forward:
-            self.heading = math.degrees(math.atan2(dx, dy))
-        else:
-            self.heading = math.degrees(math.atan2(-dx, -dy))
+        # Heading (smooth from segment direction, will be overridden during turn).
+        # While a segment-end heading transition is active, the transition
+        # owns the heading (it eases toward exactly this segment's
+        # direction), so don't overwrite it here - that would snap the
+        # heading back to the target in one frame and defeat the easing.
+        if not self._heading_transition:
+            if self.forward:
+                self.heading = math.degrees(math.atan2(dx, dy))
+            else:
+                self.heading = math.degrees(math.atan2(-dx, -dy))
     
     def _get_or_create_planned_turn(self, network, junction_node: str):
         """Get the cached, ONE-TIME turn plan for the upcoming junction,
@@ -543,11 +688,15 @@ class Car:
             # segment-end instant-transition fallback would have handled
             # it fine).
             self._pending_junction_is_dead_end = True
+            self._pending_no_arc_next_seg = None
             self.planned_turn = None
             self.planned_turn_key = None
             return None
         
         self._pending_junction_is_dead_end = False
+        # A plan (re)computed for this junction supersedes any stale
+        # "no arc" state from an earlier evaluation of the same junction.
+        self._pending_no_arc_next_seg = None
         
         key = (self.seg_idx, next_seg_idx, junction_node)
         if self.planned_turn_key == key and self.planned_turn is not None:
@@ -637,12 +786,31 @@ class Car:
         self.planned_turn = plan
         self.planned_turn_key = key
         
+        if plan is not None:
+            # Record the car's ACTUAL state at plan-creation time as the
+            # recovery start for the plan branch's lane-offset easing
+            # (see _update_position_rails): the plan must ease from
+            # wherever the car actually is right now, not from an
+            # assumed full lane offset. (When the plan is created right
+            # at a hand-off this matches the record _handle_segment_end
+            # just wrote; when it is created mid-segment - e.g. the
+            # driver set the blinker 15 m before the junction - it is
+            # the only recovery record that exists.)
+            self._recovery_start_factor = self._lane_offset_factor
+            self._recovery_start_seg_idx = self.seg_idx
+            self._recovery_start_progress = self.progress
+        
         if plan is None:
+            # The signaled segment exists but is physically unreachable
+            # from here - remember it so _handle_segment_end can slide
+            # past (or crash at a dead end) instead of force-entering it.
+            self._pending_no_arc_next_seg = next_seg_idx
             if not getattr(self, '_warned_no_arc_for_node', None) == junction_node:
                 self._warned_no_arc_for_node = junction_node
                 print(f"⚠️ Cannot plan turn {self.seg_idx} → {next_seg_idx}: "
                       f"no radius fits within road length, even at the mechanical minimum "
-                      f"and using the opposing lane")
+                      f"and using the opposing lane - will slide past the junction "
+                      f"(blinker stays on for the next reachable decision point)")
         
         return plan
     
@@ -656,12 +824,79 @@ class Car:
         
         next_seg = network.choose_next_segment(self.seg_idx, node_id, turn)
         
+        # --- Slide past an UNREACHABLE turn (docs/TURN_REWORK_PLAN.md) ---
+        # If the driver signaled a turn into a segment for which no arc
+        # could be planned (the blinker was set too late - no radius fits
+        # even at the mechanical minimum), the car must NOT force-enter
+        # that segment: a real car that set its blinker 3 m before a 90°
+        # corner simply cannot make that corner. It slides past the
+        # junction on the straight continuation (smallest-angle exit),
+        # blinker still on, to attempt the turn at the next reachable
+        # decision point. Only if the road does not continue at all
+        # (dead-end T) does the car physically crash into the obstacle -
+        # a real, physical event (rapid deceleration to 0), never a
+        # teleport or an instant stop from speed.
+        if (self._pending_no_arc_next_seg is not None
+                and next_seg == self._pending_no_arc_next_seg):
+            continuation = network.choose_next_segment(self.seg_idx, node_id, "straight")
+            if continuation is not None and continuation != self.seg_idx:
+                print(f"🛞 Slide past unreachable turn {self.seg_idx} → "
+                      f"{self._pending_no_arc_next_seg}: continuing on {continuation} "
+                      f"(blinker stays on for the next reachable decision point)")
+                next_seg = continuation
+            else:
+                print(f"💥 Dead-end T: no continuation for unreachable turn "
+                      f"{self.seg_idx} → {self._pending_no_arc_next_seg} - "
+                      f"crashing into the obstacle")
+                self._crash_into_obstacle()
+                return
+        
         if next_seg is not None and next_seg != self.seg_idx:
             old_seg = self.seg_idx
+            old_seg_len = network.segments[old_seg].length
             self.seg_idx = next_seg
             new_seg = network.segments[next_seg]
             self.forward = (new_seg.start_node == node_id)
-            self.progress = 0.0 if self.forward else 1.0
+            # Carry the OVERSHOOT across the node instead of discarding
+            # it: this frame's movement already extended past the node
+            # (progress > 1.0), so the car physically IS partway along
+            # the new segment. Resetting progress to exactly 0.0/1.0
+            # would lose up to a full frame of travel distance - which
+            # shrinks the position step while the heading still changes
+            # by the full segment angle, and on a short step that can
+            # imply a turning radius below any real car's minimum
+            # (the rotation watchdog is rightly sensitive to exactly
+            # this). Scaling by the length ratio keeps the carried
+            # distance in meters, not in progress fraction.
+            overshoot_frac = max(0.0, self.progress - 1.0) if self.forward \
+                else max(0.0, -self.progress)
+            if old_seg_len > 0 and new_seg.length > 0:
+                overshoot_m = overshoot_frac * old_seg_len
+                carried_frac = min(0.25, overshoot_m / new_seg.length)
+            else:
+                carried_frac = 0.0
+            self.progress = (carried_frac if self.forward else 1.0 - carried_frac)
+            
+            # Smooth the heading across the swap instead of snapping it
+            # to the new segment's direction in one frame (matters for
+            # sharp continuations; see _begin_heading_transition_for_segment).
+            self._begin_heading_transition_for_segment(new_seg)
+            
+            # Record the hand-off for the lane-offset recovery blend: the
+            # no-plan branch eases the factor back toward 1.0 (full
+            # right-lane) over the next ~20 m starting from WHATEVER
+            # FACTOR THE CAR HAD AT THE NODE - which for a no-arc
+            # hand-off is ~0 (the approach blend lands the car on the
+            # centerline exactly at the node, where both segments share
+            # the exact same point). Without this record the recovery
+            # blend would assume it starts from 1.0, and on a short
+            # segment the "approach to the NEXT junction" blend would
+            # immediately re-pull the factor down from 1.0 - a one-frame
+            # factor jump (0 -> ~0.25) that moves the car sideways by
+            # up to half a meter, tripping the teleportation watchdog.
+            self._recovery_start_factor = self._lane_offset_factor
+            self._recovery_start_seg_idx = next_seg
+            self._recovery_start_progress = self.progress
             
             # Notify driver that we turned
             if self.driver and hasattr(self.driver, 'clear_blinker_if_turned'):
@@ -696,23 +931,94 @@ class Car:
                 self.driver.blinker_right = False
                 self.driver.pending_turn = None
     
-    def _update_heading_transition(self, dt: float):
-        """Smooth heading interpolation."""
-        self._heading_transition_progress += dt / self._heading_transition_duration
+    def _crash_into_obstacle(self):
+        """Physical crash into the obstacle at a dead-end T-junction.
         
-        if self._heading_transition_progress >= 1.0:
-            self._heading_transition = False
-            self.heading = self._heading_target
+        A car that cannot make a signaled turn and whose road does not
+        continue (dead-end T) does not stop magically: it hits the
+        obstacle (wall / end of road) and decelerates rapidly to 0 over a
+        short distance - a real physical event. No teleport, no instant
+        stop from speed, no position jump (docs/TURN_REWORK_PLAN.md).
+        
+        The obstacle is treated as being one car length ahead of the
+        node (the road's own end/shoulder), so the car keeps its
+        segment-following position while its speed is drained by
+        CRASH_DECEL over CRASH_DISTANCE - at any approach speed that is
+        a full stop within a couple of meters, i.e. the car noses into
+        the obstacle and comes to rest against it, exactly where the
+        road ends.
+        """
+        CRASH_DECEL = 30.0      # m/s² - impact deceleration (harder than
+                                # braking: the obstacle does the work)
+        CRASH_DISTANCE_M = 3.0  # ~one car length of crumple distance
+        # Frames of deceleration needed to reach 0 from the current speed.
+        self._crash_frames_left = max(0, int(math.ceil(self.speed / CRASH_DECEL /
+                                                      (1.0 / 60.0))))
+        self._crash_decel = CRASH_DECEL
+        # Cap: even at absurd speeds the crash takes at most this long.
+        self._crash_frames_left = min(self._crash_frames_left, 60)
+        self.target_speed = 0.0
+        self._braking = True
+
+    def _begin_heading_transition_for_segment(self, new_seg):
+        """Start a smooth heading transition toward the new segment's
+        direction after a segment-end hand-off that had no executed arc
+        (i.e. the heading would otherwise snap in a single frame).
+        
+        The transition is a RATE-LIMITED rotation, not a fixed-time
+        interpolation: every frame the nose rotates toward the target at
+        min(planned rate, v / _heading_transition_radius_m). The
+        speed-dependent cap is what keeps the motion physical no matter
+        how the speed changes mid-transition - rotating at omega while
+        moving at v sweeps a circle of radius v/omega, and the cap keeps
+        that at or above 4.0 m (comfortably above the PhysicsValidator's
+        3.0 m minimum). A car that brakes while the transition is still
+        running therefore rotates more slowly (a real car does exactly
+        this), and a stationary car does not rotate at all. Small
+        differences (gentle continuations) are applied directly.
+        """
+        dx = new_seg.x2 - new_seg.x1
+        dy = new_seg.y2 - new_seg.y1
+        if self.forward:
+            target_heading = math.degrees(math.atan2(dx, dy))
         else:
-            t = self._heading_transition_progress
-            t = t * t * (3 - 2 * t)  # smoothstep
-            
-            diff = self._heading_target - self._heading_start
-            while diff > 180:
-                diff -= 360
-            while diff < -180:
-                diff += 360
-            self.heading = (self._heading_start + t * diff) % 360
+            target_heading = math.degrees(math.atan2(-dx, -dy))
+        diff = (target_heading - self.heading + 180) % 360 - 180
+        if abs(diff) < 0.5:
+            # Negligible - apply directly, no transition needed.
+            return
+        # Planned duration: at least 0.3 s, at most 120 deg/s average.
+        duration = max(0.3, abs(diff) / 120.0)
+        self._heading_transition = True
+        self._heading_transition_elapsed = 0.0
+        self._heading_transition_duration = duration
+        self._heading_transition_remaining = diff
+        self._heading_target = target_heading
+
+    def _update_heading_transition(self, dt: float):
+        """Advance the rate-limited heading transition (see
+        _begin_heading_transition_for_segment)."""
+        if not self._heading_transition:
+            return
+        # Physical cap on the rotation rate: keep the implied radius
+        # (v / omega) at or above _heading_transition_radius_m at ALL
+        # times, including while the car is braking through the
+        # transition.
+        max_rate = (self.speed / self._heading_transition_radius_m) * (180.0 / math.pi)
+        # Planned rate: finish the remaining rotation within the
+        # remaining scheduled time (grows if the cap delayed us).
+        time_left = max(1e-6, self._heading_transition_duration - self._heading_transition_elapsed)
+        planned_rate = abs(self._heading_transition_remaining) / time_left
+        rate = min(planned_rate, max_rate)
+        step = rate * dt
+        if step >= abs(self._heading_transition_remaining) - 1e-9:
+            self.heading = self._heading_target % 360
+            self._heading_transition_remaining = 0.0
+            self._heading_transition = False
+        else:
+            self.heading = (self.heading + math.copysign(step, self._heading_transition_remaining)) % 360
+            self._heading_transition_remaining -= math.copysign(step, self._heading_transition_remaining)
+            self._heading_transition_elapsed += dt
     
     # --- Utility ---
     
@@ -772,13 +1078,19 @@ class Car:
         self.active_turn = None
         self.planned_turn = None
         self.planned_turn_key = None
+        self._pending_no_arc_next_seg = None
         self._lane_offset_factor = 1.0
         self._recovery_start_factor = 1.0
         self._recovery_start_seg_idx = None
         self._recovery_start_progress = 0.0
+        self._crash_frames_left = 0
+        self._crash_decel = 0.0
+        self._heading_transition = False
         # Apply the normal right-lane offset immediately - see the
         # matching comment in teleport_to_named_point().
         self._apply_plain_segment_position(seg)
+        if self.bicycle_nav is not None:
+            self.bicycle_nav.reset()
         
         # Clear trail
         self.trail.clear()
@@ -800,31 +1112,37 @@ class Car:
         self.active_turn = None
         self.planned_turn = None
         self.planned_turn_key = None
+        self._pending_no_arc_next_seg = None
         self._lane_offset_factor = 1.0
         self._recovery_start_factor = 1.0
         self._recovery_start_seg_idx = None
         self._recovery_start_progress = 0.0
+        self._crash_frames_left = 0
+        self._crash_decel = 0.0
+        self._heading_transition = False
         # Apply the normal right-lane offset immediately (matching what
         # continuous driving would show) instead of leaving the car at
         # the raw centerline node coordinates - otherwise the very next
         # physics frame "snaps" it sideways into its lane, which the
         # (correctly strict) teleportation watchdog flags as a real jump.
         self._apply_plain_segment_position(network.segments[seg_idx])
+        if self.bicycle_nav is not None:
+            self.bicycle_nav.reset()
         self.trail.clear()
 
     def is_on_road(self, network) -> bool:
-        """Check if car is currently on any road.
+        """Check if the car (all four corners, not just its center) is on
+        any road.
 
-        Delegates entirely to RoadNetwork.is_on_road(), which tests
-        against the exact same paved-area polygon that gets rendered
-        (rounded bends and junction fillets included). This used to be a
-        separate, independently-approximated rectangle+circle check here
-        that could disagree with what was actually drawn (e.g. flagging
-        a car as off-road while it was visibly still on the smooth
-        rendered curve through a bend) - now there's a single source of
-        truth for "where the road actually is".
+        Delegates to RoadNetwork.is_car_on_road(), which tests the car's
+        four bounding-box corners against the exact same paved-area polygon
+        that gets rendered (rounded bends and junction fillets included).
+        A center-point-only check (the old behaviour, "bicycle-style") let
+        the car's body/wheels overhang the road edge without being detected
+        - e.g. at a roundabout the center could stay on the road while the
+        outer wheels rode the curb. Checking the corners catches that.
         """
-        return network.is_on_road(self.x, self.y)
+        return network.is_car_on_road(self.x, self.y, self.heading)
     
     # --- Rendering ---
     
@@ -853,7 +1171,7 @@ class Car:
         surface.blit(rotated, rect)
         
         # Draw dynamic lights on top (blinkers)
-        if self.driver and self.driver.get_name() == "RAILS":
+        if self.driver and self.driver.get_name() in ("RAILS", "BICYCLE"):
             self._draw_blinkers(surface, sx, sy, scale)
     
     def _get_base_sprite(self) -> pygame.Surface:
