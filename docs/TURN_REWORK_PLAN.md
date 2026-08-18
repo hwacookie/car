@@ -328,8 +328,12 @@ polygon). Standalone script (planned: `scripts/proto_bicycle.py`), reusing
 - [x] **Roundabout ring densified**: 8 nodes → 64 nodes (chord curvature
       was 0 on straight chords, so the speed profile didn't slow for the
       ring).
-- [x] **Look-ahead curvature** in the speed profile (max |κ| over a 60 m
-      window, not just local chord curvature).
+- [x] **Speed-profile curvature cap** — LOCAL curvature only (the earlier
+      60 m max-|κ| look-ahead was REMOVED: it hard-capped speed ~60 m before
+      a sharp fillet on straight road, producing an infeasible braking ramp
+      and 60 m of crawling. The forward-reachability braking pass already
+      extends the corner speed backward with a feasible ramp, so no look-ahead
+      is needed; verified on 90° corners AND the chord-built roundabout ring).
 - [x] **Lateral-accel cap** lowered: `A_LAT_MAX = 2.0 m/s²` (from 3.5).
 - [x] **Dead-end stop**: terminal speed=0 when the route ends at a
       degree-≤1 node (prevents driving off the end of short segments).
@@ -359,37 +363,38 @@ polygon). Standalone script (planned: `scripts/proto_bicycle.py`), reusing
 - [x] **Headless performance**: ~61× faster than real-time (6000 frames
       in 1.6 s), so ~1 hour of driving simulates in ~59 s.
 
+### Done — bicycle model, second round (committed `2066311`, 2026-08-16)
+
+- [x] **Fix `sliver_approach` stall**: standstill deadlock at v=0 (the
+      accel-scale gate cut throttle while steering hard from a stop).
+      Fixed with a limited creep floor (`CREEP_SPEED = 1.0`,
+      `CREEP_SCALE = 0.3`): the car may roll forward while steering hard
+      from a stop, as a real driver does. All three sliver tests pass.
+- [x] **Fix the 12 timed-out tests**: root cause was the speed profile's
+      60 m curvature look-ahead (see "Speed-profile curvature cap" above).
+      Replaced with a local cap. Also corrected 4 expected end segments in
+      `tests/test_turning.py` that had been recorded while the bug was still
+      present (they pointed at the initial segment). **All 18 deterministic
+      tests now pass** (0 off-road, 0 snaps, 0 timeouts, 0 wrong segment).
+- [x] **`sliver_from_east` spawn anomaly** (`delta@4m ≈ -81.9°`): no longer
+      reproducible — all three turns give sane routing + small steering
+      demands (+12°…+24°, just the merge onto the right-offset lane).
+
 ### Open — bicycle model (blocking)
 
-- [ ] **Fix `sliver_approach`**: the car is stuck at s=0 (speed 0.0,
-      `accel_scale` = 0.0 because the steering angle is large at the
-      start). The reference line curves to the west at the sliver
-      junction, so the pure-pursuit target is to the left of the car's
-      heading, and the accel-scale gate (throttle off while steering)
-      prevents the car from ever moving. Need to either (a) reduce the
-      steering angle at the start (e.g. a smaller base lookahead, or a
-      gentler corner radius at the sliver junction), or (b) allow some
-      acceleration even while steering (lower the accel-scale gate's
-      threshold).
-- [ ] **Fix the 12 timed-out tests** in the visible-window REST-API test
-      (`tests/test_turning.py`). Most time out because the car never
-      reaches the expected end segment within the 15 s monitor window
-      (related to the `sliver_approach` stall, and possibly to the car
-      starting at the same segment as the expected end segment).
 - [ ] **Test the bicycle model on the OSM map** (so far only tested on
       the synthetic `basic` map). The OSM map has real-world geometry
       (tight corners, sliver segments, one-way rings) that the synthetic
-      map only approximates.
+      map only approximates. (Becomes straightforward once §10 smoothed
+      geometry lands, since the OSM map is where chord curvature bites.)
 
 ### Open — decision
 
 - [x] **Adopt or retire**: DECIDED (2026-08-16) — adopt the bicycle model
       for everything; the rail model is retired. See §0 and §8.
-- [ ] **Commit** the bicycle-model work (currently uncommitted in the
-      working tree: `src/bicycle_nav.py` new, `src/car.py`,
-      `src/config.py`, `src/driver.py`, `src/main.py`,
-      `src/road_network.py`, `src/test_maps.py`, `tests/test_turning.py`
-      modified, `scripts/` untracked).
+- [x] **Commit** the bicycle-model work — DONE: commit `2066311` on branch
+      `turn-planning-rework` (16 files, +3275/-258). Only the unrelated
+      cosmetic `.vscode/settings.json` theme tweak was left uncommitted.
 
 ### Obsolete — rail model, Phase 1 (retired with the rail model, 2026-08-16)
 

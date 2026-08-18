@@ -135,10 +135,11 @@ work proceeds.
   - seg 7: `tjunc_center -> tjunc_e`, (3500,200)→(3840,200), len=170m
 
 ### In Progress
-- [ ] **Investigate the unexpected `sliver_from_east` spawn steering demand**:
-  - `delta@4m ≈ -81.9°` despite a `19.79 m` approach
-  - Check whether duplicate route nodes, lane offset, projection, or the `forward=False` spawn flag are causing the issue
-  - NOTE: `sliver_from_east` is NOT in the deterministic 18-test suite (only `sliver_approach` straight/right/left are), so this does not block the suite.
+- [x] **Investigate the unexpected `sliver_from_east` spawn steering demand** — RESOLVED:
+  - Re-ran the route + reference-line construction for all three turns (straight/left/right) in the current code.
+  - All produce SANE routing and small steering demands: straight→sliv_w (delta@4m +23.6°), left→sliv_str (+12.3°), right→sliv_ap (+23.6°). The +~24° is just the car merging from the centerline onto the 1.75 m right-offset lane — expected.
+  - The old `-81.9°` is NOT reproducible; it was cleared by the route-building / speed-profile work. No further action needed.
+  - NOTE: `sliver_from_east` is NOT in the deterministic 18-test suite (only `sliver_approach` straight/right/left are), so this never blocked the suite.
 - [ ] **Decide whether to add a navigation-specific corner-radius feasibility fix** for the sliver case:
   - The sliver right-turn reference line requests a fillet radius of ~2.06 m < the 3.46 m mechanical minimum.
   - The car handles it by cutting the corner at its 3.46 m limit while creeping; the test passes because the off-road check is against the paved polygon (with width tolerance).
@@ -146,8 +147,7 @@ work proceeds.
   - Fixing it properly would mean making the sliver fillet >= 3.46 m in navigation without changing the shared rendering fillet. Deferred — tests pass, motion is physical.
 
 ### Blocked
-- (nothing currently blocks the deterministic suite — all 18 tests pass)
-- Bicycle model implementation is uncommitted, so the working tree is in a partially complete state.
+- (nothing — all 18 tests pass, and the bicycle-model work is committed as `2066311`)
 
 ## Key Decisions
 - **Bicycle model is THE physics**: Rail model retired.
@@ -170,13 +170,9 @@ work proceeds.
 - **The creep fix is NOT the cause of the full-suite turn timeouts**: Sliver tests pass; turn failures show car going straight (speed profile issue), not stalling.
 
 ## Next Steps
-1. **Commit the bicycle-model work** (the working tree has the verified fix uncommitted):
-   - `src/bicycle_nav.py`: creep floor + local-curvature speed profile
-   - `tests/test_turning.py`: 4 corrected expected end segments
-   - `scripts/debug_sliver.py`, `scripts/debug_turn.py`: new debug tools
-2. **Investigate `sliver_from_east` anomaly** (does not block the suite):
-   - Why does spawn produce `delta@4m ≈ -81.9°` despite a long approach?
-3. **Decide whether to add a navigation-specific corner-radius feasibility fix** for the sliver case (see In Progress).
+1. [x] **Commit the bicycle-model work** — DONE: commit `2066311` on branch `turn-planning-rework` (16 files, +3275/-258). The only remaining uncommitted change is the unrelated cosmetic `.vscode/settings.json` theme tweak (intentionally left out).
+2. [x] **Investigate `sliver_from_east` anomaly** — RESOLVED (see In Progress; no longer reproducible).
+3. **Decide whether to add a navigation-specific corner-radius feasibility fix** for the sliver case (see In Progress). Deferred — tests pass, motion is physical.
 4. **Continue with the plan's next phase** (all 18 tests now pass):
    - Smoothed geometry in §10
    - Miss Daisy offline reference-line authoring in §9
@@ -267,3 +263,35 @@ Findings made after the snapshot above was taken:
   starts catching the fillet creates an infeasible instantaneous deceleration,
   so the windowed cap must blend smoothly (or rely on the braking pass).
   Needs testing on BOTH `corner_right_entry` and `roundabout_from_north`.
+
+## Runtime observation #1: black pixels under the car — DIAGNOSED & FIXED (2026-07-13)
+
+**Symptom:** User reported pure-black (0,0,0) pixels on the road surface just
+below-right of the car's rear, moving with the car.
+
+**Diagnosis:**
+- The game code draws NO black anywhere (searched all of src/).
+- Headless render of the exact live state showed no black (dummy driver
+  composites the fringe differently than the live display).
+- Root cause: the car sprite `assets/car_64x128.png` contained **136 pure-black
+  (0,0,0) anti-aliasing pixels** at the body edges (bbox x:7-57, y:32-121),
+  concentrated at the bottom-right rear corner. When pygame scales (64x128 ->
+  ~22x54) and rotates the sprite, these black edge pixels leak through as a
+  black fringe ("premultiplied-alpha black fringe" — a known pygame scaling
+  artifact). On the user's display this renders as visible pure black on the
+  road at the car's rear edge.
+
+**Fix:** Surgical sprite cleanup — for every sprite pixel with alpha>0 and
+r,g,b all < 15 (the black anti-aliasing fringe), replaced RGB with the car's
+red (205,41,41), keeping alpha. 141 pixels fixed. The legitimate dark
+windshield (70,81,86), wheels, and side shading are UNTOUCHED (they're > 15).
+Result: 0 near-black fringe pixels remain; red body (4041 px), dark windshield
+(966 px), white highlight (33 px) all intact.
+
+**Verify:** Restart the game (`python -m src.main --map basic --api --bicycle`)
+and look at the car's rear edge — the black fringe should be gone. The car edge
+now anti-aliases to red instead of black.
+
+**Note:** This is a sprite-asset fix, not a code change. If the black reappears
+or other dark fringes show, the broader fix would be to regenerate the sprite
+with proper red (not black) edge anti-aliasing.

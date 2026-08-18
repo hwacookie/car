@@ -39,54 +39,206 @@ PPPM = config.PIXELS_PER_METER
 
 
 # ======================================================================
-# Reference line (route centerline, arc-length parameterized)
+# Smoothed geometry (centripetal Catmull-Rom, arc-length parameterized)
 # ======================================================================
+# See docs/TURN_REWORK_PLAN.md §10: "the graph is sacred; the curve is a
+# function of the graph." A road centerline is a centripetal Catmull-Rom
+# spline through its original nodes (interpolating, C1, no kinks). Position
+# / heading / curvature are evaluated on demand as a function of arc length
+# s, via a dense arc-length lookup table (an evaluation CACHE of the math -
+# it defines nothing new and touches no graph node).
 
-class RefLine:
-    """An arc-length-parameterized polyline (the route's centerline)."""
+def _cr_point(p0, p1, p2, p3, t0, t1, t2, t3, t):
+    """One point on the centripetal Catmull-Rom piece between p1 and p2
+    (given neighbors p0, p3 and knot values t0<t1<t2<t3, t in [t1, t2]).
+    Barry-Goldman formulation; alpha=0.5 (centripetal) knot spacing is set
+    by the caller, which is what prevents overshoot on irregular node
+    spacing. Returns (x, y)."""
+    a1x = (t1 - t) / (t1 - t0) * p0[0] + (t - t0) / (t1 - t0) * p1[0]
+    a1y = (t1 - t) / (t1 - t0) * p0[1] + (t - t0) / (t1 - t0) * p1[1]
+    a2x = (t2 - t) / (t2 - t1) * p1[0] + (t - t1) / (t2 - t1) * p2[0]
+    a2y = (t2 - t) / (t2 - t1) * p1[1] + (t - t1) / (t2 - t1) * p2[1]
+    a3x = (t3 - t) / (t3 - t2) * p2[0] + (t - t2) / (t3 - t2) * p3[0]
+    a3y = (t3 - t) / (t3 - t2) * p2[1] + (t - t2) / (t3 - t2) * p3[1]
+    b1x = (t2 - t) / (t2 - t0) * a1x + (t - t0) / (t2 - t0) * a2x
+    b1y = (t2 - t) / (t2 - t0) * a1y + (t - t0) / (t2 - t0) * a2y
+    b2x = (t3 - t) / (t3 - t1) * a2x + (t - t1) / (t3 - t1) * a3x
+    b2y = (t3 - t) / (t3 - t1) * a2y + (t - t1) / (t3 - t1) * a3y
+    cx = (t2 - t) / (t2 - t1) * b1x + (t - t1) / (t2 - t1) * b2x
+    cy = (t2 - t) / (t2 - t1) * b1y + (t - t1) / (t2 - t1) * b2y
+    return cx, cy
 
-    def __init__(self, pts: list[tuple[float, float]]):
-        self.pts = pts
-        self.seglen: list[float] = []
-        self.cum: list[float] = [0.0]
-        for i in range(len(pts) - 1):
-            d = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) / PPPM
-            self.seglen.append(d)
-            self.cum.append(self.cum[-1] + d)
-        self.total = self.cum[-1] if self.cum else 0.0
+
+class SmoothCurve:
+    """A centripetal Catmull-Rom spline through a list of 2D control points
+    (world PIXELS), arc-length parameterized in METRES.
+
+    Interpolating (the curve passes exactly through every control point -
+    faithful to the OSM data) and C1-continuous (no kinks). `point_at`,
+    `heading_at` and `curvature_at` are smooth functions of arc length s,
+    evaluated against a dense arc-length lookup table built once in the
+    constructor (a render/eval cache, not new geometry).
+
+    heading: degrees, 0 = north (+y), positive = clockwise (east), matching
+    the rest of the codebase (forward = (sin h, cos h)).
+    curvature: 1/m, signed, positive = right turn (heading increasing).
+    """
+
+    def __init__(self, pts: list[tuple[float, float]], pppm: float = PPPM,
+                 sample_m: float = 0.5):
+        self.pppm = pppm
+        self.pts = [(float(x), float(y)) for (x, y) in pts]
+        n = len(self.pts)
+        if n < 2:
+            self.total = 0.0
+            self._s = [0.0]
+            self._x = [self.pts[0][0]] if n else [0.0]
+            self._y = [self.pts[0][1]] if n else [0.0]
+            self._hdg = [0.0]
+            self._kap = [0.0]
+            return
+
+        # Centripetal knot values: alpha = 0.5.
+        self._t = [0.0]
+        for i in range(1, n):
+            d = math.hypot(self.pts[i][0] - self.pts[i - 1][0],
+                           self.pts[i][1] - self.pts[i - 1][1])
+            self._t.append(self._t[-1] + max(d, 1e-6) ** 0.5)
+
+        # Dense arc-length table. Sample each piece with a count proportional
+        # to its chord length (tight/long pieces get more samples) so the
+        # table is uniform in arc length to within ~sample_m.
+        s_tab: list[float] = []
+        x_tab: list[float] = []
+        y_tab: list[float] = []
+        hdg_tab: list[float] = []
+        kap_tab: list[float] = []
+        # Endpoint tangents: the curve leaves the first node toward the
+        # second node and arrives at the last node from the second-to-last
+        # (§10: "the spline ends at the junction node with a well-defined end
+        # tangent, direction last-but-one -> last node"). We enforce this by
+        # giving the duplicated endpoint knot a spacing that makes the
+        # centripetal tangent at the endpoint equal to the adjacent-segment
+        # direction (a standard clamped Catmull-Rom endpoint).
+        cum = 0.0
+        prev = None  # (x, y, hdg_rad) of the last emitted sample
+        for i in range(n - 1):
+            p1 = self.pts[i]
+            p2 = self.pts[i + 1]
+            t1 = self._t[i]
+            t2 = self._t[i + 1]
+            if i >= 1:
+                p0 = self.pts[i - 1]; t0 = self._t[i - 1]
+            else:
+                # start: virtual p0 placed behind p1 along the p1->p2 direction
+                p0 = p1; t0 = t1 - (t2 - t1)
+            if i + 2 < n:
+                p3 = self.pts[i + 2]; t3 = self._t[i + 2]
+            else:
+                # end: virtual p3 placed ahead of p2 along the p1->p2 direction
+                p3 = p2; t3 = t2 + (t2 - t1)
+            chord = math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / pppm
+            steps = max(8, int(chord / sample_m) + 1)
+            for k in range(steps + 1):
+                t = t1 + (t2 - t1) * k / steps
+                x, y = _cr_point(p0, p1, p2, p3, t0, t1, t2, t3, t)
+                if prev is not None:
+                    ds = math.hypot(x - prev[0], y - prev[1]) / pppm
+                    cum += ds
+                    hdg = math.atan2(x - prev[0], y - prev[1])
+                else:
+                    hdg = math.atan2(p2[0] - p1[0], p2[1] - p1[1])
+                first = (i == 0 and k == 0)
+                last = (i == n - 2 and k == steps)
+                if first:
+                    s_tab.append(0.0); x_tab.append(x); y_tab.append(y)
+                    hdg_tab.append(hdg); kap_tab.append(0.0)
+                    prev = (x, y, hdg)
+                    continue
+                if last:
+                    s_tab.append(cum); x_tab.append(x); y_tab.append(y)
+                    hdg_tab.append(hdg); kap_tab.append(0.0)
+                    break
+                dhdg = (hdg - prev[2] + math.pi) % (2 * math.pi) - math.pi
+                kap = dhdg / ds if ds > 1e-6 else 0.0
+                s_tab.append(cum); x_tab.append(x); y_tab.append(y)
+                hdg_tab.append(hdg); kap_tab.append(kap)
+                prev = (x, y, hdg)
+
+        self._s = s_tab
+        self._x = x_tab
+        self._y = y_tab
+        self._hdg = hdg_tab
+        self._kap = kap_tab
+        self.total = s_tab[-1] if s_tab else 0.0
+
+    def _index(self, s: float):
+        """Binary search: largest i with self._s[i] <= s (clamped)."""
+        lo, hi = 0, len(self._s) - 1
+        if s <= self._s[0]:
+            return 0
+        if s >= self._s[hi]:
+            return hi - 1 if hi > 0 else 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._s[mid] <= s:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
     def point_at(self, s: float) -> tuple[float, float]:
+        if self.total <= 0:
+            return self._x[0], self._y[0]
         s = max(0.0, min(self.total, s))
-        for i in range(len(self.seglen)):
-            if s <= self.cum[i + 1]:
-                t = (s - self.cum[i]) / self.seglen[i] if self.seglen[i] > 0 else 0.0
-                x = self.pts[i][0] + t * (self.pts[i + 1][0] - self.pts[i][0])
-                y = self.pts[i][1] + t * (self.pts[i + 1][1] - self.pts[i][1])
-                return x, y
-        return self.pts[-1]
+        i = self._index(s)
+        s0, s1 = self._s[i], self._s[i + 1]
+        f = (s - s0) / (s1 - s0) if s1 > s0 else 0.0
+        return (self._x[i] + f * (self._x[i + 1] - self._x[i]),
+                self._y[i] + f * (self._y[i + 1] - self._y[i]))
 
     def heading_at(self, s: float) -> float:
-        s = max(0.0, min(self.total - 1e-6, s))
-        for i in range(len(self.seglen)):
-            if s <= self.cum[i + 1]:
-                dx = self.pts[i + 1][0] - self.pts[i][0]
-                dy = self.pts[i + 1][1] - self.pts[i][1]
-                return math.degrees(math.atan2(dx, dy))
-        dx = self.pts[-1][0] - self.pts[-2][0]
-        dy = self.pts[-1][1] - self.pts[-2][1]
-        return math.degrees(math.atan2(dx, dy))
+        if self.total <= 0:
+            return math.degrees(self._hdg[0])
+        s = max(0.0, min(self.total, s))
+        i = self._index(s)
+        s0, s1 = self._s[i], self._s[i + 1]
+        f = (s - s0) / (s1 - s0) if s1 > s0 else 0.0
+        h0, h1 = self._hdg[i], self._hdg[i + 1]
+        dh = (h1 - h0 + math.pi) % (2 * math.pi) - math.pi
+        return math.degrees(h0 + f * dh)
 
     def curvature_at(self, s: float) -> float:
         """Signed curvature (1/m) at arc length s (positive = right turn)."""
-        h = max(1.0, self.total * 0.01)
-        s1 = max(0.0, s - h)
-        s2 = min(self.total, s + h)
-        if s2 - s1 < 1e-3:
+        if self.total <= 0:
             return 0.0
-        h1 = math.radians(self.heading_at(s1))
-        h2 = math.radians(self.heading_at(s2))
-        dh = (h2 - h1 + math.pi) % (2 * math.pi) - math.pi
-        return dh / (s2 - s1)
+        s = max(0.0, min(self.total, s))
+        i = self._index(s)
+        s0, s1 = self._s[i], self._s[i + 1]
+        f = (s - s0) / (s1 - s0) if s1 > s0 else 0.0
+        return self._kap[i] + f * (self._kap[i + 1] - self._kap[i])
+
+
+class RefLine:
+    """Arc-length-parameterized route centerline. Now a SmoothCurve
+    (centripetal Catmull-Rom spline through the lane-offset points) instead
+    of a raw chord polyline, so position/heading/curvature are smooth and
+    kink-free (§10). The public interface (total, point_at, heading_at,
+    curvature_at) is unchanged, so all callers work as before."""
+
+    def __init__(self, pts: list[tuple[float, float]]):
+        self._curve = SmoothCurve(pts, PPPM)
+        self.total = self._curve.total
+        self.pts = pts  # keep for backward compat / debugging
+
+    def point_at(self, s: float) -> tuple[float, float]:
+        return self._curve.point_at(s)
+
+    def heading_at(self, s: float) -> float:
+        return self._curve.heading_at(s)
+
+    def curvature_at(self, s: float) -> float:
+        return self._curve.curvature_at(s)
 
 
 def _offset_polyline_right(pts: list[tuple[float, float]], offset_m: float) -> list[tuple[float, float]]:
