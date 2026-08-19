@@ -430,6 +430,29 @@ polygon). Standalone script (planned: `scripts/proto_bicycle.py`), reusing
       control.
 - [ ] Crash handling as a physical event (rapid deceleration against the
       obstacle, no teleport, no instant stop from speed).
+- [ ] **Road signs** — speed-limit + sharp-corner warning signs rendered
+      beside the road (assets in `assets/signs/`: tempo 30/50/80/100/120 +
+      unlimited already exist; a red-triangle "sharp corner" warning SVG
+      still needs to be created in the same style). Draw procedurally with
+      pygame (circle + PIL text) like the rest of the renderer; offset to
+      the right road edge via the existing lane-offset math.
+      - **Legal limit** per road type from German law: innerorts default
+        **50** (residential/tertiary/secondary/primary/unclassified),
+        **30** (service, living_street), **100** (extra-urban
+        trunk/primary), **unlimited** (motorway). OSM `maxspeed` overrides
+        per road once added to the OSM-Wars query.
+      - **Physical override**: `L_phys = sqrt(a_lat_max / kappa_max)` per
+        section, using vehicle-capability `a_lat_max` (~8 m/s²), not the
+        driver-style value. Needs §10 smoothed geometry for meaningful
+        `kappa_max` (the synthetic test map's uniform 6 m fillets give one
+        value everywhere). If `L_phys < L_legal`, show the **largest
+        available tempo sign ≤ `L_phys`** (snap DOWN — a sign never promises
+        a speed the geometry can't sustain); if `L_phys < 30`, show the
+        sharp-corner warning triangle instead. No sign when physics doesn't
+        bind (`L_phys >= L_legal`).
+      - Leaf feature on §10's curvature — does **not** require the full §9
+        MDP (the sign only needs the local max-curvature limit, not the
+        forward/backward speed-profile solver).
 
 ---
 
