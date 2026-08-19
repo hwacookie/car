@@ -188,6 +188,8 @@ class Car:
         using validation.
         """
         x, y, heading, seg_idx, forward = network.get_start_point(name)
+        self.x = x
+        self.y = y
         self.heading = heading
         self.seg_idx = seg_idx
         self.progress = 0.0 if forward else 1.0
