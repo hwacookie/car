@@ -295,3 +295,40 @@ now anti-aliases to red instead of black.
 **Note:** This is a sprite-asset fix, not a code change. If the black reappears
 or other dark fringes show, the broader fix would be to regenerate the sprite
 with proper red (not black) edge anti-aliasing.
+
+---
+
+## Session addendum (2026-08-19): rails-removal regression — found & fixed
+
+The full status now lives in `docs/TURN_REWORK_PLAN.md` §0 ("Where we stand /
+What we did / What's still missing"). Summary of this session:
+
+- **Context:** commit `74b9c4e` ("Remove RAILS mode") turned all 18
+deterministic tests red (2 off-road, 14 timeout, 2 wrong-end-segment), even
+though the rails model was genuinely unused (the bicycle model was active).
+- **Root cause #1 (the real one):** the rails cleanup deleted
+  `_apply_plain_segment_position()` from `teleport_to_named_point()` without a
+  replacement, so named-point teleports updated heading/segment/progress/speed
+  but **never set `self.x`/`self.y`** — the car stayed put and drove off-road
+  from wherever it happened to be. Fixed in `9cfcf10` (2-line addition).
+- **Root cause #2 (a red herring):** the same commit had **bundled in the §10
+  smoothed-geometry pipeline** (`SmoothCurve` / centripetal Catmull-Rom) by
+  replacing `RefLine`'s chord polyline with a spline. The spline was NOT the
+  cause of the failures — reverting it alone turned the failures into 18
+  off-road (the teleport bug was still there). Reverted in `33cb300` so §10
+  stays a standalone task.
+- **Also enabled by `74b9c4e`:** the off-road check is now run for ALL modes
+  (it was RAILS-mode-only at `2066311`), which is why the off-road behavior is
+  now visible. The check is correct; the car genuinely needed the teleport fix.
+- **Result:** 18/18 deterministic tests pass (0 off-road, 0 snaps, 0 timeouts,
+  0 wrong segment).
+- **Other this session:** solid-green background (dropped `make_grass_background`),
+  tests pinned to `127.0.0.1` (macOS ControlCenter squats on `localhost:5000` /
+  `::1`), road-signs feature designed + added to §7, and
+  `scripts/visualize_junction_fillets.py` (circular vs Bézier junction
+  connections; found a single cubic Bézier overshoots peak curvature vs the
+  circular arc for turn angles >~100° → chain two for large angles).
+- **Next task:** §10 smoothed geometry, re-introduced deliberately (see §0 / §8.2).
+  Known gotcha: `SmoothCurve`'s `kap` table is corrupted at every piece
+  junction (duplicate sample → κ spikes up to ~16 1/m); use geometry-based
+  curvature (central differences of `point_at`) for any curvature measurement.

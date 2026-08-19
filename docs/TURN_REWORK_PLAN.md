@@ -9,62 +9,85 @@
 > **New here? Read §13 (Onboarding) first, then §8.** Hard rule:
 > `AGENTS.md` — never do physically impossible things.
 
-## 0. Status (updated 2026-08-16)
+## 0. Status (updated 2026-08-19)
 
-**Decision (2026-08-16): the bicycle model becomes THE physics; the rail
-model is retired.** End goal: a traffic simulation of one district
-(Kleinmachnow) with several hundred (~500) concurrent vehicles running
-start→end trips — to find bottlenecks and jams and to evaluate structural
-changes (e.g. road closures) — PLUS fun driving: a player-assisted mode
-(gas/brake/turn signal, the car holds the line) and a free mode (direct
-steering, wrong-way driving allowed). One bicycle model serves all three
-operating modes; the rail model fits none of them (a "train on the graph"
-cannot represent real gaps/jams, cannot be driven free, and its seam
-teleports don't scale). New plan: §8–§13. §3 (rail Phases 1–3), §5 and the
+**Where we stand.** The bicycle model is THE physics and is committed
+(`2066311`). The retired rail model has been **removed** from the codebase
+(`74b9c4e` "Remove RAILS mode") — `_update_position_rails` and all rails
+machinery are gone; the car is a pure free particle driven by the bicycle
+model in every mode. All **18 deterministic turn tests pass** (0 off-road,
+0 snaps, 0 timeouts, 0 wrong segment) on the synthetic `basic` map.
+
+**What we did (2026-08-19).** While reviewing the rails-removal commit we
+found it had **silently bundled in the §10 smoothed-geometry pipeline**
+(`SmoothCurve` / centripetal Catmull-Rom) by replacing `RefLine`'s chord
+polyline with a spline — and that the removal had **broken named-point
+teleport**: `teleport_to_named_point()` lost its position-setting (the rails
+cleanup deleted `_apply_plain_segment_position()` without a replacement), so
+the car never actually moved to a named start point and drove off-road on
+every deterministic test. Isolated both, then:
+- **`9cfcf10`** — fix the teleport: set `self.x`/`self.y` from the named
+  start point. (This was the real cause of the test failures.)
+- **`33cb300`** — revert the §10 spline; restore `RefLine` to the plain
+  arc-length polyline so the rails-removal commit stays clean and §10 remains
+  a standalone task. (The spline was *not* the cause of the failures — it
+  had been masking some of them as timeouts.)
+
+Also this session: solid-green background (replaced the patterned grass
+texture), tests pinned to `127.0.0.1` (macOS ControlCenter squats on
+`localhost:5000` / `::1`), road-signs feature designed and added to §7, and
+`scripts/visualize_junction_fillets.py` (compares circular vs Bézier junction
+connections for feasibility).
+
+**What's still missing** (next, per §8.2 work order):
+- **§10 smoothed geometry** — the next standalone task. Re-introduce the
+  centripetal Catmull-Rom pipeline *deliberately* (it was just reverted),
+  shared by renderer / driving / on-road check, with a feasibility check on
+  actual max curvature. Note: `SmoothCurve`'s `kap` table is corrupted at
+  every piece junction (duplicate sample → κ spikes); use geometry-based
+  curvature (central differences of `point_at`) for any curvature
+  measurement. Large turn angles (>~100°) need a *chained* Bézier/arc, not a
+  single one (a single cubic overshoots peak curvature vs the circular arc).
+- **§9 Miss Daisy** offline reference-line authoring (per maneuver) on the
+  OSM map.
+- **§11** rendering / paint-bucket trails; **§12** ~500-car traffic sim.
+- Test the bicycle model on the **real OSM map** (so far only the synthetic
+  `basic` map is exercised by the suite).
+
+**End goal (unchanged):** a traffic simulation of one district
+(Kleinmachnow) with ~500 concurrent vehicles running start→end trips — to
+find bottlenecks and jams and evaluate structural changes — PLUS fun driving:
+a player-assisted mode (gas/brake/turn signal, the car holds the line) and a
+free mode (direct steering, wrong-way allowed). One bicycle model serves all
+three operating modes. Full plan: §8–§13. §3 (rail Phases 1–3), §5 and the
 rail items in §7 are **obsolete** (kept for the record).
 
-**Phase 1 (items 1–3) is implemented** in the working tree (NOT committed):
-no-plan centerline blend, slide-past + dead-end crash, rate-limited heading
-transition, overshoot carry-over, hand-off lane-offset records.
-`scripts/repro_crash.py` confirms: the original 815→1008 crash is **fixed**
-(car slides past, blinker stays on).
-
-**New crash found & root-caused (818→746, 0.9 m teleport at arc-end
-hand-off):** `_lane_offset_factor` is a fraction of the *current segment's*
-width/4, so its absolute meaning changes when segment width changes. The
-arc is built with an absolute `lane_offset_m` (1.75 m = the 7 m FROM road's
-lane); the 3.5 m exit road's quarter width is 0.875 m, so the same factor
-renders 0.87 m instead of 1.75 m → lateral teleport. (Masked before because
-the car died at 815 first.)
-
-Done / open for this bug:
-- [x] `_advance_active_turn`: derive the factor from the arc's absolute
-      `lane_offset_m / (to_seg.width/4)` at the hand-off (factor may be up
-      to 2.0 = road edge; recovery blend eases it back to 1.0). Verified:
-      factor = 2.0 at hand-off.
-- [ ] no-plan branch: `approach_to_centerline` is capped at 1.0 → snaps
-      2.0→1.0 on the next frame. Anchor the ramp to the hand-off state
-      whenever the standard "last 20 m" ramp does NOT pass through it
-      (hand-off factor F, hand-off-to-junction distance R): use the standard
-      ramp only if `F <= 1.0 and R >= 20*F`, else
-      `approach = F * remaining_to_junction / R` (passes through (hand-off,
-      F) and (junction, 0); `min(recovery, approach)` of two curves sharing
-      the hand-off point is continuous there by construction).
-- [ ] plan branch: drop the `abs(recovery_start - 1.0) > 1e-6` guard so the
-      ease ALWAYS starts from the actual hand-off factor (it currently skips
-      the ease exactly when `planned_factor(hand-off) != 1.0` — same bug
-      class).
-- [ ] then full §4 verification (repro, test suite, long runs).
-
-Working tree: `src/car.py` modified, `scripts/repro_crash.py` +
-`scripts/debug_handoff.py` untracked. Nothing committed. **The repro still
-crashes** (frame 261) until the two open fixes above are in.
-
-**Direction change (brainstorm 2026-08-16, see §6):** the rail model is
-identified as the root cause of this whole bug class. Agreed next step is a
-one-car bicycle-model prototype — Phases 2–3 below may be superseded.
-
 ---
+
+<details><summary>Historical status (2026-08-16, pre-commit — kept for the record)</summary>
+
+**Decision (2026-08-16): the bicycle model becomes THE physics; the rail
+model is retired.** (Superseded by the 2026-08-19 status above: the rail
+model has since been *removed*, not just retired.)
+
+**Phase 1 (items 1–3) was implemented** in the working tree (later committed
+as `2066311`): no-plan centerline blend, slide-past + dead-end crash,
+rate-limited heading transition, overshoot carry-over, hand-off lane-offset
+records.
+
+**Crash found & root-caused (818→746, 0.9 m teleport at arc-end hand-off):**
+`_lane_offset_factor` is a fraction of the *current segment's* width/4, so
+its absolute meaning changes when segment width changes. The arc is built
+with an absolute `lane_offset_m` (1.75 m = the 7 m FROM road's lane); the
+3.5 m exit road's quarter width is 0.875 m, so the same factor renders 0.87 m
+instead of 1.75 m → lateral teleport. (This rail-model code path no longer
+exists — removed with the rail model.)
+
+**Direction change (brainstorm 2026-08-16, see §6):** the rail model was
+identified as the root cause of this whole bug class; a one-car
+bicycle-model prototype was built and adopted.
+
+</details>
 
 ## 1. The problem (verified against the OSM data)
 
@@ -380,6 +403,37 @@ polygon). Standalone script (planned: `scripts/proto_bicycle.py`), reusing
       reproducible — all three turns give sane routing + small steering
       demands (+12°…+24°, just the merge onto the right-offset lane).
 
+### Done — rails removal + regression fix (2026-08-19)
+
+- [x] **Remove the retired rail model** (`74b9c4e`): `_update_position_rails`
+      and all rails machinery deleted from `src/car.py`; the car is a pure
+      free particle driven by the bicycle model in every mode. `AIDriver`
+      renamed `BicycleDriver`; dead-end handling added.
+- [x] **Fix named-point teleport not moving the car** (`9cfcf10`): the rails
+      cleanup deleted `_apply_plain_segment_position()` without a replacement,
+      so `teleport_to_named_point()` updated heading/segment/progress/speed
+      but never set `self.x`/`self.y` — the car stayed put and drove off-road
+      on every deterministic test. Set the position directly from the named
+      start point.
+- [x] **Revert the §10 spline that rode along in `74b9c4e`** (`33cb300`):
+      the commit had replaced `RefLine`'s chord polyline with a
+      `SmoothCurve` (centripetal Catmull-Rom) — §10 work smuggled into the
+      rails removal. Restored the plain arc-length polyline so §10 stays a
+      standalone task. (The spline was not the cause of the test failures; it
+      had been masking some of them as timeouts.)
+- [x] **All 18 deterministic tests green** after the above (0 off-road, 0
+      snaps, 0 timeouts, 0 wrong segment).
+- [x] **Solid-green background**: dropped `make_grass_background()` + the
+      per-frame blit; the screen is now filled with `BG_COLOR`.
+- [x] **Tests pinned to `127.0.0.1`**: `localhost` may resolve to `::1`, where
+      macOS ControlCenter squats on port 5000; explicit IPv4 reaches Flask.
+- [x] **Road-signs feature designed** (see "Open — later"): legal limit per
+      road type + physical override from §10 curvature + snap-down rule.
+- [x] **`scripts/visualize_junction_fillets.py`**: renders current (circular
+      fillet) vs proposed (Bézier) junction connections for the 5 test-map
+      junction types, with paved + curvature strips, to compare peak-curvature
+      feasibility.
+
 ### Open — bicycle model (blocking)
 
 - [ ] **Test the bicycle model on the OSM map** (so far only tested on
@@ -516,16 +570,22 @@ the same physics with the reference line switched off.
 
 ### 8.2 Work order (replaces §5)
 
-1. Fix `sliver_approach` stall + the 12 timed-out tests (bicycle model
-   must be trustworthy before it authors anything).
-2. Smoothed geometry pipeline (§10): centripetal Catmull-Rom through the
-   original OSM nodes, κ(s), shared by renderer / driving / on-road check.
+1. ~~Fix `sliver_approach` stall + the 12 timed-out tests~~ — **DONE**
+   (`2066311`); re-verified green after the 2026-08-19 rails-removal
+   regression fix (`9cfcf10` + `33cb300`).
+2. **Smoothed geometry pipeline (§10)** — NEXT. Centripetal Catmull-Rom
+   through the original OSM nodes, κ(s), shared by renderer / driving /
+   on-road check. *Note:* a first `SmoothCurve` was accidentally bundled into
+   the rails-removal commit (`74b9c4e`) and reverted (`33cb300`) — re-introduce
+   it deliberately, with a feasibility check on actual max curvature and the
+   `kap`-table junction bug avoided (use geometry-based curvature).
 3. Miss Daisy authoring on the OSM map (§9): every directed way + every
    junction turn → precomputed lines + speed profiles; verify on-road.
 4. Player modes: assisted (B) and free (C) on the same physics.
 5. Paint-bucket trail overlay (§11) — global + per-vehicle toggle.
 6. Traffic simulation (§12): exit points, trips, steady state, metrics.
-7. Commit (see §7 "Open — decision").
+7. ~~Commit (see §7 "Open — decision")~~ — **DONE** (`2066311`, then
+   `74b9c4e` + the 2026-08-19 fixes).
 
 ---
 
@@ -867,16 +927,17 @@ section for the specific task you are doing.
 
 The game is a top-down 2D car game (pygame + Flask REST API) on OSM road
 data (default: Kleinmachnow). The old "rails" driving model (car = train
-on the OSM graph, position = segment+offset) is **retired** (§8) — its
-code still exists in `src/car.py` (`_update_position_rails`) but must not
-be extended. A kinematic **bicycle model** is implemented and integrated
-(`src/bicycle_nav.py`, `BicycleDriver` in `src/driver.py`, `--bicycle`
-flag in `src/main.py`) but is **uncommitted** and has two known bugs
-(§7 "Open — bicycle model"). The agreed direction: smooth the geometry
-(§10), precompute drivable reference lines offline with a cautious
-virtual driver ("Miss Daisy", §9), then run a ~500-car traffic
-simulation of one district (§12) with two extra player modes (assisted,
-free — §8) and a paint-bucket trail overlay (§11.4).
+on the OSM graph, position = segment+offset) is **removed** (§8) — it no
+longer exists in the code. A kinematic **bicycle model** is THE physics,
+implemented and integrated (`src/bicycle_nav.py`, `BicycleDriver` in
+`src/driver.py`, `--bicycle` flag in `src/main.py`) and **committed**
+(`2066311`); the car is a pure free particle in every mode. All 18
+deterministic turn tests pass on the synthetic `basic` map. The agreed
+direction: smooth the geometry (§10 — the next task), precompute drivable
+reference lines offline with a cautious virtual driver ("Miss Daisy", §9),
+then run a ~500-car traffic simulation of one district (§12) with two extra
+player modes (assisted, free — §8) and a paint-bucket trail overlay (§11.4).
+See §0 for the current status and what's still missing.
 
 ### 13.2 Hard rule (from AGENTS.md — read it)
 
@@ -912,7 +973,7 @@ layout, named start points like `sliver_approach`): `src/test_maps.py`.
 |---|---|
 | bicycle model / reference line / pure pursuit | `src/bicycle_nav.py` (`BicycleNav`, `_offset_polyline_right`) |
 | bicycle driver (AI) | `src/driver.py` (`BicycleDriver`) |
-| retired rails model (do not extend) | `src/car.py` (`_update_position_rails`) |
+| (rails model removed — no longer in the codebase) | — |
 | road network, paved polygon, on-road check | `src/road_network.py` (`is_car_on_road`) |
 | config (car accel/top speed, corner radius, lane offset) | `src/config.py` |
 | entry point, `--map` / `--bicycle` / `--api` flags | `src/main.py` |
@@ -923,17 +984,20 @@ layout, named start points like `sliver_approach`): `src/test_maps.py`.
 
 ### 13.5 Git state — read before touching anything
 
-The working tree has **uncommitted bicycle-model work** (this is the
-future; do not discard, revert, or "clean" it):
+Branch `turn-planning-rework`, working tree clean. Relevant history (old →
+new):
 
-- modified: `src/car.py`, `src/config.py`, `src/driver.py`, `src/main.py`,
-  `src/road_network.py`, `src/test_maps.py`, `tests/test_turning.py`,
-  `docs/TURN_REWORK_PLAN.md`
-- new (untracked): `src/bicycle_nav.py`, `scripts/`
+- `2066311` — bicycle-model turn rework (the bicycle model, committed).
+- `74b9c4e` — "Remove RAILS mode": deleted the retired rail model **and
+  (accidentally) bundled in the §10 `SmoothCurve` spline** + broke
+  named-point teleport (see §0 / §7).
+- `9cfcf10` — fix named-point teleport not moving the car.
+- `33cb300` — revert the §10 spline; `RefLine` back to the plain polyline.
+- `0aa206e` / `07d99eb` / `88a6508` / `a00f683` — solid-green background,
+  `127.0.0.1` test URL, road-signs TODO, junction-fillet viz script.
 
-Commit it per §7 ("Open — decision", item "Commit") — ideally after the
-first work-order item below is done, so the commit contains a working
-bicycle model.
+The next task (§10 smoothed geometry) will re-introduce `SmoothCurve`
+deliberately as its own commit.
 
 ### 13.6 First task, concretely (work-order item 1, §8.2)
 
