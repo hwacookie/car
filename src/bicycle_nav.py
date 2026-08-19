@@ -219,25 +219,51 @@ class SmoothCurve:
 
 
 class RefLine:
-    """Arc-length-parameterized route centerline. Now a SmoothCurve
-    (centripetal Catmull-Rom spline through the lane-offset points) instead
-    of a raw chord polyline, so position/heading/curvature are smooth and
-    kink-free (§10). The public interface (total, point_at, heading_at,
-    curvature_at) is unchanged, so all callers work as before."""
+    """An arc-length-parameterized polyline (the route's centerline).
+    [TEMP-EXPERIMENT: reverted to 2066311 polyline to isolate the §10 spline]"""
 
     def __init__(self, pts: list[tuple[float, float]]):
-        self._curve = SmoothCurve(pts, PPPM)
-        self.total = self._curve.total
-        self.pts = pts  # keep for backward compat / debugging
+        self.pts = pts
+        self.seglen: list[float] = []
+        self.cum: list[float] = [0.0]
+        for i in range(len(pts) - 1):
+            d = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) / PPPM
+            self.seglen.append(d)
+            self.cum.append(self.cum[-1] + d)
+        self.total = self.cum[-1] if self.cum else 0.0
 
     def point_at(self, s: float) -> tuple[float, float]:
-        return self._curve.point_at(s)
+        s = max(0.0, min(self.total, s))
+        for i in range(len(self.seglen)):
+            if s <= self.cum[i + 1]:
+                t = (s - self.cum[i]) / self.seglen[i] if self.seglen[i] > 0 else 0.0
+                x = self.pts[i][0] + t * (self.pts[i + 1][0] - self.pts[i][0])
+                y = self.pts[i][1] + t * (self.pts[i + 1][1] - self.pts[i][1])
+                return x, y
+        return self.pts[-1]
 
     def heading_at(self, s: float) -> float:
-        return self._curve.heading_at(s)
+        s = max(0.0, min(self.total - 1e-6, s))
+        for i in range(len(self.seglen)):
+            if s <= self.cum[i + 1]:
+                dx = self.pts[i + 1][0] - self.pts[i][0]
+                dy = self.pts[i + 1][1] - self.pts[i][1]
+                return math.degrees(math.atan2(dx, dy))
+        dx = self.pts[-1][0] - self.pts[-2][0]
+        dy = self.pts[-1][1] - self.pts[-2][1]
+        return math.degrees(math.atan2(dx, dy))
 
     def curvature_at(self, s: float) -> float:
-        return self._curve.curvature_at(s)
+        """Signed curvature (1/m) at arc length s (positive = right turn)."""
+        h = max(1.0, self.total * 0.01)
+        s1 = max(0.0, s - h)
+        s2 = min(self.total, s + h)
+        if s2 - s1 < 1e-3:
+            return 0.0
+        h1 = math.radians(self.heading_at(s1))
+        h2 = math.radians(self.heading_at(s2))
+        dh = (h2 - h1 + math.pi) % (2 * math.pi) - math.pi
+        return dh / (s2 - s1)
 
 
 def _offset_polyline_right(pts: list[tuple[float, float]], offset_m: float) -> list[tuple[float, float]]:
