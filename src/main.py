@@ -12,7 +12,7 @@ from .road_network import RoadNetwork
 from .camera import Camera
 from .renderer import Renderer, make_grass_background
 from .car import Car
-from .driver import Driver, KeyboardDriver, AIDriver, BicycleDriver
+from .driver import Driver, KeyboardDriver, BicycleDriver
 from .physics_validator import PhysicsValidator
 from .rest_api import GameAPI
 from .test_maps import build_test_map, TEST_MAPS
@@ -89,27 +89,14 @@ def main(smoke_test_frames: int = 0):
 
     # --- Car with AI driver on random road ---
     rx, ry, rh, seg_idx, node_id = network.random_road_point()
-    # --bicycle selects the kinematic bicycle model (src/bicycle_nav.py)
-    # instead of the rail model; the REST-API test framework is identical.
-    use_bicycle = "--bicycle" in sys.argv
-    driver = BicycleDriver() if use_bicycle else AIDriver()
+    driver = BicycleDriver()
     car = Car(rx, ry, rh, seg_idx, driver)
-    if use_bicycle:
-        print("Navigation model: BICYCLE (kinematic, free particle)")
-    else:
-        print("Navigation model: RAILS (rail-following)")
+    print("Navigation model: BICYCLE (kinematic, free particle)")
     car.progress = 0.5
-    # Apply the normal right-lane offset immediately (matching what
-    # continuous driving would show), instead of leaving the car exactly
-    # on the raw centerline - otherwise the very first physics frame
-    # "snaps" it sideways into its lane, which the (correctly strict)
-    # teleportation watchdog flags as a real jump. Same fix as
-    # Car.teleport_random()/teleport_to_named_point().
     _spawn_seg = network.segments[seg_idx]
     _spawn_dx, _spawn_dy = _spawn_seg.x2 - _spawn_seg.x1, _spawn_seg.y2 - _spawn_seg.y1
     _spawn_seg_heading = math.degrees(math.atan2(_spawn_dx, _spawn_dy))
     car.forward = abs((rh - _spawn_seg_heading + 180) % 360 - 180) < 90
-    car._apply_plain_segment_position(_spawn_seg)
     
     # --- Physics validator (can be toggled with V key) ---
     validator = PhysicsValidator(enabled=True)
@@ -180,10 +167,10 @@ def main(smoke_test_frames: int = 0):
         if keys[pygame.K_TAB] and not hasattr(main, '_last_tab'):
             main._last_tab = False
         if keys[pygame.K_TAB] and not main._last_tab:
-            if isinstance(car.driver, AIDriver):
+            if isinstance(car.driver, BicycleDriver):
                 car.driver = KeyboardDriver()
             else:
-                car.driver = AIDriver()
+                car.driver = BicycleDriver()
                 car.snap_to_road(network)
                 car.target_speed = car.speed
             print(f"Driving mode: {car.driver.get_name()}")
@@ -270,11 +257,7 @@ def main(smoke_test_frames: int = 0):
                         validator.disable()
                 if 'mode' in toggle_params:
                     mode = toggle_params['mode']
-                    if mode == 'rails' and not isinstance(car.driver, AIDriver):
-                        car.driver = AIDriver()
-                        car.snap_to_road(network)
-                        print("API: Switched to RAILS mode")
-                    elif mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
+                    if mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
                         car.driver = BicycleDriver()
                         car.bicycle_nav = None
                         print("API: Switched to BICYCLE mode")
@@ -306,19 +289,9 @@ def main(smoke_test_frames: int = 0):
             if api_control['blinker_right']:
                 control_input['blinker_right'] = True
             
-            # The AIDriver's actual turn CHOICE (which segment to take at
-            # a junction) comes from its own `pending_turn` attribute -
-            # which get_control() above only ever sets from real keyboard
-            # key-edge-detection (K_LEFT/K_a, K_RIGHT/K_d). Merging the
-            # API's blinker flags into control_input alone only affected
-            # cosmetic blinker-light rendering elsewhere; it never told
-            # the driver which way to actually turn, so API-controlled
-            # turns silently fell back to whatever `pending_turn` already
-            # was (usually None -> "straight", or whatever the keyboard
-            # last set) regardless of which blinker the API requested.
-            # Explicitly sync pending_turn/blinker state from the API's
-            # request here so a remote-controlled turn actually steers
-            # the requested direction at the next junction.
+            # BicycleDriver's turn choice comes from `pending_turn`.
+            # Sync blinker state from API so remote-controlled turns
+            # actually steer the requested direction.
             if hasattr(car.driver, 'pending_turn'):
                 if api_control['blinker_left']:
                     car.driver.pending_turn = 'left'
@@ -330,9 +303,6 @@ def main(smoke_test_frames: int = 0):
                     car.driver.blinker_left = False
                 elif not (keys[pygame.K_LEFT] or keys[pygame.K_a] or
                           keys[pygame.K_RIGHT] or keys[pygame.K_d]):
-                    # Neither the API nor the keyboard is requesting a
-                    # turn right now - make sure a previous API-driven
-                    # blinker doesn't stay stuck on.
                     car.driver.pending_turn = None
                     car.driver.blinker_left = False
                     car.driver.blinker_right = False

@@ -357,7 +357,7 @@ class Renderer:
 
         # Mode indicator (top)
         driver_name = car.driver.get_name() if car.driver else "NONE"
-        mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
+        mode_color = (0, 200, 100) if driver_name == "BICYCLE" else (100, 150, 255)
 
         surface.blit(self._hud_text("mode", driver_name, 20, mode_color), (panel_x + 10, panel_y + 5))
         surface.blit(self._hud_text("tab", "(TAB)", 12, (100, 100, 100)), (panel_x + 120, panel_y + 8))
@@ -393,7 +393,7 @@ class Renderer:
 
         # Indicators: Brake (red), Accel (green), Blinkers (orange)
         # Driver may expose braking/accelerating flags directly (Car) or
-        # blinker state indirectly (via car.driver for AIDriver).
+        # blinker state indirectly (via car.driver for BicycleDriver).
         indicator_y = panel_y + 15
         driver = getattr(car, 'driver', None)
         blinker_left = getattr(driver, 'blinker_left', False)

@@ -108,7 +108,9 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
   - Blinker only turns off when **actually turned** in that direction (not at every junction)
   - Automatic braking before sharp curves (physics-based braking distance)
   - "Rechts vor links" logic: only brakes at junctions with roads from the right
-  - Dead ends: car turns 180° and stops
+  - Dead ends / route end: car eases to the **right edge** of the road (as far
+    right as possible without leaving the paved area) and stops there (see
+    "Route-End / Dead-End Approach (Right Edge)")
   - Smooth segment transitions (no teleportation)
 
 ### Mode Switching
@@ -266,6 +268,51 @@ if cannot_brake_in_time():
 - Blinker stays on
 - Car continues on current road (follows "straight")
 - Will attempt turn at next junction if blinker still active
+
+### Route-End / Dead-End Approach (Right Edge)
+
+**Goal**: When the car reaches the **end of its route** — a genuine dead end
+where no road continues beyond the node — it must **not** drift toward the
+centerline (the old behavior). Instead it pulls over to the **right edge** of
+the road, as far right as possible, and stops there, like a real driver
+parking at the end of a street.
+
+**Why not the centerline here?** At an ordinary junction the lane offset is
+blended down to the centerline because both adjacent segments share the exact
+node point there, so the segment hand-off has no lateral jump. At a genuine
+dead end there is **no** hand-off to a continuing segment — the car simply
+stops — so there is no reason to be on the centerline. The natural, expected
+position is the right curb.
+
+**Target position (right edge, not off-road)**:
+- The car's lateral offset is driven toward the **rightmost drivable position**:
+  the right road edge minus half the car width, minus the shared safety slack
+  `config.ROAD_EDGE_TOLERANCE_M` (0.5 m), so all four tires stay fully on the
+  paved area.
+- "As far right as possible" is bounded by the actual road geometry (the
+  Shapely paved polygon), never by a fixed fraction of the road width — a
+  narrow service road and a wide primary both end at their own right edge.
+- The final position must pass the same on-road check as everywhere else
+  (`RoadNetwork.is_on_road` / the shared paved polygon). The car must **never
+  leave the road** to reach the edge.
+
+**How the approach is executed (physically plausible)**:
+- The move to the right edge is a **smooth, distance-based ease** over the
+  final stretch before the dead end (the same ~20 m approach window used for
+  the centerline blend), **not** a lateral snap or teleport. Lateral velocity
+  stays within what the car can actually achieve at its current speed.
+- The right-edge blend **replaces** the centerline approach blend only for a
+  **genuine dead end** (no continuing segment). At any junction that *does*
+  hand off to a next segment (executed arc, slide-past, or near-straight
+  continuation) the centerline blend is unchanged, because that hand-off
+  still needs the shared node point to avoid a lateral jump.
+- Braking to the stop is unchanged (physics-based braking distance + 5 m
+  safety margin); only the *lateral* target changes from centerline to right
+  edge.
+- After stopping at the right edge, the existing dead-end turnaround (180°
+  heading flip, small fixed nudge back onto the road, blinkers cleared) still
+  applies if the route is to be retraced — the nudge preserves the right-edge
+  side the car arrived on.
 
 ### Turning
 - **FREE mode**: Turn rate depends on speed (slower at high speed)
@@ -583,6 +630,10 @@ car/
 - **Pygame PNG support missing**: Worked around with PIL image loading
 
 ### 🔮 Future Enhancements
+- **Route-end / dead-end right-edge approach** (spec'd, not yet implemented): at a
+  genuine dead end the car eases to the rightmost drivable position (right edge
+  minus half car width minus `ROAD_EDGE_TOLERANCE_M`) and stops there instead of
+  blending to the centerline — see "Route-End / Dead-End Approach (Right Edge)"
 - Multiple AI cars (infrastructure ready - Driver class supports it)
 - Building footprints from OSM `building` polygons
 - Road surface textures (asphalt, cobblestone)
@@ -628,33 +679,88 @@ Tests:
 
 ### Comprehensive Turn Tests
 ```bash
-# Terminal 1: Start game with API
-python -m src.main --api
+# Terminal 1: Start game with API (synthetic test map)
+python -m src.main --map basic --api
 
 # Terminal 2: Run turn tests
 python tests/test_turning.py
 ```
 
-Tests 6 scenarios:
-1. RIGHT turn @ 30 km/h
-2. LEFT turn @ 30 km/h
-3. RIGHT turn @ 50 km/h
-4. LEFT turn @ 50 km/h
-5. RIGHT turn @ 80 km/h
-6. LEFT turn @ 80 km/h
-
-Each test:
-- Teleports to random location
+The default mode runs the **deterministic suite**: 18 named scenarios on the
+synthetic `basic` test map (90° corners, T-junction, Y-intersection, 4-way
+crossroads, one-way street, S-curve, hairpin, sweeping curve, roundabout,
+sliver junction). Each test:
+- Teleports to a KNOWN start point (exact position + heading)
 - Accelerates to target speed
-- Activates turn signal
-- Monitors every frame for:
-  * Off-road violations
-  * Instant heading snaps (>30°)
-  * Smooth circular arc progression
-- Captures screenshot on violation
-- Reports detailed metrics
+- Activates the turn signal (or none, for `straight`)
+- Monitors every ~50 ms for: off-road violations, instant heading snaps
+  (>30° per frame), teleports/unexpected jumps, and arrival at the exact
+  expected end segment (then drives to the segment's far end and stops)
+- Captures a screenshot on violation
 
-**Current Results**: 5/6 pass, 1/6 fail (instant snap detected)
+`--random` instead teleports to random locations on whatever map is loaded
+(works with real OSM data too); `--only <start_point> <direction> <speed>`
+runs a single scenario for fast debugging.
+
+#### Turn Test Output
+
+Each scenario prints, at the start:
+- **What is running** — a one-line human description, e.g.
+  `🧪 Test: Following a zig-zag S-curve road`
+- **Last run** — whether this exact scenario passed the previous time it ran
+  (`Yes - passed (...)`), or not, with the human-readable failure reason, e.g.
+  `No - cut the corner and drove off the road (2026-08-18T12:00:00)`.
+  First-ever runs show `never run before`.
+
+At the end, a colored verdict:
+- green `✅ PASSED`
+- red `❌ FAIL: <reason>` — e.g. `cut the corner and drove off the road`,
+  `took the wrong route (ended on segment 13, expected 14)`,
+  `game process ended mid-test (window closed or physics watchdog crash)`.
+
+Colors are ANSI and auto-disabled when stdout is not a TTY (e.g. when the
+output is redirected to a file).
+
+#### Results File (`tests/turning_results.json`)
+
+Every scenario result is saved to `tests/turning_results.json` (next to the
+test script) immediately after the scenario finishes, so a run that is
+interrupted mid-way never loses completed results. Structure:
+
+```json
+{
+  "updated": "2026-08-18T12:00:00",
+  "last": {
+    "s_curve|straight": {
+      "passed": false,
+      "reason": "took the wrong route (ended on segment 19, expected 20)",
+      "timestamp": "2026-08-18T12:00:00",
+      "final_segment": 19,
+      "expected_end_segment": 20
+    }
+  },
+  "history": [ { "scenario": "s_curve|straight", "passed": false, "...": "..." } ]
+}
+```
+
+- `last` is keyed by `"<start_point>|<direction>"` and is what the next run
+  reads for the "Last run" line.
+- `history` keeps the most recent 500 entries (capped).
+- Random-location runs have no stable scenario key and are not persisted.
+
+#### Interruption Handling (Ctrl-C / Window Closed)
+
+The test script detects user interruption and stops cleanly instead of
+falling through all remaining scenarios with connection errors:
+- **Ctrl-C** — a SIGINT handler sets a flag and prints a notice; the suite
+  finishes the in-flight scenario, saves results, and exits with code 130.
+- **Game window closed** — the game process dies, so the API stops answering;
+  the in-flight scenario records `game process ended mid-test`, and the suite
+  detects the dead API between scenarios and stops scheduling new tests.
+
+Either way, all completed scenario results are already saved to
+`tests/turning_results.json` (each scenario is persisted as soon as it
+finishes), and the exit code is 130 (conventional "terminated by signal").
 
 ### REST API Endpoints
 
@@ -838,7 +944,7 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ---
 
-**Last Updated**: 2026-01-15  
+**Last Updated**: 2026-08-18  
 **Status**: ✅ Actively maintained - road corner rendering + on-road physics unified and calibrated against real-world turning behavior  
 **Version**: 0.96 (fully playable, comprehensive test suite, professional sprite, REST API, Shapely-based road geometry)  
 **Test Results**: `corner_right_entry` right-turn test passing (smooth arc, stays on road, realistic ~15 km/h corner speed)  

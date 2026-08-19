@@ -18,17 +18,13 @@ class PhysicsValidator:
       changes while the car barely moves — a car has a nonzero minimum
       turning radius, so distance_moved / angle_rotated can never drop
       below it; this is a hard invariant, checked every single frame)
-    - Off-road driving (RAILS mode only)
+    - Off-road driving
     
     Can be enabled/disabled per car for performance.
     """
     
     # "Rotation requires proportional movement" tolerances
     HEADING_EPSILON_DEG = 0.05      # below this, no meaningful rotation to check
-    # Kept comfortably below TurningSystem.MIN_MECHANICAL_RADIUS_M (5.0m)
-    # so legitimate arcs never trip this by numerical/geometric slack,
-    # while anything meaningfully tighter than a real car can achieve
-    # still gets caught.
     MIN_REALISTIC_RADIUS_M = 3.0
     DISTANCE_EPSILON_M = 0.001       # floating-point noise floor for "didn't move at all"
     
@@ -86,19 +82,13 @@ class PhysicsValidator:
         self._check_teleportation(car, old_x, old_y, dt)
         
         # Check 2: Instant heading change
-        if car.driver and car.driver.get_name() == "RAILS":
-            self._check_heading_snap(car, old_heading)
+        self._check_heading_snap(car, old_heading)
         
         # Check 3: Rotating in place (heading changed but position didn't)
-        # Hard invariant: a car has a nonzero turning radius, so it can
-        # only be a spot-turn if it's not actually moving. Checked every
-        # frame directly — no heuristics, no thresholds beyond float noise.
-        if car.driver and car.driver.get_name() == "RAILS":
-            self._check_rotation_requires_movement(car, old_x, old_y, old_heading)
+        self._check_rotation_requires_movement(car, old_x, old_y, old_heading)
         
-        # Check 4: Off-road in RAILS mode
-        if car.driver and car.driver.get_name() == "RAILS":
-            self._check_off_road(car, network)
+        # Check 4: Off-road
+        self._check_off_road(car, network)
         
         # Update state
         self._last_state[car_id] = (car.x, car.y, car.heading, time.time())
@@ -111,18 +101,6 @@ class PhysicsValidator:
         pppm = config.PIXELS_PER_METER
         distance_m = distance_moved / pppm
         
-        # Maximum allowed: the TRUE physical bound is
-        # v_old*dt + 0.5*a*dt^2 (a car cannot travel further than that in
-        # one frame, full stop). The post-update speed already includes
-        # this frame's acceleration, so post_speed*dt over-estimates the
-        # true distance by exactly 0.5*a*dt - which on a LONG dt (e.g. a
-        # 0.2s hitch while loading data) can be a full meter. So the
-        # bound is post_speed*dt (safe: covers the acceleration term) +
-        # a dt-scaled margin for the straight-segment/arc split-frame
-        # hand-off (see Car._update_position_rails) + a tiny constant
-        # floor for float noise. The previous flat speed*dt*1.1 + 0.1
-        # bound flagged perfectly legal motion on hitches (1.5m over
-        # 1.47m at dt=0.215s -> crash).
         max_allowed_m = car.speed * dt + 0.1 * dt + 0.01
         
         if distance_m > max_allowed_m:
@@ -145,11 +123,10 @@ class PhysicsValidator:
             raise RuntimeError(error_msg)
     
     def _check_heading_snap(self, car, old_heading: float):
-        """Check for instant heading changes (should be smooth in RAILS mode)."""
+        """Check for instant heading changes."""
         heading_diff = abs((car.heading - old_heading + 180) % 360 - 180)
         
-        # Allow instant changes only during smooth transitions
-        if heading_diff > 30 and not car._heading_transition:
+        if heading_diff > 30:
             import traceback
             error_msg = (
                 f"\n{'='*70}\n"
@@ -161,8 +138,7 @@ class PhysicsValidator:
                 f"Position: ({car.x:.1f}, {car.y:.1f})\n"
                 f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
                 f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"Driver: {car.driver.get_name()}\n"
-                f"In transition: {car._heading_transition}\n"
+                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
                 f"{'='*70}\n"
             )
             print(error_msg)
@@ -170,20 +146,18 @@ class PhysicsValidator:
             # Don't raise - just warn for now
     
     def _check_off_road(self, car, network):
-        """Check if car is completely on road (RAILS mode constraint)."""
-        # TODO: Implement proper 4-wheel check
-        # For now, use center point check
+        """Check if car is completely on road."""
         if not car.is_on_road(network):
             import traceback
             error_msg = (
                 f"\n{'='*70}\n"
-                f"⚠️  OFF-ROAD DETECTED (RAILS MODE)!\n"
+                f"⚠️  OFF-ROAD DETECTED!\n"
                 f"{'='*70}\n"
                 f"Position: ({car.x:.1f}, {car.y:.1f})\n"
                 f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
                 f"Heading: {car.heading:.1f}°\n"
                 f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"Driver: {car.driver.get_name()}\n"
+                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
                 f"{'='*70}\n"
             )
             print(error_msg)
@@ -192,28 +166,12 @@ class PhysicsValidator:
     
     def _check_rotation_requires_movement(self, car, old_x: float, old_y: float, old_heading: float):
         """Hard invariant: a car cannot change heading without moving a
-        distance PROPORTIONAL to that rotation. It has a minimum turning
-        radius r_min > 0, so rotating by angle theta necessarily sweeps at
-        least an arc of length r_min*theta — there is no such thing as a
-        car turning "on the spot", even a little bit each frame.
-        
-        My first version of this check only flagged EXACTLY zero movement
-        (< 1mm), which missed the actual bug: while an arc is executing,
-        distance = speed*dt is never exactly zero (even a few mm/frame at
-        low speed), so heading rotating a lot while barely translating
-        slipped through. The correct check is the IMPLIED radius
-        (distance_moved / angle_rotated) — if that's smaller than any
-        real car could achieve, the motion is impossible, regardless of
-        whether distance_moved itself is nonzero.
-        
-        Checked directly every frame — no rolling windows, just the one
-        physical constant (MIN_REALISTIC_RADIUS_M).
-        """
+        distance PROPORTIONAL to that rotation."""
         heading_diff_deg = abs((car.heading - old_heading + 180) % 360 - 180)
         distance_moved_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
         
         if heading_diff_deg <= self.HEADING_EPSILON_DEG:
-            return  # no meaningful rotation this frame, nothing to check
+            return
         
         heading_diff_rad = math.radians(heading_diff_deg)
         implied_radius_m = distance_moved_m / heading_diff_rad
@@ -228,14 +186,11 @@ class PhysicsValidator:
                 f"{distance_moved_m*1000:.1f}mm.\n"
                 f"Implied turning radius: {implied_radius_m:.3f}m "
                 f"(minimum realistic: {self.MIN_REALISTIC_RADIUS_M}m)\n"
-                f"No real car can turn this tightly — position/heading updates\n"
-                f"fell out of sync somewhere in the simulation (e.g. the car is\n"
-                f"effectively spinning in place instead of sweeping a proper arc).\n"
                 f"Old position: ({old_x:.1f}, {old_y:.1f}), heading {old_heading:.1f}°\n"
                 f"New position: ({car.x:.1f}, {car.y:.1f}), heading {car.heading:.1f}°\n"
                 f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
                 f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"Driver: {car.driver.get_name()}\n"
+                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
                 f"{'='*70}\n"
             )
             print(error_msg)

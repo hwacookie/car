@@ -1,7 +1,6 @@
 # Bicycle-model road navigation
 #
-# Replaces the rail model (car._update_rails_mode + turning_system.py) for
-# the "BICYCLE" driving mode. The car is a FREE PARTICLE on the road
+# The car is a FREE PARTICLE on the road
 # surface, not a train locked to the OSM graph:
 #
 #     state = (x, y, heading, v, steering_delta)

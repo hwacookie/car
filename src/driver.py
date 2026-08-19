@@ -50,23 +50,28 @@ class KeyboardDriver(Driver):
         return "FREE"
 
 
-class AIDriver(Driver):
-    """Autonomous driver that follows roads (RAILS mode)."""
-    
+class BicycleDriver(Driver):
+    """Autonomous driver for BICYCLE mode.
+
+    Provides high-level intent (accelerate / brake / which way to turn,
+    from the keyboard or the REST API). The car executes it with the
+    kinematic bicycle model (src/bicycle_nav.py).
+    """
+
     def __init__(self):
-        self.name = "AI"
+        self.name = "BICYCLE"
         self.pending_turn = None  # "left", "right", or None
         self.blinker_left = False
         self.blinker_right = False
         self._last_left = False
         self._last_right = False
-    
+
     def get_control(self, car, network, dt, keys) -> dict:
         """Automatic road following with blinkers."""
         # Update blinkers based on A/D keys
         left = keys[pygame.K_LEFT] or keys[pygame.K_a]
         right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
-        
+
         # Toggle blinkers
         if left and not self._last_left:
             self.blinker_left = not self.blinker_left
@@ -82,73 +87,23 @@ class AIDriver(Driver):
                 self.pending_turn = "right"
             else:
                 self.pending_turn = None
-        
+
         self._last_left = left
         self._last_right = right
-        
-        # Determine if we should brake automatically
-        should_brake = self._should_brake_for_turn(car, network, dt)
-        
+
         # W/S for speed control (manual override)
         accel = keys[pygame.K_UP] or keys[pygame.K_w]
         brake = keys[pygame.K_DOWN] or keys[pygame.K_s]
-        
+
         return {
             'accelerate': accel,
-            'brake': brake or should_brake,  # Automatic + manual braking
+            'brake': brake,
             'steer_left': False,  # AI controls steering via road following
             'steer_right': False,
             'blinker_left': self.blinker_left,
             'blinker_right': self.blinker_right,
         }
-    
-    def _should_brake_for_turn(self, car, network, dt) -> bool:
-        """Determine if automatic braking is needed for upcoming turn."""
-        if not self.pending_turn or car.speed < 1.0:
-            return False
-        
-        seg = network.segments[car.seg_idx]
-        node = seg.end_node if car.forward else seg.start_node
-        
-        # Only brake at real junctions with right-of-way conflict
-        node_deg = network.node_degree.get(node, 2)
-        if node_deg < 3:
-            return False
-        
-        if not network.has_right_of_way_conflict(car.seg_idx, node):
-            return False
-        
-        next_seg = network.choose_next_segment(car.seg_idx, node, self.pending_turn)
-        if next_seg is None or next_seg == car.seg_idx:
-            return False
-        
-        turn_angle = abs(network.get_exit_angle(car.seg_idx, next_seg))
-        
-        # Determine safe speed
-        if turn_angle > 90:
-            safe_speed = 25 / 3.6
-        elif turn_angle > 60:
-            safe_speed = 40 / 3.6
-        elif turn_angle > 30:
-            safe_speed = 55 / 3.6
-        else:
-            return False
-        
-        if car.speed <= safe_speed:
-            return False
-        
-        # Calculate if we need to brake now
-        if car.forward:
-            remaining_distance = seg.length * (1.0 - car.progress)
-        else:
-            remaining_distance = seg.length * car.progress
-        
-        from . import config
-        braking_distance = (car.speed**2 - safe_speed**2) / (2 * config.CAR_BRAKING)
-        safety_margin = 15.0
-        
-        return remaining_distance <= braking_distance + safety_margin
-    
+
     def clear_blinker_if_turned(self, car, network, from_seg: int, to_seg: int):
         """Clear blinker if actually turned in the signaled direction."""
         if from_seg == to_seg:
@@ -162,31 +117,6 @@ class AIDriver(Driver):
         elif self.blinker_right and turn_angle > 30:
             self.blinker_right = False
             self.pending_turn = None
-
-    def get_name(self) -> str:
-        return "RAILS"
-
-
-class BicycleDriver(AIDriver):
-    """Autonomous driver for BICYCLE mode.
-
-    Provides exactly the same high-level intent as AIDriver (accelerate /
-    brake / which way to turn, from the keyboard or the REST API) so the
-    test framework is unchanged - but the car executes it with the
-    kinematic bicycle model (src/bicycle_nav.py) instead of the rail
-    model. The rail model's automatic pre-turn braking is NOT used here:
-    the bicycle navigation plans its own corner speed from the reference
-    line's curvature, so we suppress it to avoid double braking.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.name = "BICYCLE"
-
-    def _should_brake_for_turn(self, car, network, dt) -> bool:
-        # The bicycle nav computes its own corner speed profile - no
-        # rail-style pre-turn braking here.
-        return False
 
     def get_name(self) -> str:
         return "BICYCLE"

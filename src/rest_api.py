@@ -105,7 +105,7 @@ class GameAPI:
             Body: {
                 "breadcrumbs": bool,
                 "validator": bool,
-                "mode": "rails" | "free"
+                "mode": "bicycle" | "free"
             }
             """
             data = request.get_json()
