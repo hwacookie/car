@@ -1,11 +1,13 @@
 # Turn-Planning Rework — Plan
 
-> **TL;DR (2026-08-16):** The rail model is **retired**; one kinematic
-> **bicycle model** is the physics for everything (§8) — AI mass, player-
-> assisted, player-free. Roadmap: smoothed geometry (§10) → "Miss Daisy"
-> offline reference-line authoring (§9) → pygame rendering + paint-bucket
-> trails (§11) → ~500-car traffic simulation of Kleinmachnow (§12).
-> **Next task: fix the `sliver_approach` stall — §13.6.**
+> **TL;DR (2026-08-19):** The rail model is **retired and removed**; one
+> kinematic **bicycle model** is the physics for everything (§8) — AI mass,
+> player-assisted, player-free. Roadmap: smoothed geometry (§10) → "Miss
+> Daisy" offline reference-line authoring (§9) → pygame rendering +
+> paint-bucket trails (§11) → ~500-car traffic simulation of Kleinmachnow
+> (§12).
+> **Next task: §10 smoothed geometry — re-introduce the spline
+> deliberately (§8.2 item 2, concretely in §13.6).**
 > **New here? Read §13 (Onboarding) first, then §8.** Hard rule:
 > `AGENTS.md` — never do physically impossible things.
 
@@ -999,28 +1001,33 @@ new):
 The next task (§10 smoothed geometry) will re-introduce `SmoothCurve`
 deliberately as its own commit.
 
-### 13.6 First task, concretely (work-order item 1, §8.2)
+### 13.6 First task, concretely (work-order item 2, §8.2)
 
-**Fix the `sliver_approach` stall.**
+**§10 smoothed geometry — re-introduce the spline deliberately.**
 
-- Symptom: on the synthetic map, teleport to start point
-  `sliver_approach` and accelerate — the car is stuck at s=0 (speed 0.0):
-  the reference line curves sharply at the sliver junction, the
-  pure-pursuit target sits far off the car's heading, the steering angle
-  is large, and the accel-scale gate (throttle off while steering hard)
-  prevents any movement. It is a deadlock, not a slow start.
-- Reproduce: `SDL_VIDEODRIVER=dummy python -m src.main --map basic --api
-  --bicycle`, then drive it via the REST API as `tests/test_turning.py`
-  does (teleport → blinker if needed → accelerate), or run the affected
-  scenarios: `python tests/test_turning.py` (the 12 timed-out tests in
-  the visible-window run include this one).
-- Candidate fixes (from §7): (a) reduce the steering angle at the start
-  (smaller base look-ahead, or a gentler effective corner radius at the
-  sliver junction), or (b) allow some acceleration even while steering
-  (lower the accel-scale gate's threshold). Pick whichever keeps the
-  motion physically legal (§13.2) — verify with the validator enabled.
-- **Done when:** the car leaves the sliver start point and completes the
-  maneuver on-road; the 12 timed-out `tests/test_turning.py` scenarios
-  pass; no `RuntimeError` from the physics validator; the existing green
-  tests stay green (the 3 pre-existing failures in `test_api.py` /
-  `test_random_road_point` are unrelated and remain).
+Work-order item 1 (the `sliver_approach` stall) is **done** (`2066311`,
+re-verified after `9cfcf10` + `33cb300`); §10 is next.
+
+- Re-introduce the centripetal Catmull-Rom pipeline as its **own commit**
+  (it was accidentally bundled into the rails-removal commit `74b9c4e` and
+  reverted in `33cb300` — `git show 33cb300` shows exactly what was
+  removed and is the starting point). Each way's centerline becomes a
+  smooth C¹ curve **through the original OSM nodes**; the graph (node set,
+  topology) stays untouched — the curve is a function of the graph (§10).
+- One curve, all consumers: renderer / driving / on-road check share the
+  same geometry (§11.1) — no consumer builds its own chords anymore.
+- Known gotchas:
+  - `SmoothCurve`'s `kap` table is corrupted at every piece junction
+    (duplicate sample → κ spikes up to ~16 1/m); use geometry-based
+    curvature (central differences of `point_at`) for any curvature
+    measurement.
+  - Large turn angles (>~100°) need a *chained* Bézier/arc, not a single
+    cubic (a single cubic overshoots peak curvature vs the circular arc —
+    see `scripts/visualize_junction_fillets.py`).
+- Add a **feasibility check on actual max curvature**: the driving line
+  must never demand a radius below the mechanical minimum
+  `WHEELBASE / tan(MAX_STEER) ≈ 3.46 m`.
+- **Done when:** the 18 deterministic tests stay green (0 off-road, 0
+  snaps, 0 timeouts, 0 wrong segment) with the smoothed pipeline active;
+  curvature reads are sane (no spikes at piece junctions); the renderer
+  and the driving model demonstrably use the same curve.
