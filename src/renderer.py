@@ -12,30 +12,6 @@ from .road_network import RoadNetwork
 from .camera import Camera
 
 
-def make_grass_background(w: int, h: int, tile_size: int = 32) -> pygame.Surface:
-    """Pre-render a tiled grass texture for the screen background, modeled
-    on the RQ 31 reference SVG: base #4c702e with sparse lighter grass
-    strokes (#6f963f) and a couple of small lighter/darker dots. Built
-    once and blitted as the full background each frame - static, since
-    the pattern is uniform and doesn't need to follow the camera."""
-    tile = pygame.Surface((tile_size, tile_size), pygame.SRCALPHA)
-    tile.fill((76, 112, 46, 255))                        # #4c702e base
-    stroke = (111, 150, 63, 140)                          # #6f963f @ ~55%
-    for (x1, y1, x2, y2) in (
-        (2, 8, 7, 5), (17, 5, 21, 11), (25, 25, 31, 21),
-        (5, 27, 8, 20), (20, 18, 28, 20),
-    ):
-        pygame.draw.line(tile, stroke, (x1, y1), (x2, y2), 1)
-    pygame.draw.circle(tile, (120, 158, 72, 153), (10, 17), 2)  # #789e48 @ 60%
-    pygame.draw.circle(tile, (54, 86, 37, 153), (28, 8), 1)     # #365625 @ 60%
-
-    bg = pygame.Surface((w, h))
-    for ty in range(0, h, tile_size):
-        for tx in range(0, w, tile_size):
-            bg.blit(tile, (tx, ty))
-    return bg
-
-
 class Renderer:
     # Cache of PIL fonts by size (class-level, shared across instances)
     _pil_fonts: dict[int, object] = {}

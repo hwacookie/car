@@ -10,7 +10,7 @@ from .config import *
 from .osm_loader import fetch_osm_data
 from .road_network import RoadNetwork
 from .camera import Camera
-from .renderer import Renderer, make_grass_background
+from .renderer import Renderer
 from .car import Car
 from .driver import Driver, KeyboardDriver, BicycleDriver
 from .physics_validator import PhysicsValidator
@@ -54,8 +54,6 @@ def main(smoke_test_frames: int = 0):
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
     pygame.display.set_caption("Car Game — Kleinmachnow")
     clock = pygame.time.Clock()
-    # Tiled grass texture for the background (built once, blitted per frame)
-    grass_bg = make_grass_background(WINDOW_WIDTH, WINDOW_HEIGHT)
 
     # macOS: bring the window to the foreground (it may open behind the terminal
     # or on another Space/display)
@@ -329,7 +327,7 @@ def main(smoke_test_frames: int = 0):
                       follow=car.speed > 0.1)
 
         # Render
-        screen.blit(grass_bg, (0, 0))
+        screen.fill(BG_COLOR)  # solid grass-green background
         renderer.draw(screen, car)
         car.draw(screen, camera)
 
