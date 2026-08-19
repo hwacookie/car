@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-API_URL = "http://localhost:5000"
+API_URL = "http://127.0.0.1:5000"  # explicit IPv4: 'localhost' may resolve to ::1, where macOS ControlCenter squats on :5000
 
 # Results are persisted next to this script, keyed by "start_point|direction",
 # so the next run can report whether each scenario passed the last time it ran
