@@ -63,19 +63,52 @@ der Driver setzt Blinker und Intent (Gas / Bremse).
 
 | Phase | Beschreibung |
 |-------|-------------|
-| **Einleitung** | Blinker in Abbiegerichtung an. |
-| **Spurwechsel zum Außenrand** | Vor der Kreuzung (`TURN_OFFSET_FAR_M = 25 m`) blendet die Referenzlinie zur außenliegenden Position: Linksabbieger → weit außen, Rechtsabbieger → Mittelwert zwischen `base_offset` und `max_offset`. Blend läuft symmetrisch vor **und nach** der Kurve. |
-| **Kurve** | Speed-Profile drosselt stark (bei enger Krümmung > 0.15: `A_LAT_MAX` auf 60% reduziert). Tight Lookahead (`2.5 + 0.2*v`). Auto durchfährt die Kreuzung auf der vorgeblendeten Referenzlinie. |
-| **Zurück in Normalposition** | Nach der Kreuzung (`TURN_OFFSET_FAR_M` hinter dem Punkt) blendet die Linie zurück auf `base_offset`. |
+| **Einleitung** | Blinker in Abbiegerichtung an. Die Route wird neu gebaut (`_maybe_rebuild`), diesmal über den gewählten Ast der Kreuzung. |
+| **Linienwahl** | Es gibt **keinen festen Abbiege-Offset mehr**. Die Fahrlinie ist die Lösung einer Optimierung (`src/raceline.py`): minimale Krümmung innerhalb eines Korridors, dessen Grenzen die beiden harten Regeln sind – nie von der Fahrbahn, nie auf die Gegenfahrbahn. Die klassische Linie „außen rein, Scheitel innen, außen raus“ ist **nirgends codiert**, sie fällt aus der Geometrie heraus. |
+| **Kurve** | Das Speed-Profile leitet die Kurvengeschwindigkeit direkt aus der Krümmung der *optimierten* Linie ab: `v = sqrt(a_lat / kappa)`. Keine Sonderfälle, keine Deckelung. |
+| **Zurück in Normalposition** | Ergibt sich von selbst – hinter der Kreuzung ist die krümmungsärmste Linie wieder die Spurmitte. |
 | **Blinker aus** | `clear_blinker_if_turned()` prüft den Winkel des Kurvenausgangs und schaltet den Blinker ab. |
 
 ### Parameter
 
-- `TURN_OFFSET_FAR_M = 25.0` – Blend beginnt (m vor/nach Kreuzung)
-- `TURN_OFFSET_NEAR_M = 5.0` – Blend abgeschlossen
-- Linksabbieger: `turn_offset = max_offset` (außenrand)
-- Rechtsabbieger: `turn_offset = (base_offset + max_offset) / 2` (Mittelwert)
-- Lookahead: `2.5 + 0.2 * speed` (basis), bei enger Kurve (`k > 0.15`): `A_LAT_MAX *= 0.6`
+- `A_LAT_MAX = 4.5 m/s²` – Querbeschleunigungs-Limit (Untersteuern)
+- `A_LAT_PLAN_FRACTION = 0.7` – das Profil plant nur mit 70 % davon. Plant
+  man mit dem vollen Wert, ist die Gierrate im Scheitel bereits gesättigt
+  und dem Regler bleibt **keine Reserve zum Nachkorrigieren**: gemessen lief
+  Pure Pursuit dann 1 m innerhalb der eigenen Linie – genug, um mit der
+  Flanke über die Mittellinie zu geraten.
+- `LANE_CENTRE_MARGIN_M = 0.5` – Abstand der Korridor-Untergrenze zur
+  Mittellinie. Enthält bewusst Reserve für den Schleppfehler des Reglers:
+  der Korridor beschränkt die *Linie*, die harte Regel gilt aber dem *Auto*.
+- `CURVATURE_WINDOW_M = 1.0` – feste physikalische Fensterbreite der
+  Krümmungsmessung.
+
+### Kreuzungsmitte (der weiße Punkt)
+
+Geradeaus und beim **Rechtsabbiegen** muss der Knotenpunkt (der weiße Punkt,
+den der Renderer an jedem Knoten mit Grad ≥ 3 zeichnet) **links** liegen –
+das ist nur „rechts fahren“ an der Stelle, an der die Mittellinie aufhört zu
+existieren.
+
+Beim **Linksabbiegen** gilt das ausdrücklich **nicht**. StVO § 9 Abs. 4:
+*„Linksabbieger müssen einander voreinander abbiegen, sofern nicht die
+Verkehrslage oder die Gestaltung der Kreuzung ein Umeinanderfahren
+erfordert.“* Der Regelfall ist **voreinander** – entgegenkommende
+Linksabbieger fahren Fahrerseite an Fahrerseite aneinander vorbei, jeder
+biegt vor der Mitte ab, und der Punkt liegt damit **rechts**.
+
+Das ist keine Feinheit: zwingt man Linksabbieger, den Punkt links zu lassen,
+ist die einzige verbleibende Linie enger als der Wendekreis des Autos
+(gemessen 1,5 m gegen 3,46 m Minimum) – die Beschränkung war schlicht falsch
+für dieses Manöver.
+
+### Erreichbarkeit
+
+Ein Blinker bedeutet „ich will an der nächsten Stelle abbiegen, an der es
+*noch physikalisch geht*“ (siehe `TURN_REWORK_PLAN.md` § 2.5). Ist das Auto
+bereits schneller, als das Profil an seiner Position erlaubt, hilft kein
+Bremsen mehr – dann wird die Kreuzung **durchfahren** (`_rebuild_straight_past`)
+und der Blinker bleibt an.
 
 ---
 

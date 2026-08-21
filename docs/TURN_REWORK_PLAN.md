@@ -1,15 +1,61 @@
 # Turn-Planning Rework — Plan
 
-> **TL;DR (2026-08-19):** The rail model is **retired and removed**; one
-> kinematic **bicycle model** is the physics for everything (§8) — AI mass,
-> player-assisted, player-free. Roadmap: smoothed geometry (§10) → "Miss
-> Daisy" offline reference-line authoring (§9) → pygame rendering +
-> paint-bucket trails (§11) → ~500-car traffic simulation of Kleinmachnow
-> (§12).
-> **Next task: §10 smoothed geometry — re-introduce the spline
-> deliberately (§8.2 item 2, concretely in §13.6).**
-> **New here? Read §13 (Onboarding) first, then §8.** Hard rule:
-> `AGENTS.md` — never do physically impossible things.
+> **TL;DR (2026-08-22):** The rail model is retired and removed; one
+> kinematic **bicycle model** is the physics for everything (§8). The
+> driving line is now the solution to a **constrained optimisation**
+> (`src/raceline.py`, §14) rather than a fixed lane offset — the racing
+> line emerges from it rather than being coded. **16/18** deterministic
+> tests pass; the two failures are both `sliver_approach` turns.
+> Roadmap: §9 Miss Daisy authoring → §11 rendering/trails → §12 traffic sim.
+> **New here? Read §14 first (it supersedes the turning parts of §3 and
+> §10), then §8.** Hard rule: `AGENTS.md` — never do physically impossible
+> things.
+
+## 0a. Status (updated 2026-08-22)
+
+**16/18 deterministic tests pass.** 0 off-road, 0 snaps, 0 teleports,
+0 crashes, 0 wrong-side. Corners are taken at 14–17 km/h, matching a real
+car on an ordinary local road (0.38 g measured); they used to be 4.3 km/h.
+
+**What changed.** See §14 for the driving line. Beyond that:
+
+- **Rear axle vs body.** The bicycle model integrates the REAR AXLE — that
+  is the pivot — but the sprite, tyre trails and the four-corner on-road box
+  all treated `Car.x/y` as the body centre. Drawn rear wheels sat ~1.7 m
+  behind the real pivot, and a point behind the pivot swings OUT of a turn,
+  so rear tyre tracks curved right while the front wheels steered left. The
+  on-road box was likewise 1.28 m too far back and never tested the nose.
+- **Rule 2 was unenforced.** `LaneGuard` only ran outside the "turn blend
+  zone", which covered 100% of every route. Now limited to real junctions.
+- **Curvature window** was proportional to route length, smearing short
+  fillets away (§14).
+- **Fork stickiness.** `_sync_segment` picked the nearest segment by
+  distance; at a fork the branches are near-equidistant, so it could snap to
+  the branch the car was NOT taking, which then re-planned it onto the wrong
+  branch mid-corner.
+- **`id()` reuse.** Per-car state keyed on `id(car)` was inherited by the
+  next car allocated at the same address.
+
+**Still open.**
+
+1. `sliver_approach` left/right — the car ends on the straight continuation
+   whatever it is told, *even armed from the first frame*, so this is not
+   the §2.5 slide-past behaviour: the turn is never attempted. Approach is
+   4.22 m against a 3.46 m minimum radius, so the scenario is marginal by
+   construction. Note all 18 passed at `2066311`, when a hard 1.2 m/s cap
+   made the car crawl everywhere — removing that cap (correct for realistic
+   corner speeds) plausibly took the sliver with it.
+2. **No restraint parameter.** The optimiser always uses the whole corridor,
+   so every driver is Schumacher. §9.5 says the line is shared and only the
+   speed profile scales per driver, but a cautious driver also would not use
+   the full lane width. Design decision outstanding.
+3. **§9.1 per-manoeuvre junction lines.** Junction turns are still built by
+   offsetting a centreline rounded THROUGH the node, then constraining the
+   offset, rather than as a line from lane centre to lane centre around the
+   node. The current lines are feasible, but by constraint rather than by
+   shape.
+
+---
 
 ## 0. Status (updated 2026-08-19)
 
@@ -1031,3 +1077,63 @@ re-verified after `9cfcf10` + `33cb300`); §10 is next.
   snaps, 0 timeouts, 0 wrong segment) with the smoothed pipeline active;
   curvature reads are sane (no spikes at piece junctions); the renderer
   and the driving model demonstrably use the same curve.
+
+---
+
+## 14. The driving line as a constrained optimisation (2026-08-22)
+
+Supersedes the lane-offset machinery in §3 and the driving-line parts of
+§10. Implemented in `src/raceline.py`.
+
+The line is not a fixed offset from the centreline. It is the solution to
+the driving rules stated directly:
+
+| rule | enforcement |
+|---|---|
+| never leave the pavement | upper corridor bound from the paved polygon, eroded by half the car's width |
+| never enter the oncoming lane | lower corridor bound `CAR_WIDTH/2 + LANE_CENTRE_MARGIN_M`; lifted on one-way roads |
+| be as fast as possible | objective: `v = sqrt(a_lat/kappa)`, so fastest = straightest = minimise curvature |
+| use a racing line | not implemented; it is what the objective produces |
+
+Rules 1 and 2 are hard bounds, so a legal line is guaranteed by
+construction rather than detected afterwards.
+
+### 14.1 Why not a formula
+
+Offsetting a path laterally by `o(s)` changes curvature by roughly `-o''`.
+A local "swing out then cut in" bump therefore buys radius at the apex and
+pays for it with sharper curvature on both shoulders: measured, the result
+was 2–4x *tighter* than the plain lane line. Only reshaping the whole
+approach and exit together gains anything, which is what the optimiser does.
+
+Minimising `sum(kappa^2)` under box bounds gives pentadiagonal normal
+equations; a banded solve does a 500-station route in ~20 ms.
+
+### 14.2 Junction centre — voreinander
+
+Going straight or turning right, the degree>=3 node (the white dot) stays
+on the car's left: keep-right, restated where the centreline stops
+existing. Turning **left** it does not — StVO 9(4) makes *voreinander* the
+default, so opposing left-turners pass in front of one another and the dot
+ends up on their right.
+
+Forcing dot-on-the-left for left turns leaves only lines tighter than the
+car's 3.46 m minimum radius (measured 1.5 m). The constraint was wrong for
+that manoeuvre, and the infeasibility was the geometry saying so.
+
+### 14.3 Curvature must be measured over a fixed window
+
+`CURVATURE_WINDOW_M = 1.0`, never a fraction of route length. At the old
+`max(1.0, total*0.01)` a 494 m route measured curvature over 4.94 m —
+wider than half a 9.4 m fillet — smearing a 4.25 m lane radius into a
+reported 6.30 m. The profile then commanded a speed needing 2.96 m/s2
+against a 2.0 limit, so the car could not hold its own reference line and
+understeered wide out of every bend. The 1.2 m/s corner cap that used to
+exist was compensating for exactly this.
+
+### 14.4 Plan below the limit
+
+`A_LAT_PLAN_FRACTION = 0.7`. Planning at the full lateral limit saturates
+the heading rate at the apex, leaving the controller no authority to
+correct with — pure pursuit was measured running 1 m inside its own line.
+The reserve is what lets it recover onto the line.

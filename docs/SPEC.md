@@ -34,8 +34,9 @@ Main Game Loop (src/main.py)
   ├─ Car (physics, state)
   │   ├─ Driver (control interface)
   │   │   ├─ KeyboardDriver (FREE mode)
-  │   │   └─ AIDriver (RAILS mode)
-  │   └─ TurningSystem (arc geometry)
+  │   │   └─ BicycleDriver (intent: gas / brake / blinker)
+  │   └─ BicycleNav (kinematic bicycle model + pure pursuit)
+  │       └─ raceline (corridor + minimum-curvature line)
   ├─ PhysicsValidator (constraint checking)
   └─ GameAPI (REST server, optional)
 
@@ -45,7 +46,8 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 **Separation of Concerns:**
 - **Car**: Pure physics and state (no input handling)
 - **Driver**: Control logic (keyboard or AI)
-- **TurningSystem**: Geometry calculations (arc planning)
+- **BicycleNav**: Kinematic bicycle model, reference line, speed profile
+- **raceline**: The driving line as a constrained optimisation (see below)
 - **PhysicsValidator**: Constraint validation (teleportation, snaps, off-road)
 - **GameAPI**: Remote control interface (optional, thread-safe)
 
@@ -161,24 +163,82 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 
 **Note**: This is a **design constraint** for the turning system (how we calculate turns), NOT a validation check. External forces (collisions, explosions) CAN exceed this limit—that's physically possible!
 
-**Target speed per turn severity** (`TurningSystem.decide_target_speed_for_turn`),
-calibrated against real-world guidance for turning a small car (~5.5m
-wall-to-wall turning circle) through an intersection:
+**Cornering speed is not a table.** It follows from the geometry of the
+line the car is actually driving:
 
-| Turn angle | Target speed | Notes |
-|------------|---------------|-------|
-| ≥ 90° (right angle or sharper) | ~15 km/h | Matches real-world guidance for a tight right-angle corner (roughly 10-15 km/h, tighter still without swinging wide) |
-| ≥ 60° | ~25 km/h | |
-| ≥ 30° | ~45 km/h | |
-| < 30° | cruise speed | Gentle enough that no dedicated slow-down is needed |
+```
+v(s) = sqrt( A_LAT_MAX * A_LAT_PLAN_FRACTION / kappa(s) )
+```
 
-This used to target ~40 km/h for a 90° corner, which would need a ~25m
-turning radius — wildly more than an ordinary street corner's curb
-radius provides. That mismatch forced the planner to fall back through
-several slower/lane-shifted attempts and could still end up visibly
-cutting across into the centerline/opposing lane just to make the
-(too-large) arc geometrically fit. At the corrected ~15 km/h target, the
-arc fits comfortably within the car's own lane.
+There is no per-turn-angle lookup and no special case for tight corners.
+An earlier version had both, plus a hard 1.2 m/s ceiling for
+`kappa > 0.05`. Together those drove a 6 m junction fillet at **4.3 km/h**,
+about a quarter of the ~17 km/h a real car takes an ordinary local-road
+corner at (0.38 g, measured). They were treating a symptom: the car cut
+corners because of where its reference line ran, not because the speed
+formula was wrong, so capping the speed only made it cut them slowly.
+
+Two things make the formula trustworthy:
+
+- **Curvature is measured over a fixed 1 m window** (`CURVATURE_WINDOW_M`),
+  never a fraction of route length. A window proportional to the route was
+  4.94 m on a 494 m route - wider than half a 9.4 m fillet - which smeared a
+  4.25 m lane radius into a reported 6.30 m. The profile then handed the car
+  a speed needing 2.96 m/s2 against a 2.0 limit, so it could not hold its
+  own reference line and understeered wide out of every bend.
+- **The profile plans against only 70 % of the limit**
+  (`A_LAT_PLAN_FRACTION`). Planning at the full value saturates the heading
+  rate at the apex and leaves the controller no authority to correct with;
+  the reserve is what lets it pull back onto the line.
+
+#### The Driving Line (`src/raceline.py`)
+
+The car does not follow a fixed lane offset. The line is the solution to
+the driving rules, stated as an optimisation:
+
+| rule | how it is enforced |
+|------|--------------------|
+| 1. never leave the pavement | upper corridor bound: the paved polygon eroded by half the car's width plus `ROAD_EDGE_TOLERANCE_M` (so corner rounding is respected automatically) |
+| 2. never enter the oncoming lane | lower corridor bound: `CAR_WIDTH/2 + LANE_CENTRE_MARGIN_M` right of the centreline; lifted on one-way carriageways |
+| 3. be as fast as possible | the objective - since `v = sqrt(a_lat/kappa)`, fastest means straightest, so minimise curvature |
+| 4. use a racing line | not a feature; it is what (3) produces |
+
+Rules 1 and 2 are **hard bounds**, so they cannot be traded away for
+speed: a legal line is guaranteed by construction rather than detected
+afterwards by a validator.
+
+The classic outside-apex-outside line is encoded nowhere. It emerges: on
+a right-hand bend the solver drives the offset to the centreline side on
+entry, to the kerb at the apex, and back out on exit - and mirrors itself
+for a left-hander.
+
+**Why an optimiser and not a formula.** Offsetting a path laterally by
+`o(s)` changes its curvature by roughly `-o''`, so a local "swing out,
+cut in" bump buys radius at the apex and pays for it with sharper
+curvature on both shoulders - measured, the net line was 2-4x *tighter*.
+The gain only appears when the whole approach and exit reshape together,
+which is what the optimiser does and a bump function cannot.
+
+Minimising `sum(kappa^2)` subject to box bounds gives normal equations
+that are pentadiagonal, so a banded solve handles a 500-station route in
+about 20 ms.
+
+#### Junction Centre: the White Dot
+
+The renderer paints a white dot at every node of degree >= 3. Going
+straight or turning **right**, that dot must stay on the car's **left** -
+this is just keep-right restated at the one place the centreline stops
+existing.
+
+Turning **left** it must not. StVO 9(4) makes *voreinander* the default:
+opposing left-turners pass in front of one another, each turning before
+the centre, which puts the dot on their **right**. *Umeinander* (around
+the centre) is the exception, not the rule.
+
+This matters concretely: constraining left turns to keep the dot on the
+left leaves only lines tighter than the car's 3.46 m minimum turning
+radius (measured 1.5 m), i.e. the constraint was simply wrong for that
+manoeuvre.
 
 #### On-Road Check: Single Source of Truth
 
@@ -198,8 +258,8 @@ This is now unified:
   included).
 - `RoadNetwork.is_on_road(x, y)` and `Car.is_on_road()` (which now just
   delegates to it) both test against this polygon.
-- `TurningSystem.validate_arc_on_road()` also tests candidate arcs
-  against this same polygon.
+- `raceline.legal_corridor()` derives the driving corridor from the
+  same polygon, so the line cannot be planned off the pavement.
 - All three share one tolerance constant, `config.ROAD_EDGE_TOLERANCE_M`
   (0.5m), instead of the planner silently allowing more slack than the
   live check honored (which used to cause plans that passed validation
@@ -606,7 +666,7 @@ car/
 - [x] "Rechts vor links" junction logic
 - [x] Dead-end handling (180° turn)
 - [x] Off-road detection (FREE mode)
-- [x] **TurningSystem class** (circular arc physics - in development)
+- [x] **raceline module** (driving line as constrained optimisation)
 
 #### Visual & UI
 - [x] **Professional SVG car sprite** (windows, mirrors, wheels)
