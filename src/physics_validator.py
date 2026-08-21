@@ -1,10 +1,8 @@
 # Physics Validator - Independent "Physics Judge" for detecting violations
-# Can be enabled/disabled per car for performance
 
 from __future__ import annotations
 import math
-import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 from . import config
 
 
@@ -12,194 +10,130 @@ class PhysicsValidator:
     """Independent physics constraint checker for cars.
     
     Detects violations:
-    - Teleportation (position jumps)
+    - Impossible position jumps (speed exceeds max)
     - Instant heading changes (>30° in one frame)
-    - Rotating with an impossibly tight implied turning radius (heading
-      changes while the car barely moves — a car has a nonzero minimum
-      turning radius, so distance_moved / angle_rotated can never drop
-      below it; this is a hard invariant, checked every single frame)
-    - Off-road driving
+    - Rotating with an impossibly tight implied turning radius
     
-    Can be enabled/disabled per car for performance.
+    State is tracked by car id — when a car is destroyed and replaced,
+    the old entry simply goes stale. No skip/reset plumbing needed.
     """
     
-    # "Rotation requires proportional movement" tolerances
-    HEADING_EPSILON_DEG = 0.05      # below this, no meaningful rotation to check
+    HEADING_EPSILON_DEG = 0.05
     MIN_REALISTIC_RADIUS_M = 3.0
-    DISTANCE_EPSILON_M = 0.001       # floating-point noise floor for "didn't move at all"
     
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        # State tracking: car_id -> (x, y, heading, timestamp)
-        self._last_state: Dict[int, Tuple[float, float, float, float]] = {}
-        # Skip frames after intentional resets
-        self._frames_to_skip: Dict[int, int] = {}
+        self.violations: list[dict] = []  # log of all violations
+        # car_id -> (x, y, heading)
+        self._last_state: Dict[int, Tuple[float, float, float]] = {}
     
     def enable(self):
-        """Enable validation checks."""
         self.enabled = True
         print("✅ Physics validator ENABLED")
     
     def disable(self):
-        """Disable validation checks (for performance)."""
         self.enabled = False
         print("❌ Physics validator DISABLED")
     
-    def skip_next_frames(self, car, num_frames: int = 5):
-        """Skip validation for next N frames (after teleport, reset, etc)."""
-        car_id = id(car)
-        self._frames_to_skip[car_id] = num_frames
-    
     def check(self, car, dt: float, network):
-        """Run all physics checks on a car.
-        
-        Called from main loop AFTER car.update().
-        """
+        """Run all physics checks on a car. Called after car.update()."""
         if not self.enabled:
             return
         
         car_id = id(car)
         
-        # Skip frames if requested
-        if car_id in self._frames_to_skip:
-            if self._frames_to_skip[car_id] > 0:
-                self._frames_to_skip[car_id] -= 1
-                # Update state but don't check
-                self._last_state[car_id] = (car.x, car.y, car.heading, time.time())
-                return
-            else:
-                del self._frames_to_skip[car_id]
-        
-        # Get previous state
         if car_id not in self._last_state:
-            # First check - just store state
-            self._last_state[car_id] = (car.x, car.y, car.heading, time.time())
+            self._last_state[car_id] = (car.x, car.y, car.heading)
             return
         
-        old_x, old_y, old_heading, old_time = self._last_state[car_id]
+        old_x, old_y, old_heading = self._last_state[car_id]
         
-        # Check 1: Teleportation (position jump)
-        self._check_teleportation(car, old_x, old_y, dt)
-        
-        # Check 2: Instant heading change
+        self._check_jump(car, old_x, old_y, dt)
         self._check_heading_snap(car, old_heading)
-        
-        # Check 3: Rotating in place (heading changed but position didn't)
-        self._check_rotation_requires_movement(car, old_x, old_y, old_heading)
-        
-        # Check 4: Off-road
+        self._check_turning_radius(car, old_x, old_y, old_heading)
         self._check_off_road(car, network)
         
-        # Update state
-        self._last_state[car_id] = (car.x, car.y, car.heading, time.time())
+        self._last_state[car_id] = (car.x, car.y, car.heading)
     
-    def _check_teleportation(self, car, old_x: float, old_y: float, dt: float):
-        """Check for impossible position jumps."""
-        dx = car.x - old_x
-        dy = car.y - old_y
-        distance_moved = math.hypot(dx, dy)
-        pppm = config.PIXELS_PER_METER
-        distance_m = distance_moved / pppm
+    def _check_jump(self, car, old_x: float, old_y: float, dt: float):
+        """Impossible position jump."""
+        distance_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
+        max_allowed = car.speed * dt + 0.1 * dt + 0.01
         
-        max_allowed_m = car.speed * dt + 0.1 * dt + 0.01
-        
-        if distance_m > max_allowed_m:
+        if distance_m > max_allowed:
             import traceback
-            error_msg = (
+            msg = (
                 f"\n{'='*70}\n"
-                f"⚠️  TELEPORTATION DETECTED!\n"
+                f"⚠️  IMPOSSIBLE JUMP!\n"
                 f"{'='*70}\n"
-                f"Old position: ({old_x:.1f}, {old_y:.1f})\n"
-                f"New position: ({car.x:.1f}, {car.y:.1f})\n"
-                f"Distance: {distance_m:.1f}m (max allowed: {max_allowed_m:.1f}m)\n"
-                f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
-                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
-                f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"dt: {dt:.4f}s\n"
+                f"Old: ({old_x:.1f}, {old_y:.1f}) → New: ({car.x:.1f}, {car.y:.1f})\n"
+                f"Distance: {distance_m:.1f}m (max: {max_allowed:.1f}m)\n"
+                f"Speed: {car.speed:.1f} m/s | Segment: {car.seg_idx}\n"
                 f"{'='*70}\n"
             )
-            print(error_msg)
+            print(msg)
             traceback.print_stack()
-            raise RuntimeError(error_msg)
+            raise RuntimeError(msg)
     
     def _check_heading_snap(self, car, old_heading: float):
-        """Check for instant heading changes."""
-        heading_diff = abs((car.heading - old_heading + 180) % 360 - 180)
+        """Instant heading change."""
+        diff = abs((car.heading - old_heading + 180) % 360 - 180)
         
-        if heading_diff > 30:
+        if diff > 30:
             import traceback
-            error_msg = (
+            msg = (
                 f"\n{'='*70}\n"
-                f"⚠️  INSTANT HEADING CHANGE DETECTED!\n"
+                f"⚠️  INSTANT HEADING CHANGE!\n"
                 f"{'='*70}\n"
-                f"Old heading: {old_heading:.1f}°\n"
-                f"New heading: {car.heading:.1f}°\n"
-                f"Change: {heading_diff:.1f}° (max allowed: 30°)\n"
-                f"Position: ({car.x:.1f}, {car.y:.1f})\n"
-                f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
-                f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
+                f"{old_heading:.1f}° → {car.heading:.1f}° (Δ{diff:.1f}°)\n"
+                f"Speed: {car.speed:.1f} m/s | Segment: {car.seg_idx}\n"
                 f"{'='*70}\n"
             )
-            print(error_msg)
+            print(msg)
             traceback.print_stack()
-            # Don't raise - just warn for now
     
     def _check_off_road(self, car, network):
-        """Check if car is completely on road."""
+        """Off-road driving."""
         if not car.is_on_road(network):
             import traceback
-            error_msg = (
+            msg = (
                 f"\n{'='*70}\n"
-                f"⚠️  OFF-ROAD DETECTED!\n"
+                f"⚠️  OFF-ROAD!\n"
                 f"{'='*70}\n"
-                f"Position: ({car.x:.1f}, {car.y:.1f})\n"
-                f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
-                f"Heading: {car.heading:.1f}°\n"
-                f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
+                f"({car.x:.1f}, {car.y:.1f}) | Speed: {car.speed:.1f} m/s\n"
+                f"Segment: {car.seg_idx}\n"
                 f"{'='*70}\n"
             )
-            print(error_msg)
+            print(msg)
             traceback.print_stack()
-            # Don't raise - just warn for now
+            self.violations.append({
+                'type': 'off_road',
+                'position': (car.x, car.y),
+                'speed': car.speed,
+                'segment': car.seg_idx,
+            })
     
-    def _check_rotation_requires_movement(self, car, old_x: float, old_y: float, old_heading: float):
-        """Hard invariant: a car cannot change heading without moving a
-        distance PROPORTIONAL to that rotation."""
-        heading_diff_deg = abs((car.heading - old_heading + 180) % 360 - 180)
-        distance_moved_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
+    def _check_turning_radius(self, car, old_x: float, old_y: float, old_heading: float):
+        """Heading change requires proportional movement."""
+        diff_deg = abs((car.heading - old_heading + 180) % 360 - 180)
         
-        if heading_diff_deg <= self.HEADING_EPSILON_DEG:
+        if diff_deg <= self.HEADING_EPSILON_DEG:
             return
         
-        heading_diff_rad = math.radians(heading_diff_deg)
-        implied_radius_m = distance_moved_m / heading_diff_rad
+        dist_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
+        radius_m = dist_m / math.radians(diff_deg)
         
-        if implied_radius_m < self.MIN_REALISTIC_RADIUS_M:
+        if radius_m < self.MIN_REALISTIC_RADIUS_M:
             import traceback
-            error_msg = (
+            msg = (
                 f"\n{'='*70}\n"
-                f"⚠️  ROTATING WITH IMPOSSIBLE TURNING RADIUS!\n"
+                f"⚠️  IMPOSSIBLE TURNING RADIUS!\n"
                 f"{'='*70}\n"
-                f"Heading changed by {heading_diff_deg:.2f}° while moving only "
-                f"{distance_moved_m*1000:.1f}mm.\n"
-                f"Implied turning radius: {implied_radius_m:.3f}m "
-                f"(minimum realistic: {self.MIN_REALISTIC_RADIUS_M}m)\n"
-                f"Old position: ({old_x:.1f}, {old_y:.1f}), heading {old_heading:.1f}°\n"
-                f"New position: ({car.x:.1f}, {car.y:.1f}), heading {car.heading:.1f}°\n"
-                f"Speed: {car.speed:.1f} m/s ({car.speed * 3.6:.0f} km/h)\n"
-                f"Segment: {car.seg_idx}, Progress: {car.progress:.3f}\n"
-                f"Driver: {car.driver.get_name() if car.driver else 'None'}\n"
+                f"Δheading: {diff_deg:.2f}° | Δpos: {dist_m*1000:.1f}mm\n"
+                f"Implied radius: {radius_m:.3f}m (min: {self.MIN_REALISTIC_RADIUS_M}m)\n"
+                f"Segment: {car.seg_idx}\n"
                 f"{'='*70}\n"
             )
-            print(error_msg)
+            print(msg)
             traceback.print_stack()
-            raise RuntimeError(error_msg)
-    
-    def reset_car_state(self, car):
-        """Clear stored state for a car (after manual teleport, etc)."""
-        car_id = id(car)
-        if car_id in self._last_state:
-            del self._last_state[car_id]
-        self.skip_next_frames(car, 5)
+            raise RuntimeError(msg)

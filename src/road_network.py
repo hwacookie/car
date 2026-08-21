@@ -639,29 +639,37 @@ def _line_distance(c1: list, c2: list) -> float:
 
 
 def _build_road_polygons(network: "RoadNetwork"):
-    """Merge connected same-width road segments into continuous lines,
-    round off the CENTERLINE's own corners with a real arc of visible
-    radius at every bend (a plain buffer's 'round join' only curves the
-    outer/convex edge of a bend and leaves the inner edge a perfectly
-    sharp mitre - correct for a generic stroke, but not what an actual
-    paved road corner looks like), and only then buffer the
-    already-smooth line into a fillable polygon. Grouped by (highway
-    type, width) for coloring. Returns a list of
-    (color, [exterior_ring_coords, ...]) - polygon holes are ignored
-    (roads in practice don't produce meaningful ones)."""
+    """Build road polygons from the §10 smoothed geometry (Catmull-Rom
+    splines through the merged lines) instead of direct Shapely buffer
+    on rounded polylines. The spline passes through every original node
+    including degree-2 bends, so sharp zig-zag corners become slightly
+    rounded curves.
+
+    Grouped by (highway type, width) for coloring. Returns a list of
+    (color, [exterior_ring_coords, ...]) - polygon holes are included
+    (e.g. roundabout islands). Junction fillets at degree-3+ nodes are
+    added separately via SmoothedNetwork.junction_fillets."""
     from shapely.geometry import LineString
     from shapely.ops import unary_union
 
     pppm = config.PIXELS_PER_METER
-    groups = _merge_and_round_lines(network)
+    from .smooth_geometry import smoothed_network
+    sm_net = smoothed_network(network)
+
+    # Group lines by (highway, width) — same grouping the old code used.
+    groups: dict[tuple[str, float], list] = {}
+    for line in sm_net.lines:
+        key = (line["highway"], line["width"])
+        groups.setdefault(key, []).append(line["resampled"])
 
     result = []
-    for (highway, width), smooth_lines in groups.items():
+    for (highway, width), all_coords in groups.items():
         half_w_px = (width / 2) * pppm
 
+        # Buffer each line's spline and union them together.
         buffered_parts = []
-        for smooth_coords in smooth_lines:
-            smooth_line = LineString(smooth_coords)
+        for coords in all_coords:
+            smooth_line = LineString(coords)
             buffered_parts.append(
                 smooth_line.buffer(half_w_px, cap_style="round", join_style="round", resolution=8)
             )
@@ -672,7 +680,10 @@ def _build_road_polygons(network: "RoadNetwork"):
         exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors]) for p in polys if not p.is_empty]
         result.append((color, exteriors))
 
-    result.extend(_build_multiway_junction_fillets(network, pppm))
+    # Junction fillets at degree-3+ nodes (same as the old code).
+    corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
+    extras = _build_smoothed_junction_fillets(network, sm_net, pppm, corner_radius_px)
+    result.extend(extras)
     return result
 
 
@@ -743,6 +754,35 @@ def _build_multiway_junction_fillets(network: "RoadNetwork", pppm: float):
             polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]
             exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors]) for p in polys if not p.is_empty]
             extras.append((color, exteriors))
+    return extras
+
+
+def _build_smoothed_junction_fillets(network: "RoadNetwork",
+                                      sm_net: "SmoothedNetwork", pppm: float,
+                                      corner_radius_px: float) -> list:
+    """Build polygon patches for junction corners using the smoothed
+    network's precomputed fillet arcs (tangent-continuous with the
+    Catmull-Rom splines). Same filters and radii as the old
+    _build_multiway_junction_fillets, but reuses SmoothedNetwork's
+    fillet data instead of recomputing."""
+    from shapely.geometry import LineString
+
+    extras = []
+    for fillet in sm_net.junction_fillets:
+        seg_a_id = fillet["seg_a"]
+        arc = fillet["arc"]  # list of (x, y) points
+        if not arc or len(arc) < 2:
+            continue
+        half_w_px = (network.segments[seg_a_id].width / 2) * pppm
+        buffered = LineString(arc).buffer(
+            half_w_px, cap_style="round", join_style="round", resolution=8
+        )
+        color = config.ROAD_TYPES.get(network.segments[seg_a_id].highway,
+                                      {}).get("color", (150, 150, 150))
+        polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]
+        exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors])
+                     for p in polys if not p.is_empty]
+        extras.append((color, exteriors))
     return extras
 
 

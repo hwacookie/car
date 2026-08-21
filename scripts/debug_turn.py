@@ -11,6 +11,8 @@ Usage: .venv/bin/python scripts/debug_turn.py <start_point> <direction> [seconds
 import sys
 import math
 
+import pygame
+
 from src.test_maps import build_basic_test_map
 from src.car import Car
 from src.driver import BicycleDriver
@@ -30,7 +32,6 @@ def main():
     car.progress = 0.0 if fwd else 1.0
     car.forward = fwd
     car.speed = 0.0
-    car._apply_plain_segment_position(network.segments[seg])
     car.bicycle_nav = BicycleNav(car, network)
     car.bicycle_nav.reset()
 
@@ -61,12 +62,30 @@ def main():
     print(f"{'t':>5} {'s':>6} {'v':>6} {'v_tgt':>6} {'delta':>7} {'scale':>6} "
           f"{'hdg':>7} {'seg':>4}  on_road")
 
+    # Mirror the game loop: driver computes controls from (empty) keys, the
+    # "test" merges accelerate=True and - like the real test suite - flicks
+    # the turn blinker once we are within 50 m of the junction.
+    keys = {k: False for k in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT,
+                               pygame.K_RIGHT, pygame.K_a, pygame.K_d,
+                               pygame.K_w, pygame.K_s)}
+    blinker_sent = DIRECTION == "straight"
+
     for frame in range(int(SECONDS * 60)):
-        control = {"accelerate": True}
-        if DIRECTION == "left":
-            control["blinker_left"] = True
-        elif DIRECTION == "right":
-            control["blinker_right"] = True
+        control = car.driver.get_control(car, network, DT, keys)
+        control["accelerate"] = True  # the test holds the gas
+        if not blinker_sent:
+            seg = network.segments[car.seg_idx]
+            dist_junc = ((1.0 - car.progress) if car.forward else car.progress) * seg.length
+            if dist_junc <= 50.0:
+                blinker_sent = True
+                if DIRECTION == "left":
+                    car.driver.pending_turn = "left"
+                    car.driver.blinker_left = True
+                    car.driver.blinker_right = False
+                elif DIRECTION == "right":
+                    car.driver.pending_turn = "right"
+                    car.driver.blinker_right = True
+                    car.driver.blinker_left = False
         car.update(DT, network, control)
 
         if frame % 30 == 0:

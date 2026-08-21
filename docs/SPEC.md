@@ -477,6 +477,34 @@ Only roads with these highway types are loaded:
   - Flash with 0.5s period (on 0.25s, off 0.25s)
   - Left or right depending on signal
 
+## Breadcrumb Trail (Debug Overlay)
+
+Toggleable with the **B** key (see Controls). The trail records the car's
+position and heading every 0.1 s (max 500 points, oldest dropped first).
+
+### Rendering
+
+- **Continuous line**: one continuous line from one recorded position on
+  the road to the next — i.e. a single polyline through all recorded
+  points (no gaps, no discrete arrow shapes).
+- **Paint buckets on the wheels**: at each recorded position, a small
+  filled marker (a "paint bucket") is placed at each of the car's four
+  tire positions — the tire centers from the car sprite
+  (`assets/car_sprite.svg`: front axle 62/200 of the length ahead of
+  center, rear axle 58/200 behind, all tires 36/100 of the width
+  outboard), transformed with the recorded center and heading:
+  - **Front tires** (front-left, front-right): **yellow**
+  - **Rear tires** (rear-left, rear-right): **blue**
+  - Bucket diameter = tire width (~0.2 m) in screen pixels, so each
+    bucket is exactly the contact patch of one tire (scales with zoom,
+    1 px minimum)
+
+  The buckets show the car's actual wheel footprint at each recorded
+  moment, so the width of the swept area is visible at a glance.
+- **Rainbow arrows: removed.** The old chevron ("v") arrows with the
+  50-step violet→red recency gradient (`Renderer._RECENT_RAINBOW`) are
+  no longer drawn.
+
 ## Coordinate System
 
 - **World space**: EPSG:3857 projection (meters)
@@ -587,6 +615,7 @@ car/
 - [x] Speedometer arc (0-180 km/h)
 - [x] Blinker visualization (flashing orange)
 - [x] **Breadcrumb trail** (toggleable with B key)
+- [x] **Breadcrumb trail v2** (continuous line + yellow/blue wheel paint buckets, replaces the rainbow chevron arrows — see "Breadcrumb Trail (Debug Overlay)")
 - [x] Mode indicator (RAILS/FREE)
 
 #### Debugging & Validation
@@ -944,7 +973,7 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ---
 
-**Last Updated**: 2026-08-18  
+**Last Updated**: 2026-08-20  
 **Status**: ✅ Actively maintained - road corner rendering + on-road physics unified and calibrated against real-world turning behavior  
 **Version**: 0.96 (fully playable, comprehensive test suite, professional sprite, REST API, Shapely-based road geometry)  
 **Test Results**: `corner_right_entry` right-turn test passing (smooth arc, stays on road, realistic ~15 km/h corner speed)  

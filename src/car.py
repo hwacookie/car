@@ -200,6 +200,18 @@ class Car:
             self.bicycle_nav.reset()
         self.trail.clear()
 
+    def body_center(self) -> tuple[float, float]:
+        """Geometric centre of the car body, in world pixels.
+
+        self.x / self.y are the REAR AXLE (the bicycle model's pivot), so
+        the body sits config.REAR_AXLE_OFFSET_M ahead of them along the
+        heading. Anything that draws or measures the car's BODY (sprite,
+        four-corner on-road box, blinkers) must use this, not (x, y).
+        """
+        rad = math.radians(self.heading)
+        off = config.REAR_AXLE_OFFSET_M * config.PIXELS_PER_METER
+        return self.x + math.sin(rad) * off, self.y + math.cos(rad) * off
+
     def is_on_road(self, network) -> bool:
         """Check if the car (all four corners, not just its center) is on
         any road.
@@ -208,13 +220,16 @@ class Car:
         four bounding-box corners against the exact same paved-area polygon
         that gets rendered (rounded bends and junction fillets included).
         """
-        return network.is_car_on_road(self.x, self.y, self.heading)
+        bx, by = self.body_center()
+        return network.is_car_on_road(bx, by, self.heading)
     
     # --- Rendering ---
     
     def draw(self, surface: pygame.Surface, camera):
         """Draw the car sprite."""
-        sx, sy = camera.world_to_screen(self.x, self.y)
+        # The sprite is the BODY, which sits ahead of the rear axle that
+        # (self.x, self.y) tracks - see Car.body_center().
+        sx, sy = camera.world_to_screen(*self.body_center())
         sx, sy = int(sx), int(sy)
         scale = camera.zoom
         

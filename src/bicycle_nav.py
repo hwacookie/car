@@ -33,6 +33,7 @@ import math
 
 from . import config
 from .road_network import _round_polyline_corners
+from . import raceline
 
 PPPM = config.PIXELS_PER_METER
 
@@ -255,7 +256,9 @@ class RefLine:
 
     def curvature_at(self, s: float) -> float:
         """Signed curvature (1/m) at arc length s (positive = right turn)."""
-        h = max(1.0, self.total * 0.01)
+        # Fixed physical window - see config.CURVATURE_WINDOW_M. A window
+        # proportional to route length blurs short corners away entirely.
+        h = config.CURVATURE_WINDOW_M
         s1 = max(0.0, s - h)
         s2 = min(self.total, s + h)
         if s2 - s1 < 1e-3:
@@ -264,6 +267,37 @@ class RefLine:
         h2 = math.radians(self.heading_at(s2))
         dh = (h2 - h1 + math.pi) % (2 * math.pi) - math.pi
         return dh / (s2 - s1)
+
+
+def _offset_polyline_right_varying(pts: list[tuple[float, float]],
+                                   offsets_m: list[float]) -> list[tuple[float, float]]:
+    """Offset a polyline to the right by a PER-POINT offset (metres).
+
+    Same tangent averaging as _offset_polyline_right, but each point uses
+    its own offset, so the lane position can vary smoothly along the line
+    (e.g. drift to the outside of an upcoming turn only while approaching).
+    """
+    n = len(pts)
+    if n < 2:
+        return list(pts)
+    out: list[tuple[float, float]] = []
+    for i in range(n):
+        if i == 0:
+            dx, dy = pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]
+        elif i == n - 1:
+            dx, dy = pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]
+        else:
+            dx_in, dy_in = pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]
+            dx_out, dy_out = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
+            lin = math.hypot(dx_in, dy_in) or 1.0
+            lout = math.hypot(dx_out, dy_out) or 1.0
+            dx = dx_in / lin + dx_out / lout
+            dy = dy_in / lin + dy_out / lout
+        length = math.hypot(dx, dy) or 1.0
+        rx, ry = dy / length, -dx / length  # right vector
+        off_px = offsets_m[i] * PPPM
+        out.append((pts[i][0] + rx * off_px, pts[i][1] + ry * off_px))
+    return out
 
 
 def _offset_polyline_right(pts: list[tuple[float, float]], offset_m: float) -> list[tuple[float, float]]:
@@ -340,7 +374,23 @@ class BicycleNav:
     WHEELBASE = 2.7            # m
     CAR_LENGTH_M = 4.5         # m (front bumper to rear bumper)
     MAX_STEER = math.radians(38.0)   # mechanical steering limit
-    A_LAT_MAX = 2.0            # m/s^2 lateral-accel cap (understeer)
+    # Lateral-accel budget. Sets BOTH the cornering speed the profile
+    # plans (v = sqrt(A_LAT_MAX / kappa)) and the understeer cap on the
+    # heading rate, so the car is never handed a speed it cannot hold.
+    # 2.0 was the plan's ultra-cautious "Miss Daisy" value; a real car
+    # taking an ordinary local-road corner at ~17 km/h on a 6 m radius is
+    # pulling 3.7 m/s^2 (0.38 g), so 2.0 made every corner about half the
+    # speed a normal driver uses. Well under the ~8 m/s^2 the tyres could
+    # actually give.
+    A_LAT_MAX = 4.5            # m/s^2 lateral-accel cap (understeer)
+    # The speed profile plans against only a FRACTION of that cap. Planning
+    # at the full value means the heading rate is already saturated at the
+    # apex, leaving the controller no authority to correct with: any
+    # tracking error becomes permanent, and pure pursuit was measured
+    # running ~1 m inside its own reference line through a bend - enough to
+    # put the car's flank over the centreline. The reserve is what lets it
+    # pull back onto the line.
+    A_LAT_PLAN_FRACTION = 0.7
     A_CRUISE = config.CAR_ACCELERATION   # m/s^2 (2.8)
     A_BRAKE = config.CAR_BRAKING         # m/s^2 (10.0)
     V_MAX = config.CAR_SPEED             # m/s (50)
@@ -363,6 +413,7 @@ class BicycleNav:
     # roundabout (verified). (The car's understeer cap, not the radius, is
     # what protects it on tight bends - the speed profile slows it down.)
     CORNER_RADIUS_M = config.ROAD_CORNER_RADIUS_M  # 6.0
+    CORNER_ARC_STEPS = 48      # see _maybe_rebuild: must out-resolve SAMPLE_M
     HORIZON_SEGMENTS = 6     # how many segments ahead to build the route
     # Right-hand-traffic lane offset: the reference line is the road
     # CENTERLINE, but a car drives in its own lane (the right half of a
@@ -373,6 +424,30 @@ class BicycleNav:
     # but the test map's one-way roads are short rings/spokes where a center
     # offset is close enough.)
     LANE_OFFSET_M = 1.75
+    # Half-length of the span around a real junction where the wrong-side
+    # check is suspended (no centreline exists inside an intersection).
+    JUNCTION_SUPPRESS_M = 12.0
+    # When the driver signals a pull-over (right blinker + brake) and the
+    # route ends at a dead end (the destination), the reference line drifts
+    # to the right edge. The blend must FINISH before the car stops
+    # (PARK_BLEND_END_M before the end) so the final stretch is a straight,
+    # parallel line - otherwise the car stops at an angle (the offset line
+    # is angled wherever the offset is still changing). The blend starts
+    # PARK_BLEND_START_M before the end, while the car is still rolling in.
+    PARK_BLEND_START_M = 40.0
+    PARK_BLEND_END_M = 12.0
+    # Pull-out: from right edge into normal lane (symmetric to park).
+    PULL_OUT_START_M = 20.0
+    PULL_OUT_END_M = 5.0
+    # Lookahead (m) used to track the straight edge line in the final
+    # pull-over stretch. Kept short so the car corrects its lateral offset
+    # onto the edge quickly and holds the wheels parallel to the curb before
+    # it stops (a long lookahead aims at the clamped endpoint and freezes
+    # the car a few degrees off parallel, short of the edge).
+    PARK_TRACK_LOOKAHEAD_M = 2.5
+    # Lateral error (m) below which the car is considered "lined up" on the
+    # edge line and the heading is squared up to parallel for the stop.
+    PARK_ALIGN_LATERAL_M = 0.35
 
     def __init__(self, car, network):
         self.car = car
@@ -383,6 +458,7 @@ class BicycleNav:
         self._route_seg_set: set[int] = set()
         self._profile: list[float] = []
         self._s = 0.0
+        self._pull_out_frames = 120  # ~2 seconds at 60fps, then done
         # Cruise at the car's top speed on straights: the car accelerates as
         # far as it can (limited by A_CRUISE / V_MAX) and only brakes when the
         # speed profile requires it (i.e. before a corner). This replaces the
@@ -397,6 +473,20 @@ class BicycleNav:
         if d is not None and hasattr(d, "pending_turn"):
             return d.pending_turn or "straight"
         return "straight"
+
+    def _route_ends_dead_end(self) -> bool:
+        """True if the current route ends at a dead end (the car's
+        destination - there is no road beyond it)."""
+        if not self._route:
+            return False
+        return self.network.node_degree.get(self._route[-1], 0) <= 1
+
+    def distance_to_destination(self):
+        """Distance (m) along the reference line to the end of the route,
+        if the route ends at a dead end (the car's destination); else None."""
+        if self._ref is None or not self._route_ends_dead_end():
+            return None
+        return max(0.0, self._ref.total - self._s)
 
     def _build_route(self) -> list[str]:
         """Build a node route: the node BEHIND the car, then the current
@@ -472,7 +562,7 @@ class BicycleNav:
         # Otherwise: straight continuation (smallest |angle|).
         return min(candidates, key=lambda x: abs(x[1]))[0]
 
-    def _maybe_rebuild(self):
+    def _maybe_rebuild(self, pulling_over: bool = False, pulling_out: bool = False):
         """(Re)build the route + reference line when needed.
 
         The route must stay STABLE while the car follows it. In particular
@@ -487,8 +577,9 @@ class BicycleNav:
         """
         car = self.car
         turn = self._intended_turn()
+        key = (car.seg_idx, turn, pulling_over, pulling_out)
         if self._ref is not None:
-            if self._route_key == (car.seg_idx, turn):
+            if self._route_key == key:
                 # Same segment + same intent: only extend if we've reached
                 # the end of the line.
                 if self._s < self._ref.total - 15.0:
@@ -509,7 +600,15 @@ class BicycleNav:
             route = [seg.start_node, seg.end_node]
         self._route = route
         raw = [self.network.nodes[n] for n in route]
-        rounded = _round_polyline_corners(raw, self.CORNER_RADIUS_M * PPPM)
+        # Round corners far more finely than the renderer does. The line is
+        # resampled every 0.5 m and its curvature read over a 1 m window, so
+        # the arc's own vertices must be much closer than that - at the
+        # default 10 steps a 6 m fillet has ~0.94 m between vertices, and
+        # each one reads as a 9-degree kink over a single 0.5 m sample:
+        # curvature alternates between 0 and 0.31 (an apparent 3.3 m radius)
+        # along an arc that is actually a clean 6 m.
+        rounded = _round_polyline_corners(raw, self.CORNER_RADIUS_M * PPPM,
+                                          arc_steps=self.CORNER_ARC_STEPS)
         # Shift the centerline into the driving lane (right-hand traffic).
         # The offset must be small enough that the car's right side stays on
         # the road for the NARROWEST segment in the route: the car's right
@@ -522,23 +621,116 @@ class BicycleNav:
             (self.network.segments[i].width for i in self._route_segments()),
             default=7.0,
         )
-        lane_offset = min(
-            self.LANE_OFFSET_M,
-            max(0.0, min_width / 2.0 - 0.9 - 0.1),
-        )
-        # For a LEFT turn, the right side of the car is on the OUTSIDE of the
-        # turn. A full lane offset pushes the car to the outside of the turn,
-        # which makes it swing wide. Reduce the offset for left turns so the
-        # car stays closer to the centerline (and the inside of the turn).
-        if turn == "left":
-            lane_offset *= 0.5
-        lane = _offset_polyline_right(rounded, lane_offset)
+        max_offset = config.kerb_offset_m(min_width)
+        base_offset = min(self.LANE_OFFSET_M, max_offset)
+        # The driving line is the FASTEST LEGAL line, not a fixed lane
+        # offset: minimum curvature inside the corridor bounded by the
+        # pavement (never off-road) and the centreline (never on the
+        # oncoming lane). See src/raceline.py. The old left/right
+        # turn_offset constants are gone with it - they picked one lateral
+        # position for the whole turn, in the wrong direction for right
+        # turns, and had to be blended in and out, which is what made the
+        # car S-wobble through bends.
+        P, N, offsets, cum = raceline.solve_line(
+            self.network, rounded, self._route_segments())
+        lane = self._apply_end_blends(P, N, offsets, cum,
+                                      edge_offset=max_offset,
+                                      pulling_over=pulling_over,
+                                      pulling_out=pulling_out)
         self._ref = RefLine(lane)
-        self._route_key = (car.seg_idx, turn)
+        self._route_key = key
         self._route_seg_set = self._route_segments()
         self._profile = self._build_speed_profile()
         # Re-project the car onto the (new) reference line.
         self._s = project_s(self._ref, car.x, car.y, self._s)
+
+    def _apply_end_blends(self, P: list[tuple[float, float]],
+                          N: list[tuple[float, float]],
+                          offsets: list[float],
+                          cum: list[float],
+                          edge_offset: float = 0.0,
+                          pulling_over: bool = False,
+                          pulling_out: bool = False) -> list[tuple[float, float]]:
+        """Lay the manoeuvre blends over the racing line and build the line.
+
+        `offsets` is the fastest legal line from raceline.solve_offsets().
+        Two manoeuvres override it near the route's ends, because they are
+        about where the car STOPS or STARTS rather than how fast it can
+        get round a bend:
+
+          pulling_over - drift to the kerb approaching the destination. The
+              last PARK_BLEND_END_M are a CONSTANT offset so the car comes
+              to rest parallel to the kerb, not at an angle.
+          pulling_out  - the mirror image, leaving the kerb at the start.
+
+        Also records where the route passes through real junctions, which
+        is the only place LaneGuard has to be suppressed (see
+        _in_turn_blend_zone).
+        """
+        offs = list(offsets)
+
+        if pulling_over and edge_offset > 0:
+            s_end = cum[-1]
+            for i, s in enumerate(cum):
+                d = s_end - s
+                if d <= self.PARK_BLEND_END_M:
+                    offs[i] = edge_offset
+                elif d < self.PARK_BLEND_START_M:
+                    t = (self.PARK_BLEND_START_M - d) / \
+                        (self.PARK_BLEND_START_M - self.PARK_BLEND_END_M)
+                    t = t * t * (3.0 - 2.0 * t)
+                    offs[i] += (edge_offset - offs[i]) * t
+
+        if pulling_out and edge_offset > 0:
+            for i, s in enumerate(cum):
+                if s <= self.PULL_OUT_END_M:
+                    offs[i] = edge_offset
+                elif s < self.PULL_OUT_START_M:
+                    t = (s - self.PULL_OUT_END_M) / \
+                        (self.PULL_OUT_START_M - self.PULL_OUT_END_M)
+                    t = t * t * (3.0 - 2.0 * t)
+                    offs[i] = edge_offset + (offs[i] - edge_offset) * t
+
+        self._junction_zones = self._find_junction_zones(P, cum)
+        return raceline.points_from_offsets(P, N, offs)
+
+    def _find_junction_zones(self, rounded, cum) -> list[tuple[float, float]]:
+        """Arc-length spans where the route crosses a real (degree >= 3)
+        junction. Inside a junction there is no meaningful centreline to
+        stay right of, so the wrong-side check cannot apply there. This
+        used to be the whole route, which silently disabled the check
+        everywhere."""
+        zones = []
+        for node in self._route:
+            if self.network.node_degree.get(node, 0) < 3:
+                continue
+            nxy = self.network.nodes.get(node)
+            if nxy is None:
+                continue
+            best_i, best_d2 = 0, float("inf")
+            for i, (x, y) in enumerate(rounded):
+                d2 = (x - nxy[0]) ** 2 + (y - nxy[1]) ** 2
+                if d2 < best_d2:
+                    best_d2, best_i = d2, i
+            s = cum[best_i]
+            zones.append((s - self.JUNCTION_SUPPRESS_M,
+                          s + self.JUNCTION_SUPPRESS_M))
+        return zones
+
+    def _in_turn_blend_zone(self, s):
+        """True where the wrong-side (LaneGuard) check must be suppressed.
+
+        Only inside a real junction, where there is no centreline to stay
+        right of. Previously this covered the ENTIRE route in both
+        branches - a turning route because TURN_OFFSET_FAR_M (300 m)
+        exceeded the route length, and a straight route because the
+        default span was never overwritten - so the wrong-side check never
+        ran at all and rule 2 was completely unenforced.
+        """
+        for a, b in getattr(self, "_junction_zones", ()):
+            if a <= s <= b:
+                return True
+        return False
 
     def _route_segments(self) -> set[int]:
         """Segment indices covered by the current node route."""
@@ -589,10 +781,28 @@ class BicycleNav:
         # faster between kinks and brakes to the ring cap at each kink -
         # physically fine, and verified by the roundabout test.)
         for i in range(n):
-            s = min(ref.total, i)
-            k = abs(ref.curvature_at(s))
+            # Take the WORST curvature within this metre, not the value at
+            # its left edge. The profile is stored per metre but curvature
+            # can peak sharply between samples (a junction fillet is only a
+            # few metres long); sampling one point per metre stepped right
+            # over those peaks and handed the car a corner speed its own
+            # lateral limit forbids, so it understeered wide - off its line
+            # and across the centreline.
+            k = max(abs(ref.curvature_at(min(ref.total, i + f * 0.25)))
+                    for f in range(4))
             if k > 1e-4:
-                profile[i] = min(profile[i], math.sqrt(self.A_LAT_MAX / k))
+                # v = sqrt(a_lat / k), and nothing else. There used to be
+                # two extra clamps for k > 0.05 (a x0.4 penalty on A_LAT_MAX
+                # and a hard 1.2 m/s ceiling) added to suppress
+                # corner-cutting. They took a 6 m fillet from 12.5 km/h down
+                # to 4.3 km/h - about a quarter of the ~17 km/h a real car
+                # takes an ordinary local-road corner at (0.38 g). They
+                # treated the symptom: the car cut corners because of where
+                # its reference line runs, not because the speed formula was
+                # wrong, so capping the speed just made it crawl and cut
+                # corners slowly.
+                profile[i] = min(profile[i], math.sqrt(
+                    self.A_LAT_MAX * self.A_LAT_PLAN_FRACTION / k))
         # Dead end: stop at the end of the route (no road beyond it).
         # The car's CENTER must stop a full car length before the end of
         # the pavement, otherwise the front bumper (and the front corners,
@@ -619,7 +829,22 @@ class BicycleNav:
 
     def update(self, dt: float, control: dict):
         car = self.car
-        self._maybe_rebuild()
+        # Pull-over mode: the driver is braking with the right blinker on
+        # and the route ends at a dead end (the destination). In this mode
+        # the speed profile (not a hard brake) controls the deceleration,
+        # and the reference line is shifted to the right edge near the stop.
+        driver = car.driver
+        pulling_over = (
+            control.get("brake", False)
+            and driver is not None
+            and getattr(driver, "blinker_right", False)
+            and self._route_ends_dead_end()
+        )
+        # Pull-out mode: first ~2 seconds after spawn → max left steer + slow speed
+        pulling_out = (self._pull_out_frames > 0)
+        if pulling_out:
+            self._pull_out_frames -= 1
+        self._maybe_rebuild(pulling_over=pulling_over, pulling_out=pulling_out)
         ref = self._ref
         if ref is None or ref.total < 1e-3:
             return
@@ -632,10 +857,29 @@ class BicycleNav:
         # A SMALL base lookahead is critical for tight corners: if the
         # lookahead point lands beyond the corner (e.g. 10 m ahead on a 9 m
         # 90-degree arc), the car aims past the apex and cuts the corner
-        # (swings wide). A 4 m base keeps the aim point inside the corner
-        # at low speed; the 0.5*speed term still stretches it out on
+        # (swings wide). A 2.5 m base keeps the aim point inside the corner
+        # at low speed; the 0.2*speed term still stretches it out on
         # straights for stability.
-        lookahead = 4.0 + 0.5 * car.speed
+        lookahead = 2.0 + 0.15 * car.speed
+        # Tighten lookahead further in high-curvature zones to prevent
+        # corner-cutting on sharp junction fillets.
+        local_k = abs(ref.curvature_at(self._s))
+        if local_k > 0.05:
+            lookahead = min(lookahead, 0.5)
+        # Pull-over: track the reference line TIGHTLY (short lookahead) for
+        # the whole drift-to-edge maneuver (the blend + the final straight).
+        # The long default lookahead (4 + 0.5*speed, up to ~11 m at cruise)
+        # makes the car cut the drift curve and stay well inside the edge,
+        # and in the final straight it aims at the clamped endpoint (off the
+        # approach path), freezing the heading a few degrees off parallel.
+        # A tight aim point follows the curve to the edge and keeps the
+        # wheels parallel to the curb, like a driver lining up before
+        # pulling in.
+        if pulling_over and (ref.total - self._s) < self.PARK_BLEND_START_M:
+            lookahead = min(lookahead, self.PARK_TRACK_LOOKAHEAD_M)
+        # Pull-out: very short lookahead for sharp left turn into lane.
+        if pulling_out:
+            lookahead = min(lookahead, 1.5)
         tx, ty = ref.point_at(self._s + lookahead)
         dx = (tx - car.x) / PPPM
         dy = (ty - car.y) / PPPM
@@ -647,6 +891,32 @@ class BicycleNav:
         delta = math.atan2(local_right, local_forward)
         delta = max(-self.MAX_STEER, min(self.MAX_STEER, delta))
 
+        # No steering override while pulling out. The reference line
+        # already starts at the kerb and merges into the lane (see
+        # _apply_end_blends), so pure pursuit follows it correctly.
+        # Forcing full left lock here instead ignored the line entirely and
+        # drove the car straight across the centreline into the oncoming
+        # lane - it only looked survivable because the wrong-side check was
+        # suppressed for the whole route.
+
+        # Pull-over final straight, once lined up: straighten the wheels to
+        # the road so the car rests PARALLEL to the curb, not nose-in. The
+        # tight tracking above has converged the car onto the edge line; once
+        # its lateral error is small we stop chasing the (clamped) endpoint
+        # and instead match the local line direction. This is a real turn -
+        # the car is still rolling, and the lateral-accel clamp further down
+        # keeps the implied turning radius above the physical minimum (no
+        # in-place rotation, per the project's physics rule). Gating on the
+        # lateral error (rather than distance) means the car first pulls to
+        # the edge and only then squares up, so it ends both flush and level.
+        if pulling_over and (ref.total - self._s) < self.PARK_BLEND_END_M:
+            ref_x, ref_y = ref.point_at(self._s)
+            lateral_err = math.hypot(car.x - ref_x, car.y - ref_y) / PPPM
+            if lateral_err < self.PARK_ALIGN_LATERAL_M:
+                line_heading = ref.heading_at(self._s)
+                heading_err = (line_heading - car.heading + 180.0) % 360.0 - 180.0
+                delta = max(-self.MAX_STEER, min(self.MAX_STEER, math.radians(heading_err)))
+
         # --- longitudinal: throttle/brake toward the speed profile ---
         # The profile ALREADY encodes the cruising speed on straights and
         # the (much lower) corner speed at bends, with a braking ramp into
@@ -656,8 +926,11 @@ class BicycleNav:
         accel = control.get("accelerate", False)
         brake = control.get("brake", False)
         v_target = self._target_speed(self._s)
-        if brake:
+        if brake and not pulling_over:
             v_target = 0.0
+        # Pull-out: cap speed so curve is visible (~18 km/h, not 80).
+        if pulling_out:
+            v_target = min(v_target, 5.0)
         # No flooring it mid-corner: after the apex the profile jumps back
         # to cruise speed while the car is still rotating (heading lags the
         # reference line). A real driver keeps the throttle off until the
@@ -731,3 +1004,4 @@ class BicycleNav:
         self._route_key = None
         self._profile = []
         self._s = 0.0
+        self._pull_out_frames = 120

@@ -58,6 +58,11 @@ class BicycleDriver(Driver):
     kinematic bicycle model (src/bicycle_nav.py).
     """
 
+    # When approaching the destination (a dead end) within this distance,
+    # signal right and brake - like a real driver pulling over to the right
+    # edge of the road.
+    PARK_DISTANCE_M = 50.0
+
     def __init__(self):
         self.name = "BICYCLE"
         self.pending_turn = None  # "left", "right", or None
@@ -94,6 +99,37 @@ class BicycleDriver(Driver):
         # W/S for speed control (manual override)
         accel = keys[pygame.K_UP] or keys[pygame.K_w]
         brake = keys[pygame.K_DOWN] or keys[pygame.K_s]
+
+        # Parking: when approaching the destination (a dead end) within
+        # PARK_DISTANCE_M, signal right and brake - like a real driver
+        # pulling over to the right edge. The nav interprets brake + right
+        # blinker (route ending at a dead end) as "pull over to the right
+        # edge."
+        nav = car.bicycle_nav
+        dist_dest = nav.distance_to_destination() if nav is not None else None
+        s_pos = nav._s if nav is not None else 0.0
+        pulling_out = nav is not None and nav._pull_out_frames > 0
+        parking = dist_dest is not None and dist_dest <= self.PARK_DISTANCE_M
+        if parking:
+            self.blinker_right = True
+            self.blinker_left = False
+            self.pending_turn = None
+            brake = True
+            accel = False
+        elif pulling_out:
+            # Pulling out from the right edge: signal LEFT (into lane)
+            self.blinker_left = True
+            self.blinker_right = False
+            self.pending_turn = None
+            accel = True
+            brake = False
+        elif self.blinker_right and car.speed < 0.1 and \
+                dist_dest is not None and dist_dest < 1.0:
+            # Stopped at the destination: switch the parking blinker off.
+            self.blinker_right = False
+        elif self.blinker_left and nav is not None and nav._pull_out_frames <= 0:
+            # Finished pulling out into lane: switch left blinker off.
+            self.blinker_left = False
 
         return {
             'accelerate': accel,

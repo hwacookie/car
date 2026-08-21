@@ -211,7 +211,8 @@ class SmoothCurve:
         window. Never a per-sample table (see module docstring)."""
         if self.total <= 0:
             return 0.0
-        h = max(1.0, self.total * 0.01)
+        # Fixed physical window - see config.CURVATURE_WINDOW_M.
+        h = config.CURVATURE_WINDOW_M
         s1 = max(0.0, s - h)
         s2 = min(self.total, s + h)
         if s2 - s1 < 1e-3:
@@ -369,7 +370,15 @@ class SmoothedNetwork:
             for forward in (True, False):
                 a = seg.start_node if forward else seg.end_node
                 b = seg.end_node if forward else seg.start_node
-                pa, pb = network.nodes[a], network.nodes[b]
+                # Fall back to the segment's own endpoints when it carries
+                # no node ids. Networks built directly (unit tests, ad-hoc
+                # fixtures) leave start_node/end_node empty, and looking
+                # those up raised KeyError('') the moment the renderer
+                # started going through SmoothedNetwork.
+                ea = (seg.x1, seg.y1) if forward else (seg.x2, seg.y2)
+                eb = (seg.x2, seg.y2) if forward else (seg.x1, seg.y1)
+                pa = network.nodes.get(a, ea)
+                pb = network.nodes.get(b, eb)
                 hit = None
                 for line in self.lines:
                     cs = line["coords"]

@@ -29,16 +29,17 @@ python -m src.main --map basic --api
 
 ### Headless vs. visible
 
-- For automated/unattended runs (e.g. from an agent or CI), start
-  Pygame with a dummy video driver so no real window is needed:
+- **Default: visible.** Just omit `SDL_VIDEODRIVER` - the game window
+  opens normally and updates in real time while the test script drives
+  it via the API. This is genuinely useful for debugging: you can
+  literally watch the car take a turn while a test script asserts on
+  the exact same state.
+- **Use `SDL_VIDEODRIVER=dummy` ONLY when testing in a build system
+  (CI) or when the user explicitly asks for it.** Do not reach for it
+  by default on a developer machine:
   ```bash
   SDL_VIDEODRIVER=dummy python -m src.main --map basic --api
   ```
-- For watching a run happen live, just omit `SDL_VIDEODRIVER=dummy` -
-  the game window opens normally and updates in real time while the
-  test script drives it via the API. This is genuinely useful for
-  debugging: you can literally watch the car take a turn while a test
-  script asserts on the exact same state.
 
 Either way, the API and test behavior are identical - `SDL_VIDEODRIVER`
 only affects whether Pygame renders to a real window.

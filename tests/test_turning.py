@@ -4,6 +4,7 @@ Comprehensive Turn Testing via REST API
 Tests both left and right turns with detailed monitoring
 """
 
+import os
 import requests
 import time
 import sys
@@ -13,13 +14,16 @@ from datetime import datetime
 from pathlib import Path
 
 
-API_URL = "http://127.0.0.1:5000"  # explicit IPv4: 'localhost' may resolve to ::1, where macOS ControlCenter squats on :5000
+API_URL = os.environ.get("CAR_API_URL", "http://127.0.0.1:5000")  # explicit IPv4: 'localhost' may resolve to ::1, where macOS ControlCenter squats on :5000
 
 # Results are persisted next to this script, keyed by "start_point|direction",
 # so the next run can report whether each scenario passed the last time it ran
 # (and why it failed, if it didn't). See docs/SPEC.md ("Turn Test Output").
 RESULTS_FILE = Path(__file__).resolve().parent / "turning_results.json"
 HISTORY_LIMIT = 500  # cap the per-scenario history so the file can't grow unbounded
+# Signal the turn (blinker) only this many metres before the junction -
+# like a real driver, not the instant the test starts.
+SIGNAL_DISTANCE_M = 50.0
 
 
 # --- Colored console output (auto-disabled when stdout is not a TTY) ---
@@ -38,6 +42,65 @@ def dim(text: str) -> str:    return _c(text, "2")
 
 
 # --- Result persistence (tests/turning_results.json) ---
+
+def select_tests(tests: list) -> list:
+    """Pick which scenarios to run, keeping their ORIGINAL numbering.
+
+        --tests 3              one scenario
+        --tests 3,7,12         several
+        --tests 3-6            an inclusive range
+        --tests tjunction_from_top      every scenario at that start point
+        --failed               whatever failed on the last recorded run
+
+    Returns [(original_index, test), ...] so the printed "TEST 7/18" still
+    identifies the same scenario however the suite is filtered - the point
+    being to jump straight back to one that failed without renumbering it.
+    """
+    numbered = list(enumerate(tests, 1))
+
+    if '--failed' in sys.argv:
+        last = load_results().get('last', {})
+        failed = {k for k, v in last.items() if not v.get('passed')}
+        if not failed:
+            print("--failed: nothing failed on the last run; nothing to do.")
+            return []
+        picked = [(i, t) for i, t in numbered
+                  if f"{t[0]}|{t[1]}" in failed]
+        print(f"--failed: re-running {len(picked)} previously failing "
+              f"scenario(s): {', '.join(sorted(failed))}")
+        return picked
+
+    if '--tests' not in sys.argv:
+        return numbered
+
+    idx = sys.argv.index('--tests')
+    if idx + 1 >= len(sys.argv):
+        print("--tests needs a value, e.g. --tests 3,7-9,tjunction_from_top")
+        sys.exit(2)
+
+    wanted_idx: set[int] = set()
+    wanted_name: set[str] = set()
+    for tok in sys.argv[idx + 1].split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if '-' in tok and all(p.strip().isdigit() for p in tok.split('-', 1)):
+            a, b = (int(p) for p in tok.split('-', 1))
+            wanted_idx.update(range(a, b + 1))
+        elif tok.isdigit():
+            wanted_idx.add(int(tok))
+        else:
+            wanted_name.add(tok)
+
+    picked = [(i, t) for i, t in numbered
+              if i in wanted_idx or t[0] in wanted_name]
+    if not picked:
+        print(f"--tests '{sys.argv[idx + 1]}' matched nothing. Available:")
+        for i, t in numbered:
+            print(f"   {i:>2}  {t[0]} {t[1]}")
+        sys.exit(2)
+    return picked
+
 
 def load_results() -> dict:
     """Load the persisted turn-test results (empty structure if missing/corrupt)."""
@@ -102,7 +165,7 @@ def describe_failure(result: dict) -> str | None:
         return "teleported / unexpected jump detected"
     if result.get("instant_snap_detected"):
         return "instant heading snap (unrealistic rotation)"
-    if result.get("off_road_detected"):
+    if result.get("off_road_detected") or result.get('validator_violations', 0) > 0:
         return "cut the corner and drove off the road"
     if result.get("segment_changed") and not result.get("reached_expected_segment"):
         return (f"took the wrong route (ended on segment {result.get('final_segment')}, "
@@ -206,15 +269,15 @@ class TurnTester:
         """Send control inputs."""
         requests.post(f"{API_URL}/control", json=kwargs)
     
-    def teleport_random(self):
-        """Teleport to random location."""
+    def create_car_at_random(self):
+        """Replace car with a fresh one at random location."""
         requests.post(f"{API_URL}/teleport", json={'random': True})
-        time.sleep(0.3)  # Wait for teleport to complete
-    
-    def teleport_to_start_point(self, name: str):
-        """Teleport to a deterministic named start point (synthetic test maps)."""
+        time.sleep(0.3)
+
+    def create_car_at_start_point(self, name: str):
+        """Replace car with a fresh one at named start point."""
         requests.post(f"{API_URL}/teleport", json={'start_point': name})
-        time.sleep(0.3)  # Wait for teleport to complete
+        time.sleep(0.3)
     
     def set_hud_label(self, text: str | None):
         """Show (or clear) a short text label in the game's HUD."""
@@ -278,7 +341,12 @@ class TurnTester:
             
             if not state['on_road']:
                 details['off_road'] = True
-                details['violation_details'] = {'type': 'off_road', 'position': pos}
+                details['violation_details'] = {
+                    'type': 'off_road', 'position': pos,
+                    'time': time.time() - start_time,
+                    'speed_kmh': state['speed_kmh'],
+                    'heading': state['heading'],
+                }
                 return pos, False, details
             
             now = time.time()
@@ -371,15 +439,15 @@ class TurnTester:
         self.reset_controls()
         requests.post(f"{API_URL}/toggle", json={'breadcrumbs': True})
         
-        # Teleport to a deterministic start point if given, else random location
+        # Create a fresh car at the given start point or a random location
         if start_point:
-            print(f"📍 Teleporting to named start point '{start_point}'...")
-            self.teleport_to_start_point(start_point)
+            print(f"📍 Creating new car at '{start_point}'...")
+            self.create_car_at_start_point(start_point)
             number = START_POINT_NUMBER.get(start_point)
             self.set_hud_label(str(number) if number is not None else start_point)
         else:
-            print("📍 Teleporting to random location...")
-            self.teleport_random()
+            print("📍 Creating new car at random location...")
+            self.create_car_at_random()
             self.set_hud_label(None)
         
         # If the game dies during setup (window closed, or the teleport
@@ -396,13 +464,10 @@ class TurnTester:
             print(f"   Position: ({state['x']:.0f}, {state['y']:.0f})")
             print(f"   Heading: {state['heading']:.1f}°")
             
-            # Accelerate to target speed
+            # Accelerate to target speed (no blinker yet - we signal only
+            # once we are actually close to the junction, like a real driver)
             print(f"🚗 Accelerating to {target_speed:.0f} km/h...")
-            if direction == 'straight':
-                self.send_control(accelerate=True)
-            else:
-                blinker_key = 'blinker_left' if direction == 'left' else 'blinker_right'
-                self.send_control(accelerate=True, **{blinker_key: True})
+            self.send_control(accelerate=True)
             
             # Wait to reach speed
             for _ in range(50):  # 5 seconds max
@@ -412,7 +477,23 @@ class TurnTester:
                 time.sleep(0.1)
             
             print(f"   Reached {state['speed_kmh']:.0f} km/h")
-            print(f"   {direction.upper()} blinker activated")
+            
+            if direction != 'straight':
+                # Wait until we are SIGNAL_DISTANCE_M or less before the
+                # junction, then signal the turn.
+                blinker_key = 'blinker_left' if direction == 'left' else 'blinker_right'
+                dist = state.get('distance_to_junction')
+                for _ in range(100):  # 10 seconds max
+                    if dist is not None and dist <= SIGNAL_DISTANCE_M:
+                        break
+                    state = self.get_state()
+                    dist = state.get('distance_to_junction')
+                    time.sleep(0.1)
+                if dist is not None and dist <= SIGNAL_DISTANCE_M:
+                    self.send_control(**{blinker_key: True})
+                    print(f"   {direction.upper()} blinker activated at {dist:.0f} m before the junction")
+                else:
+                    print(f"   ⚠️  Never got within {SIGNAL_DISTANCE_M:.0f} m of the junction - no blinker sent")
         except requests.exceptions.RequestException as e:
             setup_crashed = True
             initial_segment = -1
@@ -580,8 +661,8 @@ class TurnTester:
                 
                 break
             
-            # Check for off-road violation
-            if not state['on_road']:
+            # Check for off-road violation (live check + validator log)
+            if not state['on_road'] or state.get('validator_violations', 0) > 0:
                 off_road_detected = True
                 violation_details = {
                     'type': 'off_road',
@@ -702,7 +783,21 @@ class TurnTester:
         print(f"   Start: ({initial_pos[0]:.0f}, {initial_pos[1]:.0f}) seg {initial_segment}  "
               f"End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}"
               + (f"  (expected seg {expected_end_segment})" if expected_end_segment is not None else ""))
-        
+
+        # Validator violations (off-road caught between API polls)
+        vv = state.get('validator_violations', 0)
+        if vv > 0:
+            print(red(f"   ⚠️  Validator: {vv} off-road violation(s) logged"))
+
+        # Lane guard stats
+        lg = state.get('lane_guard_stats', {})
+        wrong_frames = lg.get('wrong_side_frames', 0)
+        wrong_secs = lg.get('wrong_side_seconds', 0.0)
+        if wrong_frames > 0:
+            print(red(f"   ⚠️  Wrong-side driving: {wrong_frames} frames ({wrong_secs}s)"))
+        else:
+            print(green("   ✅ Lane guard: no wrong-side driving detected"))
+
         # Colored one-line verdict: green "passed" or red "fail: <reason>".
         reason = describe_failure(result)
         if reason is None:
@@ -903,7 +998,14 @@ class TurnTester:
         print(f"\n📄 Results file: {RESULTS_FILE}")
         print(f"   (each scenario's outcome is saved there; next run shows its last result)")
 
-        for i, test in enumerate(tests, 1):
+        selected = select_tests(tests)
+        if not selected:
+            return
+        if len(selected) != len(tests):
+            print(f"\n▶  Running {len(selected)} of {len(tests)} scenarios: "
+                  f"{', '.join(str(i) for i, _ in selected)}")
+
+        for i, test in selected:
             # User interrupted (Ctrl-C) or closed the game window: stop
             # scheduling more tests now - results so far are already saved.
             if interrupted():
@@ -922,7 +1024,14 @@ class TurnTester:
                                expected_end_segment=expected_end_segment,
                                description=description, results=results)
 
-            if i < len(tests):
+            if '--failfast' in sys.argv and self.test_results and \
+                    not self.test_results[-1]['passed']:
+                print(yellow(
+                    f"\n⏹  --failfast: stopping at the first failure "
+                    f"(test {i}/{len(tests)})."))
+                break
+
+            if (i, test) != selected[-1]:
                 print("\n⏸️  Pausing 1s before next test...")
                 time.sleep(1)
 
@@ -953,14 +1062,19 @@ class TurnTester:
             and not r.get('game_crashed') and not r['segment_changed']
         )
         
+        def line(count, fail_label, pass_label):
+            if count > 0:
+                return f"  ❌ Failed ({fail_label}): {count}"
+            return f"  ✅ Passed: no {pass_label}"
+
         print(f"\nTotal tests: {len(self.test_results)}")
         print(f"  ✅ Passed: {passed}")
-        print(f"  ❌ Failed (off-road): {failed_offroad}")
-        print(f"  ❌ Failed (instant snap): {failed_snap}")
-        print(f"  ❌ Failed (teleport/jump): {failed_teleport}")
-        print(f"  ❌ Failed (game crashed): {failed_crashed}")
-        print(f"  ❌ Failed (wrong end segment): {failed_wrong_route}")
-        print(f"  ⚠️  Timeout (never arrived): {timeout}")
+        print(line(failed_offroad, "off-road", "off-road violations"))
+        print(line(failed_snap, "instant snap", "instant snaps"))
+        print(line(failed_teleport, "teleport/jump", "teleport/jump"))
+        print(line(failed_crashed, "game crashed", "game crashes"))
+        print(line(failed_wrong_route, "wrong end segment", "wrong end segments"))
+        print(line(timeout, "timeout (never arrived)", "timeouts"))
         
         # Show detailed violations
         snap_violations = [r for r in self.test_results if r['instant_snap_detected']]
