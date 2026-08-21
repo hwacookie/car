@@ -165,7 +165,10 @@ def describe_failure(result: dict) -> str | None:
         return "teleported / unexpected jump detected"
     if result.get("instant_snap_detected"):
         return "instant heading snap (unrealistic rotation)"
-    if result.get("off_road_detected") or result.get('validator_violations', 0) > 0:
+    # off_road_detected already accounts for the validator log, measured as
+    # a DELTA over the scenario. Re-testing the cumulative count here would
+    # reintroduce the same latch.
+    if result.get("off_road_detected"):
         return "cut the corner and drove off the road"
     if result.get("segment_changed") and not result.get("reached_expected_segment"):
         return (f"took the wrong route (ended on segment {result.get('final_segment')}, "
@@ -526,6 +529,12 @@ class TurnTester:
         stopped_ok = False
         violation_details = None
         positions = []
+        # Baseline for the cumulative validator log (see the check below).
+        try:
+            violations_at_start = requests.get(
+                f"{API_URL}/state", timeout=2).json().get('validator_violations', 0)
+        except Exception:
+            violations_at_start = 0
         final_pos = initial_pos
         last_heading = initial_heading
         max_heading_change_per_frame = 0.0
@@ -661,8 +670,15 @@ class TurnTester:
                 
                 break
             
-            # Check for off-road violation (live check + validator log)
-            if not state['on_road'] or state.get('validator_violations', 0) > 0:
+            # Check for off-road violation (live check + validator log).
+            # The validator's violation log is CUMULATIVE for the whole game
+            # process and is never cleared, so it must be compared against
+            # its value when this scenario started - not against zero. Doing
+            # the latter latched: one violation anywhere made every later
+            # scenario report off-road at t=0.00s, turning a single real
+            # failure into thirteen false ones.
+            if not state['on_road'] or \
+                    state.get('validator_violations', 0) > violations_at_start:
                 off_road_detected = True
                 violation_details = {
                     'type': 'off_road',

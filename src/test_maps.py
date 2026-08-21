@@ -301,29 +301,6 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("oneway_cross_from_north", "ow_n")
     b.start("oneway_cross_from_south", "ow_s")
 
-    # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
-    # A W-shaped zig-zag road: right-down, left-down, right-down.
-    # With §10 smoothed geometry the sharp kinks at B/C/D become
-    # slightly rounded curves instead of hard 90° corners.
-    # NOTE: offsets must be POSITIVE and inside 0..TILE. Written as
-    # `ox - 250` these landed at x=1750, which is exactly the T-junction
-    # tile's stem - the zig-zag was drawn straight through tile (3,0),
-    # silently wrecking every tjunction_* scenario.
-    ox, oy = origin(4, 0)
-    b.node("www_a", ox +  50, oy + 350)   # start, top-left
-    b.node("www_b", ox + 130, oy +  60)   # V bottom
-    b.node("www_c", ox + 210, oy + 350)   # peak
-    b.node("www_d", ox + 290, oy +  60)   # V bottom
-    b.node("www_e", ox + 370, oy + 350)   # peak
-    b.node("www_f", ox + 450, oy +  60)   # end, bottom-right
-    b.road("www_a", "www_b")
-    b.road("www_b", "www_c")
-    b.road("www_c", "www_d")
-    b.road("www_d", "www_e")
-    b.road("www_e", "www_f")
-    b.start("www_entry", "www_a")
-    b.start("www_exit", "www_f")
-
     # --- Tile (3,1): S-curve (gentle degree-2 bends) ---
     ox, oy = origin(3, 1)
     b.node("s_p0", ox + 100, oy + 400)
@@ -437,6 +414,29 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("sliver_approach", "sliv_ap")   # spawn on the sliver, heading for the junction
     b.start("sliver_from_west", "sliv_w")   # spawn on the sharp-right exit
     b.start("sliver_from_east", "sliv_e")   # spawn on the sharp-left exit
+
+    # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
+    # A W-shaped zig-zag road: right-down, left-down, right-down.
+    # With §10 smoothed geometry the sharp kinks at B/C/D become
+    # slightly rounded curves instead of hard 90° corners.
+    # NOTE: offsets must be POSITIVE and inside 0..TILE. Written as
+    # `ox - 250` these landed at x=1750, which is exactly the T-junction
+    # tile's stem - the zig-zag was drawn straight through tile (3,0),
+    # silently wrecking every tjunction_* scenario.
+    ox, oy = origin(4, 0)
+    b.node("www_a", ox +  50, oy + 350)   # start, top-left
+    b.node("www_b", ox + 130, oy +  60)   # V bottom
+    b.node("www_c", ox + 210, oy + 350)   # peak
+    b.node("www_d", ox + 290, oy +  60)   # V bottom
+    b.node("www_e", ox + 370, oy + 350)   # peak
+    b.node("www_f", ox + 450, oy +  60)   # end, bottom-right
+    b.road("www_a", "www_b")
+    b.road("www_b", "www_c")
+    b.road("www_c", "www_d")
+    b.road("www_d", "www_e")
+    b.road("www_e", "www_f")
+    b.start("www_entry", "www_a")
+    b.start("www_exit", "www_f")
 
     return b.build()
 
