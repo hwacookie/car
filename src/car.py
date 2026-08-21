@@ -14,9 +14,18 @@ class Car:
     
     # Class variable: cached sprite images
     _sprite_cache = {}
+
+    # Monotonic per-instance identity. NOT id(): CPython reuses addresses,
+    # so a freshly created Car can land on the freed address of the one it
+    # replaced. Anything keying per-car state on id() then applies the dead
+    # car's state to the new one - the physics validator did exactly that
+    # and reported the new car's spawn as a 4.8 m jump at 0 m/s.
+    _next_uid = 0
     
     def __init__(self, x: float, y: float, heading: float, seg_idx: int, driver=None):
         """x, y in world pixels. heading in degrees (0 = up/north)."""
+        Car._next_uid += 1
+        self.uid = Car._next_uid
         # Position and orientation
         self.x = x
         self.y = y

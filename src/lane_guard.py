@@ -49,7 +49,7 @@ class LaneGuard:
             return False
         
         offset_m = self._lateral_offset(car, seg, network)
-        car_id = id(car)
+        car_id = getattr(car, "uid", id(car))
 
         # If distance to centerline < half car width (0.9m), the left edge
         # crosses into the opposing lane.
@@ -118,7 +118,7 @@ class LaneGuard:
     
     def reset(self, car):
         """Clear stored state after teleport."""
-        car_id = id(car)
+        car_id = getattr(car, "uid", id(car))
         self._last_offset.pop(car_id, None)
     
     def stats(self) -> dict:

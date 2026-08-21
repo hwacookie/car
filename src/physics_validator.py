@@ -40,7 +40,7 @@ class PhysicsValidator:
         if not self.enabled:
             return
         
-        car_id = id(car)
+        car_id = getattr(car, "uid", id(car))
         
         if car_id not in self._last_state:
             self._last_state[car_id] = (car.x, car.y, car.heading)

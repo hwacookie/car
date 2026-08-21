@@ -37,6 +37,10 @@ from . import raceline
 
 PPPM = config.PIXELS_PER_METER
 
+# How much closer an off-route segment must be before it displaces the
+# route we are actually following (see BicycleNav._sync_segment).
+ROUTE_STICKINESS_PX = 3.0 * PPPM
+
 
 # ======================================================================
 # Smoothed geometry (centripetal Catmull-Rom, arc-length parameterized)
@@ -427,6 +431,10 @@ class BicycleNav:
     # Half-length of the span around a real junction where the wrong-side
     # check is suspended (no centreline exists inside an intersection).
     JUNCTION_SUPPRESS_M = 12.0
+    # How far over the planned corner speed the car may be and still be
+    # considered able to make the turn (the profile is sampled per metre,
+    # so a little slack avoids rejecting turns on rounding alone).
+    REACHABLE_SPEED_TOLERANCE = 1.15
     # When the driver signals a pull-over (right blinker + brake) and the
     # route ends at a dead end (the destination), the reference line drifts
     # to the right edge. The blend must FINISH before the car stops
@@ -643,6 +651,79 @@ class BicycleNav:
         self._profile = self._build_speed_profile()
         # Re-project the car onto the (new) reference line.
         self._s = project_s(self._ref, car.x, car.y, self._s)
+
+        # Is the signalled turn actually still REACHABLE from here?
+        #
+        # docs/TURN_REWORK_PLAN.md 2.5: the blinker means "turn this way at
+        # the next decision point where it is still physically reachable",
+        # not "turn here whatever happens". The speed profile already
+        # encodes that: its braking pass guarantees the profile can be
+        # followed from any point where the car is at or below it. So if we
+        # are ALREADY faster than the profile allows at our own position,
+        # no amount of braking gets us round the corner - the turn is out
+        # of reach.
+        #
+        # Without this the route was rebuilt to take the turn regardless.
+        # The car could not physically make it, understeered across the
+        # junction and left the road - which is precisely the failure 2.5
+        # describes, and it must instead SLIDE PAST and try again at the
+        # next junction (the blinker stays on).
+        if turn != "straight" and self._profile:
+            v_allowed = self._target_speed(self._s)
+            if car.speed > v_allowed * self.REACHABLE_SPEED_TOLERANCE:
+                self._rebuild_straight_past(pulling_over, pulling_out)
+
+    def _rebuild_straight_past(self, pulling_over: bool, pulling_out: bool):
+        """Re-plan through the upcoming junction WITHOUT the signalled turn.
+
+        The blinker deliberately stays on: the intent is not cancelled, it
+        is deferred to the next junction where the turn is reachable.
+        """
+        car = self.car
+        saved = self._route
+        route = self._build_route_straight()
+        if len(route) < 2 or route == saved:
+            return
+        self._route = route
+        raw = [self.network.nodes[n] for n in route]
+        rounded = _round_polyline_corners(raw, self.CORNER_RADIUS_M * PPPM,
+                                          arc_steps=self.CORNER_ARC_STEPS)
+        min_width = min(
+            (self.network.segments[i].width for i in self._route_segments()),
+            default=7.0,
+        )
+        P, N, offsets, cum = raceline.solve_line(
+            self.network, rounded, self._route_segments())
+        lane = self._apply_end_blends(P, N, offsets, cum,
+                                      edge_offset=config.kerb_offset_m(min_width),
+                                      pulling_over=pulling_over,
+                                      pulling_out=pulling_out)
+        self._ref = RefLine(lane)
+        self._route_seg_set = self._route_segments()
+        self._profile = self._build_speed_profile()
+        self._s = project_s(self._ref, car.x, car.y, self._s)
+
+    def _build_route_straight(self) -> list[str]:
+        """_build_route(), but taking the straight continuation at the first
+        junction instead of the signalled turn."""
+        net = self.network
+        car = self.car
+        seg = net.segments[car.seg_idx]
+        junction = seg.end_node if car.forward else seg.start_node
+        behind = seg.start_node if car.forward else seg.end_node
+        route = [behind]
+        cur_seg, cur_node = car.seg_idx, junction
+        for hop in range(self.HORIZON_SEGMENTS + 1):
+            route.append(cur_node)
+            nxt = (net.choose_next_segment(cur_seg, cur_node, "straight")
+                   if hop == 0 else
+                   self._next_after_first(cur_seg, cur_node, "straight"))
+            if nxt is None or nxt == cur_seg:
+                break
+            nseg = net.segments[nxt]
+            cur_node = nseg.end_node if nseg.start_node == cur_node else nseg.start_node
+            cur_seg = nxt
+        return route
 
     def _apply_end_blends(self, P: list[tuple[float, float]],
                           N: list[tuple[float, float]],
@@ -974,6 +1055,8 @@ class BicycleNav:
         best_seg = car.seg_idx
         best_dist = float("inf")
         best_t = car.progress
+        # Track the nearest segment that is on our ROUTE separately.
+        route_seg, route_dist, route_t = None, float("inf"), car.progress
         for idx, seg in enumerate(net.segments):
             dx = seg.x2 - seg.x1
             dy = seg.y2 - seg.y1
@@ -988,6 +1071,21 @@ class BicycleNav:
                 best_dist = dist
                 best_seg = idx
                 best_t = t
+            if idx in self._route_seg_set and dist < route_dist:
+                route_dist = dist
+                route_seg = idx
+                route_t = t
+        # Prefer the route when it is a near-tie. At a fork the branches are
+        # nearly equidistant, so plain nearest-segment can pick the one we
+        # are NOT taking - and because leaving the route set triggers a
+        # rebuild, that mis-assignment re-plans the car onto the wrong
+        # branch and yanks the reference line out from under it. Measured on
+        # the Y-junction: 1.3 m before the node the car flipped to the far
+        # fork and was off the road 0.5 s later. We know which way we intend
+        # to go; a couple of centimetres of projection noise should not
+        # overrule it.
+        if route_seg is not None and route_dist <= best_dist + ROUTE_STICKINESS_PX:
+            best_seg, best_t = route_seg, route_t
         car.seg_idx = best_seg
         car.progress = best_t
         seg = net.segments[best_seg]
