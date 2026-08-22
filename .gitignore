@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 *.osm
 *.pkl
+tests/turning_results.json
 .env
 .DS_Store

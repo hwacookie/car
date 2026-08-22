@@ -3,37 +3,12 @@
 
 from __future__ import annotations
 
-import colorsys
 import math
 import pygame
 
 from . import config
 from .road_network import RoadNetwork
 from .camera import Camera
-
-
-def make_grass_background(w: int, h: int, tile_size: int = 32) -> pygame.Surface:
-    """Pre-render a tiled grass texture for the screen background, modeled
-    on the RQ 31 reference SVG: base #4c702e with sparse lighter grass
-    strokes (#6f963f) and a couple of small lighter/darker dots. Built
-    once and blitted as the full background each frame - static, since
-    the pattern is uniform and doesn't need to follow the camera."""
-    tile = pygame.Surface((tile_size, tile_size), pygame.SRCALPHA)
-    tile.fill((76, 112, 46, 255))                        # #4c702e base
-    stroke = (111, 150, 63, 140)                          # #6f963f @ ~55%
-    for (x1, y1, x2, y2) in (
-        (2, 8, 7, 5), (17, 5, 21, 11), (25, 25, 31, 21),
-        (5, 27, 8, 20), (20, 18, 28, 20),
-    ):
-        pygame.draw.line(tile, stroke, (x1, y1), (x2, y2), 1)
-    pygame.draw.circle(tile, (120, 158, 72, 153), (10, 17), 2)  # #789e48 @ 60%
-    pygame.draw.circle(tile, (54, 86, 37, 153), (28, 8), 1)     # #365625 @ 60%
-
-    bg = pygame.Surface((w, h))
-    for ty in range(0, h, tile_size):
-        for tx in range(0, w, tile_size):
-            bg.blit(tile, (tx, ty))
-    return bg
 
 
 class Renderer:
@@ -82,7 +57,8 @@ class Renderer:
 
     def draw(self, surface: pygame.Surface, car):
         self.draw_roads(surface)
-        self.draw_trail(surface, car)  # Draw breadcrumb trail
+        # Trail is drawn AFTER the car sprite (see main.py) so buckets
+        # are visible at the car's edges rather than hidden underneath.
         self.draw_minimap(surface, car)
         self.draw_hud(surface, car)
     # --- Roads ---
@@ -248,70 +224,74 @@ class Renderer:
                 pygame.draw.line(surface, (*color, alpha), (ax, ay), (bx, by), line_w)
 
     # --- Breadcrumb Trail ---
-    # Fixed rainbow gradient (oldest -> newest) applied to the most recent
-    # N breadcrumb arrows, so the direction of travel *and* recency are
-    # both visible at a glance. Older arrows fall back to plain white.
-    # Generated once as a smooth 50-step violet -> red gradient (hue
-    # sweeping from ~300 deg down to 0 deg in HSV space).
-    _RECENT_RAINBOW = [
-        tuple(int(c * 255) for c in colorsys.hsv_to_rgb(
-            (300 - 300 * i / 49) / 360.0, 1.0, 1.0
-        ))
-        for i in range(50)
-    ]  # 50 steps, index 0 = violet (oldest of the batch) -> index -1 = red (most recent)
-    
+    # Paint bucket colors: small filled markers placed at each of the
+    # car's four corners for every recorded trail point. Front buckets
+    # are yellow, rear buckets are blue, so the swept footprint (and its
+    # width) is visible at a glance. The bucket diameter equals the tire
+    # width (~0.2 m), so each bucket is exactly the contact patch of one
+    # tire.
+    _BUCKET_FL = (255, 80, 80)       # red     — front left
+    _BUCKET_FR = (80, 255, 80)       # green   — front right
+    _BUCKET_RL = (80, 140, 255)      # blue    — rear left
+    _BUCKET_RR = (255, 220, 0)       # yellow  — rear right
+    # Buckets sit on the car's side edges (not beyond the body) and are
+    # this far in from the front / rear edges.
+    _BUCKET_INSET_M = 0.5            # m from front/rear edge
+
     def draw_trail(self, surface: pygame.Surface, car):
-        """Draw the breadcrumb trail: small chevron ("v") arrows showing
-        the car's heading at each recorded point, instead of plain dots.
-        
-        The most recent N points are colored with a fixed rainbow
-        sequence (oldest-of-the-recent-batch -> violet, most recent ->
-        red); everything older is drawn plain white.
+        """Draw the breadcrumb trail: one continuous polyline through all
+        recorded positions (no gaps, no discrete arrow shapes), plus a
+        small filled "paint bucket" at each of the car's four corners
+        for every recorded point. The buckets are placed on the car's
+        side edges (_BUCKET_INSET_M in from the front and rear edges),
+        transformed with the recorded center and heading: each tire has
+        its own color (FL=red, FR=green, RL=blue, RR=yellow).
         """
-        if not hasattr(car, 'trail') or len(car.trail) < 2:
+        trail = getattr(car, 'trail', None)
+        if not trail or len(trail) < 2:
             return
-        
-        zoom = self.camera.zoom
+
         pppm = config.PIXELS_PER_METER
-        arrow_len = 6 * zoom    # length of each arrow leg (screen px)
-        # Half-width matches the car's own half-width, so the trail
-        # visually represents the car's actual footprint at each point.
-        arrow_half_w = (config.CAR_WIDTH / 2) * pppm * zoom
-        
-        n = len(car.trail)
-        n_recent = len(self._RECENT_RAINBOW)
-        
-        for i, point in enumerate(car.trail):
-            # Trail points are (x, y, heading); tolerate old (x, y) tuples too
-            if len(point) == 3:
-                wx, wy, heading = point
-            else:
-                wx, wy = point
-                heading = 0.0
-            
-            sx, sy = self.camera.world_to_screen(wx, wy)
+        # Trail points record the REAR AXLE (Car.x/y = the bicycle model's
+        # pivot), so the rear tyres sit ON the recorded point and the front
+        # tyres one wheelbase ahead of it. Offsetting the rear tyres
+        # backwards from it (as this used to do) draws them behind the real
+        # pivot, where they visibly swing OUT of every turn.
+        front_px = config.SPRITE_WHEELBASE_M * pppm
+        out_px = config.TIRE_OUTBOARD_M * pppm
+
+        # Screen position + heading for every recorded point. Trail
+        # points are (x, y, heading); tolerate old (x, y) tuples too.
+        points = []
+        for point in trail:
+            wx, wy = point[0], point[1]
+            heading = point[2] if len(point) >= 3 else 0.0
+            points.append((wx, wy, heading))
+
+        # Collect screen-space tire tracks for each of the four wheels
+        fl_track = []  # front-left (red)
+        fr_track = []  # front-right (green)
+        rl_track = []  # rear-left (blue)
+        rr_track = []  # rear-right (yellow)
+        for wx, wy, heading in points:
             rad = math.radians(heading)
-            
-            # Forward direction (matches car movement convention: heading
-            # 0 = screen "up"/away from viewer along +y world axis)
-            fx, fy = math.sin(rad), -math.cos(rad)
-            # Perpendicular (for the two chevron legs)
-            px, py = -fy, fx
-            
-            tip_x, tip_y = sx + fx * arrow_len, sy + fy * arrow_len
-            back_x, back_y = sx - fx * arrow_len, sy - fy * arrow_len
-            left_x, left_y = back_x + px * arrow_half_w, back_y + py * arrow_half_w
-            right_x, right_y = back_x - px * arrow_half_w, back_y - py * arrow_half_w
-            
-            # Index from the end: 0 = most recent (last appended)
-            age = n - 1 - i
-            if age < n_recent:
-                color = self._RECENT_RAINBOW[n_recent - 1 - age]
-            else:
-                color = (255, 255, 255)
-            
-            pygame.draw.line(surface, color, (left_x, left_y), (tip_x, tip_y), 2)
-            pygame.draw.line(surface, color, (right_x, right_y), (tip_x, tip_y), 2)
+            fx, fy = math.sin(rad), math.cos(rad)    # forward
+            rx, ry = math.cos(rad), -math.sin(rad)   # right
+            fl_track.append(self.camera.world_to_screen(
+                wx + front_px * fx - out_px * rx,
+                wy + front_px * fy - out_px * ry))
+            fr_track.append(self.camera.world_to_screen(
+                wx + front_px * fx + out_px * rx,
+                wy + front_px * fy + out_px * ry))
+            rl_track.append(self.camera.world_to_screen(
+                wx - out_px * rx, wy - out_px * ry))
+            rr_track.append(self.camera.world_to_screen(
+                wx + out_px * rx, wy + out_px * ry))
+
+        # Draw one continuous line per tire track
+        for track, color in ((fl_track, self._BUCKET_FL), (fr_track, self._BUCKET_FR),
+                             (rl_track, self._BUCKET_RL), (rr_track, self._BUCKET_RR)):
+            pygame.draw.lines(surface, color, False, [tuple(int(c) for c in p) for p in track], 2)
 
     # --- HUD / Dashboard ---
     def _hud_text(self, key: str, text: str, size: int, color: tuple[int, int, int]) -> pygame.Surface:
@@ -357,7 +337,7 @@ class Renderer:
 
         # Mode indicator (top)
         driver_name = car.driver.get_name() if car.driver else "NONE"
-        mode_color = (0, 200, 100) if driver_name == "RAILS" else (100, 150, 255)
+        mode_color = (0, 200, 100) if driver_name == "BICYCLE" else (100, 150, 255)
 
         surface.blit(self._hud_text("mode", driver_name, 20, mode_color), (panel_x + 10, panel_y + 5))
         surface.blit(self._hud_text("tab", "(TAB)", 12, (100, 100, 100)), (panel_x + 120, panel_y + 8))
@@ -393,7 +373,7 @@ class Renderer:
 
         # Indicators: Brake (red), Accel (green), Blinkers (orange)
         # Driver may expose braking/accelerating flags directly (Car) or
-        # blinker state indirectly (via car.driver for AIDriver).
+        # blinker state indirectly (via car.driver for BicycleDriver).
         indicator_y = panel_y + 15
         driver = getattr(car, 'driver', None)
         blinker_left = getattr(driver, 'blinker_left', False)

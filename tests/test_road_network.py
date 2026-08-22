@@ -84,7 +84,7 @@ class TestRoadNetwork(unittest.TestCase):
 
     def test_random_road_point_returns_valid(self):
         """Random point should always be on road."""
-        x, y, _ = self.network.random_road_point()
+        x, y, _heading, _seg_idx, _node_id = self.network.random_road_point()
         self.assertTrue(self.network.is_on_road(x, y))
 
 

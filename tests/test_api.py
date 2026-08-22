@@ -9,7 +9,7 @@ import time
 import sys
 
 
-API_URL = "http://localhost:5000"
+API_URL = "http://127.0.0.1:5000"  # explicit IPv4: 'localhost' may resolve to ::1, where macOS ControlCenter squats on :5000
 
 
 def test_health():

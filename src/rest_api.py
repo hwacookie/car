@@ -105,7 +105,7 @@ class GameAPI:
             Body: {
                 "breadcrumbs": bool,
                 "validator": bool,
-                "mode": "rails" | "free"
+                "mode": "bicycle" | "free"
             }
             """
             data = request.get_json()
@@ -181,6 +181,13 @@ class GameAPI:
         """Get current control inputs (called from game loop)."""
         with self.lock:
             return self.control_input.copy()
+    
+    def clear_control(self, key: str):
+        """Clear a single control flag (one-shot semantics, e.g. a blinker
+        that was applied and should not re-trigger on the next frame)."""
+        with self.lock:
+            if key in self.control_input:
+                self.control_input[key] = False
     
     def get_commands(self) -> Dict[str, Any]:
         """Get and clear pending commands (called from game loop)."""

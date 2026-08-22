@@ -34,8 +34,9 @@ Main Game Loop (src/main.py)
   ├─ Car (physics, state)
   │   ├─ Driver (control interface)
   │   │   ├─ KeyboardDriver (FREE mode)
-  │   │   └─ AIDriver (RAILS mode)
-  │   └─ TurningSystem (arc geometry)
+  │   │   └─ BicycleDriver (intent: gas / brake / blinker)
+  │   └─ BicycleNav (kinematic bicycle model + pure pursuit)
+  │       └─ raceline (corridor + minimum-curvature line)
   ├─ PhysicsValidator (constraint checking)
   └─ GameAPI (REST server, optional)
 
@@ -45,7 +46,8 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 **Separation of Concerns:**
 - **Car**: Pure physics and state (no input handling)
 - **Driver**: Control logic (keyboard or AI)
-- **TurningSystem**: Geometry calculations (arc planning)
+- **BicycleNav**: Kinematic bicycle model, reference line, speed profile
+- **raceline**: The driving line as a constrained optimisation (see below)
 - **PhysicsValidator**: Constraint validation (teleportation, snaps, off-road)
 - **GameAPI**: Remote control interface (optional, thread-safe)
 
@@ -108,7 +110,9 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
   - Blinker only turns off when **actually turned** in that direction (not at every junction)
   - Automatic braking before sharp curves (physics-based braking distance)
   - "Rechts vor links" logic: only brakes at junctions with roads from the right
-  - Dead ends: car turns 180° and stops
+  - Dead ends / route end: car eases to the **right edge** of the road (as far
+    right as possible without leaving the paved area) and stops there (see
+    "Route-End / Dead-End Approach (Right Edge)")
   - Smooth segment transitions (no teleportation)
 
 ### Mode Switching
@@ -159,24 +163,82 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 
 **Note**: This is a **design constraint** for the turning system (how we calculate turns), NOT a validation check. External forces (collisions, explosions) CAN exceed this limit—that's physically possible!
 
-**Target speed per turn severity** (`TurningSystem.decide_target_speed_for_turn`),
-calibrated against real-world guidance for turning a small car (~5.5m
-wall-to-wall turning circle) through an intersection:
+**Cornering speed is not a table.** It follows from the geometry of the
+line the car is actually driving:
 
-| Turn angle | Target speed | Notes |
-|------------|---------------|-------|
-| ≥ 90° (right angle or sharper) | ~15 km/h | Matches real-world guidance for a tight right-angle corner (roughly 10-15 km/h, tighter still without swinging wide) |
-| ≥ 60° | ~25 km/h | |
-| ≥ 30° | ~45 km/h | |
-| < 30° | cruise speed | Gentle enough that no dedicated slow-down is needed |
+```
+v(s) = sqrt( A_LAT_MAX * A_LAT_PLAN_FRACTION / kappa(s) )
+```
 
-This used to target ~40 km/h for a 90° corner, which would need a ~25m
-turning radius — wildly more than an ordinary street corner's curb
-radius provides. That mismatch forced the planner to fall back through
-several slower/lane-shifted attempts and could still end up visibly
-cutting across into the centerline/opposing lane just to make the
-(too-large) arc geometrically fit. At the corrected ~15 km/h target, the
-arc fits comfortably within the car's own lane.
+There is no per-turn-angle lookup and no special case for tight corners.
+An earlier version had both, plus a hard 1.2 m/s ceiling for
+`kappa > 0.05`. Together those drove a 6 m junction fillet at **4.3 km/h**,
+about a quarter of the ~17 km/h a real car takes an ordinary local-road
+corner at (0.38 g, measured). They were treating a symptom: the car cut
+corners because of where its reference line ran, not because the speed
+formula was wrong, so capping the speed only made it cut them slowly.
+
+Two things make the formula trustworthy:
+
+- **Curvature is measured over a fixed 1 m window** (`CURVATURE_WINDOW_M`),
+  never a fraction of route length. A window proportional to the route was
+  4.94 m on a 494 m route - wider than half a 9.4 m fillet - which smeared a
+  4.25 m lane radius into a reported 6.30 m. The profile then handed the car
+  a speed needing 2.96 m/s2 against a 2.0 limit, so it could not hold its
+  own reference line and understeered wide out of every bend.
+- **The profile plans against only 70 % of the limit**
+  (`A_LAT_PLAN_FRACTION`). Planning at the full value saturates the heading
+  rate at the apex and leaves the controller no authority to correct with;
+  the reserve is what lets it pull back onto the line.
+
+#### The Driving Line (`src/raceline.py`)
+
+The car does not follow a fixed lane offset. The line is the solution to
+the driving rules, stated as an optimisation:
+
+| rule | how it is enforced |
+|------|--------------------|
+| 1. never leave the pavement | upper corridor bound: the paved polygon eroded by half the car's width plus `ROAD_EDGE_TOLERANCE_M` (so corner rounding is respected automatically) |
+| 2. never enter the oncoming lane | lower corridor bound: `CAR_WIDTH/2 + LANE_CENTRE_MARGIN_M` right of the centreline; lifted on one-way carriageways |
+| 3. be as fast as possible | the objective - since `v = sqrt(a_lat/kappa)`, fastest means straightest, so minimise curvature |
+| 4. use a racing line | not a feature; it is what (3) produces |
+
+Rules 1 and 2 are **hard bounds**, so they cannot be traded away for
+speed: a legal line is guaranteed by construction rather than detected
+afterwards by a validator.
+
+The classic outside-apex-outside line is encoded nowhere. It emerges: on
+a right-hand bend the solver drives the offset to the centreline side on
+entry, to the kerb at the apex, and back out on exit - and mirrors itself
+for a left-hander.
+
+**Why an optimiser and not a formula.** Offsetting a path laterally by
+`o(s)` changes its curvature by roughly `-o''`, so a local "swing out,
+cut in" bump buys radius at the apex and pays for it with sharper
+curvature on both shoulders - measured, the net line was 2-4x *tighter*.
+The gain only appears when the whole approach and exit reshape together,
+which is what the optimiser does and a bump function cannot.
+
+Minimising `sum(kappa^2)` subject to box bounds gives normal equations
+that are pentadiagonal, so a banded solve handles a 500-station route in
+about 20 ms.
+
+#### Junction Centre: the White Dot
+
+The renderer paints a white dot at every node of degree >= 3. Going
+straight or turning **right**, that dot must stay on the car's **left** -
+this is just keep-right restated at the one place the centreline stops
+existing.
+
+Turning **left** it must not. StVO 9(4) makes *voreinander* the default:
+opposing left-turners pass in front of one another, each turning before
+the centre, which puts the dot on their **right**. *Umeinander* (around
+the centre) is the exception, not the rule.
+
+This matters concretely: constraining left turns to keep the dot on the
+left leaves only lines tighter than the car's 3.46 m minimum turning
+radius (measured 1.5 m), i.e. the constraint was simply wrong for that
+manoeuvre.
 
 #### On-Road Check: Single Source of Truth
 
@@ -196,8 +258,8 @@ This is now unified:
   included).
 - `RoadNetwork.is_on_road(x, y)` and `Car.is_on_road()` (which now just
   delegates to it) both test against this polygon.
-- `TurningSystem.validate_arc_on_road()` also tests candidate arcs
-  against this same polygon.
+- `raceline.legal_corridor()` derives the driving corridor from the
+  same polygon, so the line cannot be planned off the pavement.
 - All three share one tolerance constant, `config.ROAD_EDGE_TOLERANCE_M`
   (0.5m), instead of the planner silently allowing more slack than the
   live check honored (which used to cause plans that passed validation
@@ -266,6 +328,51 @@ if cannot_brake_in_time():
 - Blinker stays on
 - Car continues on current road (follows "straight")
 - Will attempt turn at next junction if blinker still active
+
+### Route-End / Dead-End Approach (Right Edge)
+
+**Goal**: When the car reaches the **end of its route** — a genuine dead end
+where no road continues beyond the node — it must **not** drift toward the
+centerline (the old behavior). Instead it pulls over to the **right edge** of
+the road, as far right as possible, and stops there, like a real driver
+parking at the end of a street.
+
+**Why not the centerline here?** At an ordinary junction the lane offset is
+blended down to the centerline because both adjacent segments share the exact
+node point there, so the segment hand-off has no lateral jump. At a genuine
+dead end there is **no** hand-off to a continuing segment — the car simply
+stops — so there is no reason to be on the centerline. The natural, expected
+position is the right curb.
+
+**Target position (right edge, not off-road)**:
+- The car's lateral offset is driven toward the **rightmost drivable position**:
+  the right road edge minus half the car width, minus the shared safety slack
+  `config.ROAD_EDGE_TOLERANCE_M` (0.5 m), so all four tires stay fully on the
+  paved area.
+- "As far right as possible" is bounded by the actual road geometry (the
+  Shapely paved polygon), never by a fixed fraction of the road width — a
+  narrow service road and a wide primary both end at their own right edge.
+- The final position must pass the same on-road check as everywhere else
+  (`RoadNetwork.is_on_road` / the shared paved polygon). The car must **never
+  leave the road** to reach the edge.
+
+**How the approach is executed (physically plausible)**:
+- The move to the right edge is a **smooth, distance-based ease** over the
+  final stretch before the dead end (the same ~20 m approach window used for
+  the centerline blend), **not** a lateral snap or teleport. Lateral velocity
+  stays within what the car can actually achieve at its current speed.
+- The right-edge blend **replaces** the centerline approach blend only for a
+  **genuine dead end** (no continuing segment). At any junction that *does*
+  hand off to a next segment (executed arc, slide-past, or near-straight
+  continuation) the centerline blend is unchanged, because that hand-off
+  still needs the shared node point to avoid a lateral jump.
+- Braking to the stop is unchanged (physics-based braking distance + 5 m
+  safety margin); only the *lateral* target changes from centerline to right
+  edge.
+- After stopping at the right edge, the existing dead-end turnaround (180°
+  heading flip, small fixed nudge back onto the road, blinkers cleared) still
+  applies if the route is to be retraced — the nudge preserves the right-edge
+  side the car arrived on.
 
 ### Turning
 - **FREE mode**: Turn rate depends on speed (slower at high speed)
@@ -430,6 +537,34 @@ Only roads with these highway types are loaded:
   - Flash with 0.5s period (on 0.25s, off 0.25s)
   - Left or right depending on signal
 
+## Breadcrumb Trail (Debug Overlay)
+
+Toggleable with the **B** key (see Controls). The trail records the car's
+position and heading every 0.1 s (max 500 points, oldest dropped first).
+
+### Rendering
+
+- **Continuous line**: one continuous line from one recorded position on
+  the road to the next — i.e. a single polyline through all recorded
+  points (no gaps, no discrete arrow shapes).
+- **Paint buckets on the wheels**: at each recorded position, a small
+  filled marker (a "paint bucket") is placed at each of the car's four
+  tire positions — the tire centers from the car sprite
+  (`assets/car_sprite.svg`: front axle 62/200 of the length ahead of
+  center, rear axle 58/200 behind, all tires 36/100 of the width
+  outboard), transformed with the recorded center and heading:
+  - **Front tires** (front-left, front-right): **yellow**
+  - **Rear tires** (rear-left, rear-right): **blue**
+  - Bucket diameter = tire width (~0.2 m) in screen pixels, so each
+    bucket is exactly the contact patch of one tire (scales with zoom,
+    1 px minimum)
+
+  The buckets show the car's actual wheel footprint at each recorded
+  moment, so the width of the swept area is visible at a glance.
+- **Rainbow arrows: removed.** The old chevron ("v") arrows with the
+  50-step violet→red recency gradient (`Renderer._RECENT_RAINBOW`) are
+  no longer drawn.
+
 ## Coordinate System
 
 - **World space**: EPSG:3857 projection (meters)
@@ -531,7 +666,7 @@ car/
 - [x] "Rechts vor links" junction logic
 - [x] Dead-end handling (180° turn)
 - [x] Off-road detection (FREE mode)
-- [x] **TurningSystem class** (circular arc physics - in development)
+- [x] **raceline module** (driving line as constrained optimisation)
 
 #### Visual & UI
 - [x] **Professional SVG car sprite** (windows, mirrors, wheels)
@@ -540,6 +675,7 @@ car/
 - [x] Speedometer arc (0-180 km/h)
 - [x] Blinker visualization (flashing orange)
 - [x] **Breadcrumb trail** (toggleable with B key)
+- [x] **Breadcrumb trail v2** (continuous line + yellow/blue wheel paint buckets, replaces the rainbow chevron arrows — see "Breadcrumb Trail (Debug Overlay)")
 - [x] Mode indicator (RAILS/FREE)
 
 #### Debugging & Validation
@@ -583,6 +719,10 @@ car/
 - **Pygame PNG support missing**: Worked around with PIL image loading
 
 ### 🔮 Future Enhancements
+- **Route-end / dead-end right-edge approach** (spec'd, not yet implemented): at a
+  genuine dead end the car eases to the rightmost drivable position (right edge
+  minus half car width minus `ROAD_EDGE_TOLERANCE_M`) and stops there instead of
+  blending to the centerline — see "Route-End / Dead-End Approach (Right Edge)"
 - Multiple AI cars (infrastructure ready - Driver class supports it)
 - Building footprints from OSM `building` polygons
 - Road surface textures (asphalt, cobblestone)
@@ -628,33 +768,88 @@ Tests:
 
 ### Comprehensive Turn Tests
 ```bash
-# Terminal 1: Start game with API
-python -m src.main --api
+# Terminal 1: Start game with API (synthetic test map)
+python -m src.main --map basic --api
 
 # Terminal 2: Run turn tests
 python tests/test_turning.py
 ```
 
-Tests 6 scenarios:
-1. RIGHT turn @ 30 km/h
-2. LEFT turn @ 30 km/h
-3. RIGHT turn @ 50 km/h
-4. LEFT turn @ 50 km/h
-5. RIGHT turn @ 80 km/h
-6. LEFT turn @ 80 km/h
-
-Each test:
-- Teleports to random location
+The default mode runs the **deterministic suite**: 18 named scenarios on the
+synthetic `basic` test map (90° corners, T-junction, Y-intersection, 4-way
+crossroads, one-way street, S-curve, hairpin, sweeping curve, roundabout,
+sliver junction). Each test:
+- Teleports to a KNOWN start point (exact position + heading)
 - Accelerates to target speed
-- Activates turn signal
-- Monitors every frame for:
-  * Off-road violations
-  * Instant heading snaps (>30°)
-  * Smooth circular arc progression
-- Captures screenshot on violation
-- Reports detailed metrics
+- Activates the turn signal (or none, for `straight`)
+- Monitors every ~50 ms for: off-road violations, instant heading snaps
+  (>30° per frame), teleports/unexpected jumps, and arrival at the exact
+  expected end segment (then drives to the segment's far end and stops)
+- Captures a screenshot on violation
 
-**Current Results**: 5/6 pass, 1/6 fail (instant snap detected)
+`--random` instead teleports to random locations on whatever map is loaded
+(works with real OSM data too); `--only <start_point> <direction> <speed>`
+runs a single scenario for fast debugging.
+
+#### Turn Test Output
+
+Each scenario prints, at the start:
+- **What is running** — a one-line human description, e.g.
+  `🧪 Test: Following a zig-zag S-curve road`
+- **Last run** — whether this exact scenario passed the previous time it ran
+  (`Yes - passed (...)`), or not, with the human-readable failure reason, e.g.
+  `No - cut the corner and drove off the road (2026-08-18T12:00:00)`.
+  First-ever runs show `never run before`.
+
+At the end, a colored verdict:
+- green `✅ PASSED`
+- red `❌ FAIL: <reason>` — e.g. `cut the corner and drove off the road`,
+  `took the wrong route (ended on segment 13, expected 14)`,
+  `game process ended mid-test (window closed or physics watchdog crash)`.
+
+Colors are ANSI and auto-disabled when stdout is not a TTY (e.g. when the
+output is redirected to a file).
+
+#### Results File (`tests/turning_results.json`)
+
+Every scenario result is saved to `tests/turning_results.json` (next to the
+test script) immediately after the scenario finishes, so a run that is
+interrupted mid-way never loses completed results. Structure:
+
+```json
+{
+  "updated": "2026-08-18T12:00:00",
+  "last": {
+    "s_curve|straight": {
+      "passed": false,
+      "reason": "took the wrong route (ended on segment 19, expected 20)",
+      "timestamp": "2026-08-18T12:00:00",
+      "final_segment": 19,
+      "expected_end_segment": 20
+    }
+  },
+  "history": [ { "scenario": "s_curve|straight", "passed": false, "...": "..." } ]
+}
+```
+
+- `last` is keyed by `"<start_point>|<direction>"` and is what the next run
+  reads for the "Last run" line.
+- `history` keeps the most recent 500 entries (capped).
+- Random-location runs have no stable scenario key and are not persisted.
+
+#### Interruption Handling (Ctrl-C / Window Closed)
+
+The test script detects user interruption and stops cleanly instead of
+falling through all remaining scenarios with connection errors:
+- **Ctrl-C** — a SIGINT handler sets a flag and prints a notice; the suite
+  finishes the in-flight scenario, saves results, and exits with code 130.
+- **Game window closed** — the game process dies, so the API stops answering;
+  the in-flight scenario records `game process ended mid-test`, and the suite
+  detects the dead API between scenarios and stops scheduling new tests.
+
+Either way, all completed scenario results are already saved to
+`tests/turning_results.json` (each scenario is persisted as soon as it
+finishes), and the exit code is 130 (conventional "terminated by signal").
 
 ### REST API Endpoints
 
@@ -838,7 +1033,7 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ---
 
-**Last Updated**: 2026-01-15  
+**Last Updated**: 2026-08-20  
 **Status**: ✅ Actively maintained - road corner rendering + on-road physics unified and calibrated against real-world turning behavior  
 **Version**: 0.96 (fully playable, comprehensive test suite, professional sprite, REST API, Shapely-based road geometry)  
 **Test Results**: `corner_right_entry` right-turn test passing (smooth arc, stays on road, realistic ~15 km/h corner speed)  

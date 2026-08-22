@@ -1,0 +1,6 @@
+Lass uns mal definieren, was Parken eigentlich bedeutet.Das Parkmanöver wird eingeleitet dadurch, dass ich den Blinker nach rechts schalte und meine Geschwindigkeit verringere beziehungsweise Bremse. Wenn ich circa fünf bis zehn KMH erreicht habe, dann verschwenke ich leicht nach rechts und gleich anschließend wieder nach links, so dass meine Räder möglichst nah am Straßenrand, aber parallel zu der zum Straßenverlauf zum Stehen kommen. Anschließend schalte ich dann den Blinker aus.
+
+Haben wir eigentlich in unserer Dokumentation oder in der Spezifikation noch mehr stellen, wo wir irgendwelche Farmmanöver beschreiben. Es wäre vielleicht sinnvoll, wenn wir die alle versuchen, in einem Dokument zusammenzufassen.
+
+
+noch mehr:

@@ -297,6 +297,34 @@ class RoadNetwork:
         tolerance_px = config.ROAD_EDGE_TOLERANCE_M * config.PIXELS_PER_METER
         return self.get_paved_polygon().distance(Point(wx, wy)) <= tolerance_px
 
+    def is_car_on_road(self, wx: float, wy: float, heading_deg: float,
+                       length_m: float = 4.5, width_m: float = 1.8) -> bool:
+        """Check if a 4-wheel car (not just its center point) is on the road.
+
+        A bicycle-style check (center point only) lets the car's body/wheels
+        overhang the road edge without being detected. This checks all FOUR
+        CORNERS of the car's bounding box against the same paved polygon, so
+        any wheel leaving the road is flagged. The corners are computed from
+        the car's center, heading, length and width (north-up frame: heading
+        0 = north, forward = (sin h, cos h), right = (cos h, -sin h)).
+        """
+        from shapely.geometry import Point
+        tolerance_px = config.ROAD_EDGE_TOLERANCE_M * config.PIXELS_PER_METER
+        h = math.radians(heading_deg)
+        fx, fy = math.sin(h), math.cos(h)   # forward
+        rx, ry = math.cos(h), -math.sin(h)  # right
+        pppm = config.PIXELS_PER_METER
+        half_l = (length_m / 2.0) * pppm
+        half_w = (width_m / 2.0) * pppm
+        poly = self.get_paved_polygon()
+        for sfx in (1.0, -1.0):
+            for srx in (1.0, -1.0):
+                cx = wx + (sfx * fx * half_l + srx * rx * half_w)
+                cy = wy + (sfx * fy * half_l + srx * ry * half_w)
+                if poly.distance(Point(cx, cy)) > tolerance_px:
+                    return False
+        return True
+
     def _old_is_on_road(self, wx: float, wy: float) -> bool:
         pppm = config.PIXELS_PER_METER
         for seg in self.segments:
@@ -611,29 +639,37 @@ def _line_distance(c1: list, c2: list) -> float:
 
 
 def _build_road_polygons(network: "RoadNetwork"):
-    """Merge connected same-width road segments into continuous lines,
-    round off the CENTERLINE's own corners with a real arc of visible
-    radius at every bend (a plain buffer's 'round join' only curves the
-    outer/convex edge of a bend and leaves the inner edge a perfectly
-    sharp mitre - correct for a generic stroke, but not what an actual
-    paved road corner looks like), and only then buffer the
-    already-smooth line into a fillable polygon. Grouped by (highway
-    type, width) for coloring. Returns a list of
-    (color, [exterior_ring_coords, ...]) - polygon holes are ignored
-    (roads in practice don't produce meaningful ones)."""
+    """Build road polygons from the §10 smoothed geometry (Catmull-Rom
+    splines through the merged lines) instead of direct Shapely buffer
+    on rounded polylines. The spline passes through every original node
+    including degree-2 bends, so sharp zig-zag corners become slightly
+    rounded curves.
+
+    Grouped by (highway type, width) for coloring. Returns a list of
+    (color, [exterior_ring_coords, ...]) - polygon holes are included
+    (e.g. roundabout islands). Junction fillets at degree-3+ nodes are
+    added separately via SmoothedNetwork.junction_fillets."""
     from shapely.geometry import LineString
     from shapely.ops import unary_union
 
     pppm = config.PIXELS_PER_METER
-    groups = _merge_and_round_lines(network)
+    from .smooth_geometry import smoothed_network
+    sm_net = smoothed_network(network)
+
+    # Group lines by (highway, width) — same grouping the old code used.
+    groups: dict[tuple[str, float], list] = {}
+    for line in sm_net.lines:
+        key = (line["highway"], line["width"])
+        groups.setdefault(key, []).append(line["resampled"])
 
     result = []
-    for (highway, width), smooth_lines in groups.items():
+    for (highway, width), all_coords in groups.items():
         half_w_px = (width / 2) * pppm
 
+        # Buffer each line's spline and union them together.
         buffered_parts = []
-        for smooth_coords in smooth_lines:
-            smooth_line = LineString(smooth_coords)
+        for coords in all_coords:
+            smooth_line = LineString(coords)
             buffered_parts.append(
                 smooth_line.buffer(half_w_px, cap_style="round", join_style="round", resolution=8)
             )
@@ -644,7 +680,10 @@ def _build_road_polygons(network: "RoadNetwork"):
         exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors]) for p in polys if not p.is_empty]
         result.append((color, exteriors))
 
-    result.extend(_build_multiway_junction_fillets(network, pppm))
+    # Junction fillets at degree-3+ nodes (same as the old code).
+    corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
+    extras = _build_smoothed_junction_fillets(network, sm_net, pppm, corner_radius_px)
+    result.extend(extras)
     return result
 
 
@@ -718,13 +757,90 @@ def _build_multiway_junction_fillets(network: "RoadNetwork", pppm: float):
     return extras
 
 
-def _round_polyline_corners(coords, radius, arc_steps=10):
+def _build_smoothed_junction_fillets(network: "RoadNetwork",
+                                      sm_net: "SmoothedNetwork", pppm: float,
+                                      corner_radius_px: float) -> list:
+    """Build polygon patches for junction corners using the smoothed
+    network's precomputed fillet arcs (tangent-continuous with the
+    Catmull-Rom splines). Same filters and radii as the old
+    _build_multiway_junction_fillets, but reuses SmoothedNetwork's
+    fillet data instead of recomputing."""
+    from shapely.geometry import LineString
+
+    extras = []
+    for fillet in sm_net.junction_fillets:
+        seg_a_id = fillet["seg_a"]
+        arc = fillet["arc"]  # list of (x, y) points
+        if not arc or len(arc) < 2:
+            continue
+        half_w_px = (network.segments[seg_a_id].width / 2) * pppm
+        buffered = LineString(arc).buffer(
+            half_w_px, cap_style="round", join_style="round", resolution=8
+        )
+        color = config.ROAD_TYPES.get(network.segments[seg_a_id].highway,
+                                      {}).get("color", (150, 150, 150))
+        polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]
+        exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors])
+                     for p in polys if not p.is_empty]
+        extras.append((color, exteriors))
+    return extras
+
+
+def _corner_tangent_budget(coords, radius):
+    """Per-vertex tangent-distance allowance, sharing each edge between the
+    two corners that use it in proportion to what they actually need.
+
+    The simple rule - give every corner half of each adjoining edge - is
+    safe but badly over-conservative when a corner's neighbour needs little
+    or nothing. On the sliver junction the 4.22 m approach ends at a dead
+    end, so the corner at the junction is the ONLY claimant, yet the half
+    rule still handed it 2.11 m: a 2.06 m fillet radius, well inside the
+    car's 3.46 m minimum turning radius, i.e. a reference line no car could
+    follow. Sharing proportionally gives it the whole edge and a 4.11 m
+    radius, which is drivable.
+    """
+    n = len(coords)
+    want = [0.0] * n
+    for i in range(1, n - 1):
+        ax, ay = coords[i - 1][0] - coords[i][0], coords[i - 1][1] - coords[i][1]
+        bx, by = coords[i + 1][0] - coords[i][0], coords[i + 1][1] - coords[i][1]
+        la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+        if la < 1e-9 or lb < 1e-9:
+            continue
+        dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+        gap = math.acos(dot)
+        if gap < 1e-6 or gap > math.pi - 1e-6:
+            continue
+        want[i] = radius / math.tan(gap / 2)
+
+    budget = [float("inf")] * n
+    for i in range(n - 1):
+        Le = math.hypot(coords[i + 1][0] - coords[i][0],
+                        coords[i + 1][1] - coords[i][1])
+        d1, d2 = want[i], want[i + 1]
+        if d1 + d2 > Le and (d1 + d2) > 1e-9:
+            scale = Le / (d1 + d2)
+            d1, d2 = d1 * scale, d2 * scale
+        budget[i] = min(budget[i], d1 if d1 > 0 else float("inf"))
+        budget[i + 1] = min(budget[i + 1], d2 if d2 > 0 else float("inf"))
+    return budget
+
+
+def _round_polyline_corners(coords, radius, arc_steps=10, fit_edges=False):
     """Replace every interior vertex of a polyline with a circular arc
     of the given radius, tangent to both adjoining edges - i.e. actually
     round the line's own corners, not just its eventual stroke outline.
-    Endpoints are left untouched."""
+    Endpoints are left untouched.
+
+    fit_edges: share each edge between its two corners in proportion to
+    demand (see _corner_tangent_budget) instead of giving each half. Used
+    for the driving line, where an over-tight fillet is not merely ugly but
+    unfollowable. Rendering keeps the half rule so road shapes are
+    unchanged.
+    """
     if len(coords) < 3 or radius <= 0:
         return coords
+    budget = _corner_tangent_budget(coords, radius) if fit_edges else None
 
     result = [coords[0]]
     for i in range(1, len(coords) - 1):
@@ -754,7 +870,10 @@ def _round_polyline_corners(coords, radius, arc_steps=10):
         tangent_dist = radius / math.tan(half_gap)
         # Cap the tangent distance so it never eats more than half of
         # either adjoining edge (avoids self-overlap on short segments).
-        tangent_dist = min(tangent_dist, a_len / 2, b_len / 2)
+        if budget is not None:
+            tangent_dist = min(tangent_dist, budget[i])
+        else:
+            tangent_dist = min(tangent_dist, a_len / 2, b_len / 2)
         actual_radius = tangent_dist * math.tan(half_gap)
 
         center_dist = actual_radius / math.sin(half_gap)

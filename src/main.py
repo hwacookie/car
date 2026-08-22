@@ -10,10 +10,11 @@ from .config import *
 from .osm_loader import fetch_osm_data
 from .road_network import RoadNetwork
 from .camera import Camera
-from .renderer import Renderer, make_grass_background
+from .renderer import Renderer
 from .car import Car
-from .driver import Driver, KeyboardDriver, AIDriver
+from .driver import Driver, KeyboardDriver, BicycleDriver
 from .physics_validator import PhysicsValidator
+from .lane_guard import LaneGuard
 from .rest_api import GameAPI
 from .test_maps import build_test_map, TEST_MAPS
 
@@ -47,6 +48,12 @@ def copy_screenshot_to_clipboard(screen: pygame.Surface) -> None:
         print(f"📷 Screenshot saved to {path} (clipboard copy only supported on macOS)")
 
 
+def _distance_to_junction(car, network) -> float:
+    """Metres from the car to the junction it is heading toward (for the API)."""
+    seg = network.segments[car.seg_idx]
+    return ((1.0 - car.progress) if car.forward else car.progress) * seg.length
+
+
 def main(smoke_test_frames: int = 0):
     """Run the game. If smoke_test_frames > 0, run headless for that many frames."""
     # --- Init ---
@@ -54,8 +61,6 @@ def main(smoke_test_frames: int = 0):
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
     pygame.display.set_caption("Car Game — Kleinmachnow")
     clock = pygame.time.Clock()
-    # Tiled grass texture for the background (built once, blitted per frame)
-    grass_bg = make_grass_background(WINDOW_WIDTH, WINDOW_HEIGHT)
 
     # macOS: bring the window to the foreground (it may open behind the terminal
     # or on another Space/display)
@@ -87,32 +92,86 @@ def main(smoke_test_frames: int = 0):
         # --- Build network ---
         network = RoadNetwork.from_osm_data(osm_data, bb["north"], bb["south"], bb["west"], bb["east"])
 
-    # --- Car with AI driver on random road ---
-    rx, ry, rh, seg_idx, node_id = network.random_road_point()
-    driver = AIDriver()  # Start in RAILS mode
-    car = Car(rx, ry, rh, seg_idx, driver)
-    car.progress = 0.5
-    # Apply the normal right-lane offset immediately (matching what
-    # continuous driving would show), instead of leaving the car exactly
-    # on the raw centerline - otherwise the very first physics frame
-    # "snaps" it sideways into its lane, which the (correctly strict)
-    # teleportation watchdog flags as a real jump. Same fix as
-    # Car.teleport_random()/teleport_to_named_point().
-    _spawn_seg = network.segments[seg_idx]
-    _spawn_dx, _spawn_dy = _spawn_seg.x2 - _spawn_seg.x1, _spawn_seg.y2 - _spawn_seg.y1
-    _spawn_seg_heading = math.degrees(math.atan2(_spawn_dx, _spawn_dy))
-    car.forward = abs((rh - _spawn_seg_heading + 180) % 360 - 180) < 90
-    car._apply_plain_segment_position(_spawn_seg)
+    def _create_car(start_point=None):
+        """Create a fresh Car at a random road point or named start.
+
+        Places the car flush against the right kerb (right-hand traffic)
+        and a short way INTO the segment, never exactly on the node - a
+        node sits in the middle of the junction rounding, where the lane
+        geometry is ambiguous and the reference line is still curving.
+        """
+        if start_point:
+            rx, ry, rh, seg_idx, fwd = network.get_start_point(start_point)
+        else:
+            rx, ry, rh, seg_idx, _ = network.random_road_point()
+
+        _seg = network.segments[seg_idx]
+        rad = math.radians(rh)
+
+        # Sit at the kerb. Shared with BicycleNav's pull-over / pull-out
+        # target via config.kerb_offset_m() so the two cannot drift apart.
+        # (The lateral offset is the same for every point on the car's
+        # centreline, so offsetting the rear axle offsets the whole flank.)
+        offset_m = kerb_offset_m(_seg.width)
+        rx += math.cos(rad) * offset_m * PIXELS_PER_METER
+        ry -= math.sin(rad) * offset_m * PIXELS_PER_METER
+
+        # Advance a fraction of the way in, so short segments work too.
+        progress0 = SPAWN_PROGRESS if start_point else 0.5
+        if start_point:
+            advance_m = progress0 * _seg.length
+            rx += math.sin(rad) * advance_m * PIXELS_PER_METER
+            ry += math.cos(rad) * advance_m * PIXELS_PER_METER
+
+        car = Car(rx, ry, rh, seg_idx, BicycleDriver())
+        # progress runs start_node -> end_node, so a car travelling
+        # backwards along the segment starts near 1.0, not near 0.0.
+        car.progress = (progress0 if fwd else 1.0 - progress0) if start_point else 0.5
+        car.forward = fwd if start_point else None
+        if not start_point:
+            _dx, _dy = _seg.x2 - _seg.x1, _seg.y2 - _seg.y1
+            _seg_h = math.degrees(math.atan2(_dx, _dy))
+            car.forward = abs((rh - _seg_h + 180) % 360 - 180) < 90
+        # Breadcrumbs on from the start: the tyre tracks are the main way
+        # to see what the car actually did on its way here.
+        car.trail_enabled = True
+        return car
+
+    # --- Car with AI driver ---
+    # Prefer a deterministic spawn: a random road point means every run
+    # starts somewhere different, so nothing before the first teleport is
+    # reproducible (and a crash on startup is a different crash each time).
+    # --start <name> picks a named point; otherwise take the first one the
+    # map defines, falling back to random only for maps with none (real OSM).
+    start_name = None
+    if "--start" in sys.argv:
+        idx = sys.argv.index("--start")
+        if idx + 1 < len(sys.argv):
+            start_name = sys.argv[idx + 1]
+    if start_name is None and network.start_points:
+        start_name = sorted(network.start_points)[0]
+    car = _create_car(start_name)
+    if start_name:
+        print(f"Spawn: '{start_name}' (deterministic; --start <name> to change)")
+    print("Navigation model: BICYCLE (kinematic, free particle)")
     
     # --- Physics validator (can be toggled with V key) ---
     validator = PhysicsValidator(enabled=True)
     print("Physics validator: ENABLED (press V to toggle)")
     
+    # --- Lane guard (wrong-side detection, softer than validator) ---
+    lane_guard = LaneGuard(enabled=True)
+    lenient = "--lenient" in sys.argv
+    print(f"Lane guard: ENABLED{' (lenient - wrong-side warns, does not stop)' if lenient else ''}")
+    
     # --- REST API (optional, enable with --api flag) ---
     api = None
     if "--api" in sys.argv:
+        api_port = 5000
+        if "--port" in sys.argv:
+            api_port = int(sys.argv[sys.argv.index("--port") + 1])
         api = GameAPI()
-        api.start(port=5000)
+        api.start(port=api_port)
         # Publish named start points (synthetic test maps only; empty for OSM data)
         api.update_state({
             'start_points': {
@@ -139,6 +198,7 @@ def main(smoke_test_frames: int = 0):
     # --- Game loop ---
     frame = 0
     running = True
+    frozen = False
     dt_fixed = 1 / 60
     while running:
         frame += 1
@@ -147,6 +207,12 @@ def main(smoke_test_frames: int = 0):
             break
 
         dt = clock.tick(60) / 1000.0 if not smoke_test_frames else dt_fixed
+        # Clamp the physics step. If a frame stalls (route rebuild, GC, the
+        # window being dragged), the real elapsed time can be hundreds of
+        # milliseconds; integrating that in one go teleports the car metres
+        # downroad, straight through any geometry in between. Better to run
+        # briefly in slow motion than to take an unphysical leap.
+        dt = min(dt, 1.0 / 30.0)
 
         # Events
         for event in pygame.event.get():
@@ -173,10 +239,10 @@ def main(smoke_test_frames: int = 0):
         if keys[pygame.K_TAB] and not hasattr(main, '_last_tab'):
             main._last_tab = False
         if keys[pygame.K_TAB] and not main._last_tab:
-            if isinstance(car.driver, AIDriver):
+            if isinstance(car.driver, BicycleDriver):
                 car.driver = KeyboardDriver()
             else:
-                car.driver = AIDriver()
+                car.driver = BicycleDriver()
                 car.snap_to_road(network)
                 car.target_speed = car.speed
             print(f"Driving mode: {car.driver.get_name()}")
@@ -190,13 +256,14 @@ def main(smoke_test_frames: int = 0):
             print(f"Breadcrumb trail: {'ON' if car.trail_enabled else 'OFF'}")
         main._last_b = keys[pygame.K_b]
         
-        # Random location with R
+        # Random location with R (destroy old car, create new one)
         if keys[pygame.K_r] and not hasattr(main, '_last_r'):
             main._last_r = False
         if keys[pygame.K_r] and not main._last_r:
-            car.teleport_random(network)
-            validator.reset_car_state(car)
-            print(f"\n🎲 Random location: Segment {car.seg_idx}, Pos ({car.x:.0f}, {car.y:.0f})\n")
+            car = _create_car()
+            camera.snap_to(car.x, car.y, network.world_width, network.world_height)
+            print(f"\n🎲 New car at segment {car.seg_idx}, "
+                  f"Pos ({car.x:.0f}, {car.y:.0f})\n")
         main._last_r = keys[pygame.K_r]
         
         # Toggle physics validator with V
@@ -213,15 +280,16 @@ def main(smoke_test_frames: int = 0):
         if keys[pygame.K_c]:
             camera.snap_to(car.x, car.y, network.world_width, network.world_height)
         
-        # ESC: emergency stop + screenshot to clipboard (for bug reports)
+        # ESC: toggle freeze (pause game loop, take screenshot)
         if keys[pygame.K_ESCAPE] and not hasattr(main, '_last_esc'):
             main._last_esc = False
         esc_pressed_now = keys[pygame.K_ESCAPE] and not main._last_esc
         if esc_pressed_now:
-            car.speed = 0.0
-            car.target_speed = 0.0
-            car.active_turn = None
-            print("\n🛑 ESC: Emergency stop\n")
+            frozen = not frozen
+            if frozen:
+                print("\n⏸️  ESC: Game frozen (press ESC to resume)\n")
+            else:
+                print("▶️  ESC: Game resumed\n")
         main._last_esc = keys[pygame.K_ESCAPE]
 
         # In smoke test, simulate driving inputs
@@ -232,23 +300,14 @@ def main(smoke_test_frames: int = 0):
         if api:
             commands = api.get_commands()
             
-            # Teleport command
+            # Replace-car command (destroy old car, create fresh one)
             if 'teleport' in commands:
-                teleport_params = commands['teleport']
-                if teleport_params.get('start_point'):
-                    name = teleport_params['start_point']
-                    try:
-                        car.teleport_to_named_point(network, name)
-                        validator.reset_car_state(car)
-                        print(f"\nAPI: Teleport to named start point '{name}' "
-                              f"(segment {car.seg_idx}, heading {car.heading:.1f}°)\n")
-                    except KeyError as e:
-                        print(f"\nAPI: {e}\n")
-                elif teleport_params.get('random'):
-                    car.teleport_random(network)
-                    validator.reset_car_state(car)
-                    print(f"\nAPI: Random teleport to segment {car.seg_idx}\n")
-                # TODO: Handle specific segment/progress teleport
+                tp = commands['teleport']
+                start_point = tp.get('start_point') or None
+                car = _create_car(start_point)
+                camera.snap_to(car.x, car.y, network.world_width, network.world_height)
+                print(f"\n🔄 New car at segment {car.seg_idx}, "
+                      f"heading {car.heading:.1f}°\n")
             
             # Toggle command
             if 'toggle' in commands:
@@ -263,10 +322,10 @@ def main(smoke_test_frames: int = 0):
                         validator.disable()
                 if 'mode' in toggle_params:
                     mode = toggle_params['mode']
-                    if mode == 'rails' and not isinstance(car.driver, AIDriver):
-                        car.driver = AIDriver()
-                        car.snap_to_road(network)
-                        print("API: Switched to RAILS mode")
+                    if mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
+                        car.driver = BicycleDriver()
+                        car.bicycle_nav = None
+                        print("API: Switched to BICYCLE mode")
                     elif mode == 'free' and not isinstance(car.driver, KeyboardDriver):
                         car.driver = KeyboardDriver()
                         print("API: Switched to FREE mode")
@@ -275,8 +334,10 @@ def main(smoke_test_frames: int = 0):
             if 'label' in commands:
                 renderer.hud_label = commands['label']
 
-        # Get control input from driver (keyboard or API)
-        control_input = car.driver.get_control(car, network, dt, keys)
+        # Skip physics when frozen
+        if not frozen:
+            # Get control input from driver (keyboard or API)
+            control_input = car.driver.get_control(car, network, dt, keys)
         
         # Merge API control inputs (if API enabled)
         if api:
@@ -295,42 +356,55 @@ def main(smoke_test_frames: int = 0):
             if api_control['blinker_right']:
                 control_input['blinker_right'] = True
             
-            # The AIDriver's actual turn CHOICE (which segment to take at
-            # a junction) comes from its own `pending_turn` attribute -
-            # which get_control() above only ever sets from real keyboard
-            # key-edge-detection (K_LEFT/K_a, K_RIGHT/K_d). Merging the
-            # API's blinker flags into control_input alone only affected
-            # cosmetic blinker-light rendering elsewhere; it never told
-            # the driver which way to actually turn, so API-controlled
-            # turns silently fell back to whatever `pending_turn` already
-            # was (usually None -> "straight", or whatever the keyboard
-            # last set) regardless of which blinker the API requested.
-            # Explicitly sync pending_turn/blinker state from the API's
-            # request here so a remote-controlled turn actually steers
-            # the requested direction at the next junction.
+            # BicycleDriver's turn choice comes from `pending_turn`.
+            # API blinkers are ONE-SHOT commands (like flicking a real
+            # indicator): apply them once, then consume the flag so they
+            # don't re-trigger every frame. The driver's own blinker state
+            # persists afterwards and is cleared by the car itself once the
+            # turn is executed (see clear_blinker_if_turned below).
             if hasattr(car.driver, 'pending_turn'):
                 if api_control['blinker_left']:
                     car.driver.pending_turn = 'left'
                     car.driver.blinker_left = True
                     car.driver.blinker_right = False
+                    api.clear_control('blinker_left')
                 elif api_control['blinker_right']:
                     car.driver.pending_turn = 'right'
                     car.driver.blinker_right = True
                     car.driver.blinker_left = False
-                elif not (keys[pygame.K_LEFT] or keys[pygame.K_a] or
-                          keys[pygame.K_RIGHT] or keys[pygame.K_d]):
-                    # Neither the API nor the keyboard is requesting a
-                    # turn right now - make sure a previous API-driven
-                    # blinker doesn't stay stuck on.
-                    car.driver.pending_turn = None
-                    car.driver.blinker_left = False
-                    car.driver.blinker_right = False
+                    api.clear_control('blinker_right')
         
-        # Update car physics
-        car.update(dt, network, control_input)
+        # Update car physics (only when not frozen)
+        if not frozen:
+            prev_seg = car.seg_idx
+            car.update(dt, network, control_input)
+        
+        # Auto-cancel the blinker once the turn is actually executed
+        # (like a real car: the indicator switches off by itself after the
+        # turn - this is the car's job, not the test's).
+        if car.seg_idx != prev_seg and hasattr(car.driver, 'clear_blinker_if_turned'):
+            car.driver.clear_blinker_if_turned(car, network, prev_seg, car.seg_idx)
         
         # Run physics validation (independent check)
         validator.check(car, dt, network)
+        
+        # Lane guard: check for wrong-side driving (skip during active
+        # turns — lateral offset from incoming centerline is expected)
+        in_turn = hasattr(car.bicycle_nav, '_s') and car.bicycle_nav._s is not None and \
+                  car.bicycle_nav._in_turn_blend_zone(car.bicycle_nav._s)
+        on_wrong_side = False
+        if not in_turn:
+            on_wrong_side = lane_guard.check(car, dt, network)
+            if on_wrong_side and not lenient:
+                # Fatal by default so the test suite cannot silently pass a
+                # run that broke rule 2. Pass --lenient to explore a map
+                # instead: the guard still reports and the HUD still blinks,
+                # but the process survives. (LaneGuard itself never raises -
+                # this escalation is the game loop's choice.)
+                raise RuntimeError(
+                    f"WRONG-SIDE DRIVING! Car at ({car.x:.1f}, {car.y:.1f}), "
+                    f"heading {car.heading:.1f}°, segment {car.seg_idx}"
+                )
 
         # Off-road check (FREE mode only)
         if car.driver.get_name() == "FREE":
@@ -343,20 +417,30 @@ def main(smoke_test_frames: int = 0):
                 car.x = max(0, min(bounds[2], car.x))
                 car.y = max(0, min(bounds[3], car.y))
 
-        # Camera follow (only when moving)
-        camera.update(car.x, car.y, network.world_width, network.world_height,
-                      follow=car.speed > 0.1)
+        # Camera follow (only when moving and not frozen)
+        if not frozen:
+            camera.update(car.x, car.y, network.world_width, network.world_height,
+                          follow=car.speed > 0.1)
 
         # Render
-        screen.blit(grass_bg, (0, 0))
+        screen.fill(BG_COLOR)  # solid grass-green background
         renderer.draw(screen, car)
         car.draw(screen, camera)
+        renderer.draw_trail(screen, car)  # after sprite so buckets are visible
+        
+        # HUD: wrong-side warning LED (blinks red when on opposing lane)
+        if on_wrong_side:
+            # Blink at ~3 Hz (on for 10 frames, off for 10 frames at 60 fps)
+            if frame % 20 < 15:
+                wx = WINDOW_WIDTH - 50
+                wy = WINDOW_HEIGHT - 50
+                pygame.draw.circle(surface=screen, color=(255, 30, 30), center=(wx, wy), radius=14)
+                pygame.draw.circle(surface=screen, color=(255, 255, 255), center=(wx, wy), radius=3)
 
         pygame.display.flip()
         
-        # ESC was just pressed: capture this frame (car now stopped) and
-        # copy it to the system clipboard for easy bug reporting
-        if esc_pressed_now:
+        # On freeze: capture this frame and copy to clipboard
+        if esc_pressed_now and frozen:
             copy_screenshot_to_clipboard(screen)
         
         # Update API state and screenshot (if API enabled)
@@ -372,10 +456,13 @@ def main(smoke_test_frames: int = 0):
                 'segment': car.seg_idx,
                 'progress': car.progress,
                 'forward': car.forward,
+                'distance_to_junction': _distance_to_junction(car, network),
                 'on_road': car.is_on_road(network),
                 'driver': car.driver.get_name(),
                 'trail_enabled': car.trail_enabled,
                 'validator_enabled': validator.enabled,
+                'validator_violations': len(validator.violations),
+                'lane_guard_stats': lane_guard.stats(),
                 'camera_x': camera.x,
                 'camera_y': camera.y,
                 'camera_zoom': camera.zoom,

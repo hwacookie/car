@@ -29,16 +29,17 @@ python -m src.main --map basic --api
 
 ### Headless vs. visible
 
-- For automated/unattended runs (e.g. from an agent or CI), start
-  Pygame with a dummy video driver so no real window is needed:
+- **Default: visible.** Just omit `SDL_VIDEODRIVER` - the game window
+  opens normally and updates in real time while the test script drives
+  it via the API. This is genuinely useful for debugging: you can
+  literally watch the car take a turn while a test script asserts on
+  the exact same state.
+- **Use `SDL_VIDEODRIVER=dummy` ONLY when testing in a build system
+  (CI) or when the user explicitly asks for it.** Do not reach for it
+  by default on a developer machine:
   ```bash
   SDL_VIDEODRIVER=dummy python -m src.main --map basic --api
   ```
-- For watching a run happen live, just omit `SDL_VIDEODRIVER=dummy` -
-  the game window opens normally and updates in real time while the
-  test script drives it via the API. This is genuinely useful for
-  debugging: you can literally watch the car take a turn while a test
-  script asserts on the exact same state.
 
 Either way, the API and test behavior are identical - `SDL_VIDEODRIVER`
 only affects whether Pygame renders to a real window.
@@ -67,6 +68,24 @@ This is the main test script. It:
    `GET /screenshot` to `/tmp/violation_<name>_<timestamp>.png` so you
    can see exactly what went wrong.
 
+### Selecting scenarios
+
+```bash
+python tests/test_turning.py --tests 3            # one, by number
+python tests/test_turning.py --tests 3,7-9        # several, or a range
+python tests/test_turning.py --tests y_from_stem  # every scenario there
+python tests/test_turning.py --failed             # whatever failed last run
+python tests/test_turning.py --failfast           # stop at the first failure
+```
+
+Numbering is preserved when filtering, so "TEST 7/18" always identifies the
+same scenario - the point being to jump straight back to one that failed.
+
+The game itself also spawns deterministically (`--start <name>`, otherwise
+the map's first named start point). A random spawn means nothing before the
+first teleport is reproducible, and a crash on startup is a different crash
+each time.
+
 ### Running a single scenario
 
 Debugging one specific case is much faster than the whole suite:
@@ -80,8 +99,9 @@ that one start point, arms that one turn direction (or `straight`), and
 monitors just that one turn. `speed_kmh` is only "how fast to get up to
 before we start watching" (the driver always tries to accelerate to top
 speed and brakes only as needed for the upcoming turn - see
-`TurningSystem.decide_target_speed_for_turn` in `src/car.py`); it does
-not force a specific cruising or cornering speed.
+the speed profile in `src/bicycle_nav.py`, which derives cornering speed
+from the curvature of the driving line); it does not force a specific
+cruising or cornering speed.
 
 ### Random-location mode
 
@@ -143,8 +163,8 @@ This is the actual workflow used throughout this project's development:
 2. Run one failing scenario: `python tests/test_turning.py --only <name> <direction> <speed>`
 3. Watch the window while it runs, and/or inspect the printed physics
    debug output (turn planning, arc validation, off-road/teleportation
-   watchdog messages - see `PhysicsValidator` and `TurningSystem` in
-   `src/`).
+   watchdog messages - see `PhysicsValidator`, `LaneGuard` and
+   `BicycleNav` in `src/`).
 4. If it fails, the violation screenshot in `/tmp/` plus `GET /state`
    polled by hand (`curl http://localhost:5000/state`) is usually enough
    to pin down *where* and *at what exact frame* things went wrong.

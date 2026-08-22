@@ -1,6 +1,13 @@
 # Synthetic Test Maps
 # Deterministic, hand-crafted road networks for reproducible testing.
 # Selected via --map <name> command line flag.
+#
+# COORDINATE SYSTEM (shared with the OSM maps - see src/road_network.py):
+#   X grows EAST, Y grows NORTH (higher y = further north).
+#   Heading is in degrees, 0 = north (+y), positive = right/east, and a
+#   car's forward vector is (sin h, cos h). Every scenario below is laid
+#   out in that frame, so the synthetic maps and the real OSM map use the
+#   exact same convention and the same physics/geometry code works on both.
 
 from __future__ import annotations
 
@@ -12,10 +19,10 @@ from .road_network import RoadNetwork, RoadSegment
 class MapBuilder:
     """Helper to construct a RoadNetwork from named nodes given in METERS.
 
-    Coordinates given in meters are converted to world pixels via
-    config.PIXELS_PER_METER. Y increases "south"/downward in this
-    synthetic coordinate system, consistent with the OSM-derived maps
-    (world Y grows away from the northern edge).
+    Coordinates are given in the SHARED world frame (X east, Y NORTH),
+    the same one the OSM projection produces. A node with a larger y is
+    further north. Coordinates may be negative; build() shifts everything
+    so the world starts at (0, 0).
     """
 
     def __init__(self):
@@ -26,7 +33,7 @@ class MapBuilder:
         self._start_points: dict[str, str] = {}  # name -> node_id (must be degree-1)
 
     def node(self, node_id: str, x_m: float, y_m: float) -> None:
-        """Define a node position in meters."""
+        """Define a node position in meters (X east, Y north)."""
         self._nodes_m[node_id] = (x_m, y_m)
 
     def road(
@@ -101,9 +108,8 @@ class MapBuilder:
                 nid: (x - min_x, y - min_y)
                 for nid, (x, y) in self._nodes_m.items()
             }
-            # Shift all segment endpoints (stored in px).
-            # Same direction as the node shift above: new = old - min.
-            # (sdx/sdy are already scaled to px and negative, so SUBTRACT.)
+            # Shift segment endpoints (stored in px). Same direction as
+            # the node shift above: new = old - min.
             sdx, sdy = min_x * pppm, min_y * pppm
             for seg in self._segments:
                 seg.x1 -= sdx; seg.y1 -= sdy
@@ -173,82 +179,27 @@ class MapBuilder:
         )
 
 
-def build_autobahn_kreuz() -> RoadNetwork:
-    """Autobahnkreuz: two crossing highways, each split into two
-    one-way carriageways (right-hand traffic):
-
-      A1: N-S Autobahn (on top = overpass)
-      A2: E-W Autobahn (underpass)
-
-    Each carriageway is a 10 m wide strip: two 3.5 m driving lanes
-    (overtake on the LEFT, travel lane on the right) plus a 3 m stop
-    lane on the far right, drawn with a dashed line between the two
-    driving lanes and solid lines at both edges of the driving lanes.
-    The two carriageways of a highway are 8 m apart (central median),
-    so opposing traffic never touches.
-
-    Start points at the four cardinal approaches, each on the one-way
-    carriageway that matches the direction of travel.
-    """
-    b = MapBuilder()
-
-    LANE_W = 3.5
-    SHOULDER_W = 3.0
-    CARRIAGEWAY_W = 2 * LANE_W + SHOULDER_W   # 10.0 m
-    SEP = 6.0   # m from highway axis to carriageway centerline
-               # (5 m half carriageway + 1 m half median gap = 2 m green)
-
-    # NOTE: y grows SOUTH (down on screen), so the a1_axis list below
-    # runs from the NORTH end (y=-1200) to the SOUTH end (y=+1200) -
-    # i.e. it is in direction of travel for SOUTHBOUND traffic.
-    a1_axis = [(-20, -1200), (-15, -900), (-10, -600), (-5, -300), (0, 0),
-               (10, 300), (20, 600), (30, 900), (30, 1200)]
-    a2_axis = [(-1200, 0), (-900, 0), (-600, 0), (-300, 0), (0, 0),
-               (300, 0), (600, 0), (900, 0), (1200, 0)]
-
-    def carriageway(prefix: str, points: list[tuple[float, float]],
-                    start_name: str) -> None:
-        """Add one one-way carriageway; `points` in direction of travel.
-        (The start point is registered at the first point automatically.)"""
-        ids = [f"{prefix}_{i}" for i in range(len(points))]
-        for nid, (x, y) in zip(ids, points):
-            b.node(nid, x, y)
-        for i in range(len(ids) - 1):
-            b.road(ids[i], ids[i + 1], highway="motorway", oneway=True,
-                   width=CARRIAGEWAY_W, lanes=2, shoulder=SHOULDER_W)
-        b.start(start_name, ids[0])
-
-    # A1 (N-S, overpass), right-hand traffic: southbound (travel +y,
-    # list order) keeps WEST (x - SEP), northbound (travel -y, reversed
-    # order) keeps EAST (x + SEP).
-    carriageway("a1_sb", [(x - SEP, y) for x, y in a1_axis], "autobahn_north")
-    carriageway("a1_nb", [(x + SEP, y) for x, y in reversed(a1_axis)], "autobahn_south")
-
-    # A2 (E-W, underpass): eastbound traffic keeps SOUTH (y + SEP),
-    # westbound keeps NORTH (y - SEP).
-    carriageway("a2_eb", [(x, y + SEP) for x, y in a2_axis], "autobahn_west")
-    carriageway("a2_wb", [(x, y - SEP) for x, y in reversed(a2_axis)], "autobahn_east")
-
-    return b.build()
-
-
 def build_basic_test_map() -> RoadNetwork:
     """A comprehensive synthetic test track with known geometry.
 
-    Layout: 4x2 grid of 400m x 400m tiles (500m pitch), each containing
-    one specific test scenario:
+    A grid of ~500 m tiles, each holding one specific road situation.
+    All coordinates are in the shared world frame (X east, Y NORTH).
 
         Tile (0,0): Straight road (baseline / acceleration test)
-        Tile (1,0): 90 deg turn (corner A)
-        Tile (2,0): 90 deg turn (corner B, mirrored)
+        Tile (1,0): 90 deg RIGHT turn (approach heading south)
+        Tile (2,0): 90 deg LEFT turn (approach heading south)
         Tile (3,0): T-junction (3-way, perpendicular)
         Tile (0,1): Y-intersection (3-way, shallow diverging angles)
         Tile (1,1): 4-way intersection (crossroads)
         Tile (2,1): One-way street through a 4-way junction
         Tile (3,1): S-curve (gentle degree-2 bends)
         Tile (0,2): Dead-end
-        Tile (1,2): Tight hairpin turn (narrow angle, low speed)
+        Tile (1,2): Tight hairpin turn (~150 deg direction change)
         Tile (2,2): Wide sweeping curve (gentle single bend)
+        Tile (3,2): Roundabout (one-way ring, 4 two-way spokes)
+        Tile (0,3): Sliver junction - a very short approach into a 4-way
+                    with a near-straight, a sharp-right and a sharp-left
+                    exit (mirrors the real-world 815 -> 1008 layout).
     """
     b = MapBuilder()
     TILE = 500.0  # pitch between tiles, meters
@@ -256,103 +207,107 @@ def build_basic_test_map() -> RoadNetwork:
     def origin(col: int, row: int) -> tuple[float, float]:
         return col * TILE, row * TILE
 
-    # --- Tile (0,0): Straight road ---
+    # --- Tile (0,0): Straight road (north-south) ---
     ox, oy = origin(0, 0)
-    b.node("straight_n", ox + 100, oy + 50)
-    b.node("straight_s", ox + 100, oy + 350)
+    b.node("straight_n", ox + 100, oy + 350)   # north (large y)
+    b.node("straight_s", ox + 100, oy + 50)    # south (small y)
     b.road("straight_n", "straight_s")
-    b.start("straight", "straight_n")
-    b.start("straight_reverse", "straight_s")
+    b.start("straight", "straight_n")           # spawn at north, heading south
+    b.start("straight_reverse", "straight_s")   # spawn at south, heading north
 
-    # --- Tile (1,0): 90 deg turn (corner A) ---
-    # Approach heading south then turn RIGHT (east)
+    # --- Tile (1,0): 90 deg RIGHT turn (approach heading south) ---
+    # Come down from the north, turn right (WEST) at the corner.
+    # (Facing south, west is on your right.)
     ox, oy = origin(1, 0)
-    b.node("cornerA_n", ox + 100, oy + 50)
-    b.node("cornerA_corner", ox + 100, oy + 250)
-    b.node("cornerA_e", ox + 350, oy + 250)
-    b.road("cornerA_n", "cornerA_corner")
-    b.road("cornerA_corner", "cornerA_e")
-    b.start("corner_right_entry", "cornerA_n")
-    b.start("corner_right_exit", "cornerA_e")
+    b.node("cornerR_n", ox + 350, oy + 350)
+    b.node("cornerR_c", ox + 350, oy + 100)
+    b.node("cornerR_w", ox + 100, oy + 100)
+    b.road("cornerR_n", "cornerR_c")
+    b.road("cornerR_c", "cornerR_w")
+    b.start("corner_right_entry", "cornerR_n")
+    b.start("corner_right_exit", "cornerR_w")
 
-    # --- Tile (2,0): 90 deg turn (corner B, mirrored) ---
-    # Approach heading south then turn LEFT (west)
+    # --- Tile (2,0): 90 deg LEFT turn (approach heading south) ---
+    # Come down from the north, turn left (EAST) at the corner.
+    # (Facing south, east is on your left.)
     ox, oy = origin(2, 0)
-    b.node("cornerB_n", ox + 350, oy + 50)
-    b.node("cornerB_corner", ox + 350, oy + 250)
-    b.node("cornerB_w", ox + 100, oy + 250)
-    b.road("cornerB_n", "cornerB_corner")
-    b.road("cornerB_corner", "cornerB_w")
-    b.start("corner_left_entry", "cornerB_n")
-    b.start("corner_left_exit", "cornerB_w")
+    b.node("cornerL_n", ox + 100, oy + 350)
+    b.node("cornerL_c", ox + 100, oy + 100)
+    b.node("cornerL_e", ox + 350, oy + 100)
+    b.road("cornerL_n", "cornerL_c")
+    b.road("cornerL_c", "cornerL_e")
+    b.start("corner_left_entry", "cornerL_n")
+    b.start("corner_left_exit", "cornerL_e")
 
     # --- Tile (3,0): T-junction (3-way, perpendicular) ---
+    # Stem comes down from the north onto a west-east bar.
     ox, oy = origin(3, 0)
-    b.node("tjunc_top", ox + 250, oy + 50)
-    b.node("tjunc_center", ox + 250, oy + 250)
-    b.node("tjunc_left", ox + 80, oy + 250)
-    b.node("tjunc_right", ox + 420, oy + 250)
+    b.node("tjunc_top", ox + 250, oy + 350)
+    b.node("tjunc_center", ox + 250, oy + 100)
+    b.node("tjunc_w", ox + 80, oy + 100)
+    b.node("tjunc_e", ox + 420, oy + 100)
     b.road("tjunc_top", "tjunc_center")
-    b.road("tjunc_center", "tjunc_left")
-    b.road("tjunc_center", "tjunc_right")
+    b.road("tjunc_center", "tjunc_w")
+    b.road("tjunc_center", "tjunc_e")
     b.start("tjunction_from_top", "tjunc_top")
-    b.start("tjunction_from_left", "tjunc_left")
-    b.start("tjunction_from_right", "tjunc_right")
+    b.start("tjunction_from_west", "tjunc_w")
+    b.start("tjunction_from_east", "tjunc_e")
 
     # --- Tile (0,1): Y-intersection (shallow diverging angles) ---
+    # Stem comes down from the north, forks to the south-west and
+    # south-east (a shallow "Y").
     ox, oy = origin(0, 1)
-    b.node("y_stem", ox + 250, oy + 50)
+    b.node("y_stem", ox + 250, oy + 400)
     b.node("y_center", ox + 250, oy + 220)
-    b.node("y_left", ox + 100, oy + 400)
-    b.node("y_right", ox + 400, oy + 400)
+    b.node("y_sw", ox + 100, oy + 50)
+    b.node("y_se", ox + 400, oy + 50)
     b.road("y_stem", "y_center")
-    b.road("y_center", "y_left")
-    b.road("y_center", "y_right")
+    b.road("y_center", "y_sw")
+    b.road("y_center", "y_se")
     b.start("y_from_stem", "y_stem")
-    b.start("y_from_left", "y_left")
-    b.start("y_from_right", "y_right")
+    b.start("y_from_sw", "y_sw")
+    b.start("y_from_se", "y_se")
 
     # --- Tile (1,1): 4-way intersection (crossroads) ---
     ox, oy = origin(1, 1)
     b.node("cross_center", ox + 250, oy + 220)
-    b.node("cross_n", ox + 250, oy + 50)
-    b.node("cross_s", ox + 250, oy + 400)
-    b.node("cross_e", ox + 420, oy + 220)
+    b.node("cross_n", ox + 250, oy + 400)
+    b.node("cross_s", ox + 250, oy + 50)
     b.node("cross_w", ox + 80, oy + 220)
+    b.node("cross_e", ox + 420, oy + 220)
     b.road("cross_n", "cross_center")
     b.road("cross_center", "cross_s")
     b.road("cross_w", "cross_center")
     b.road("cross_center", "cross_e")
     b.start("crossroads_from_north", "cross_n")
     b.start("crossroads_from_south", "cross_s")
-    b.start("crossroads_from_east", "cross_e")
     b.start("crossroads_from_west", "cross_w")
+    b.start("crossroads_from_east", "cross_e")
 
     # --- Tile (2,1): One-way street through a 4-way junction ---
+    # East-west road is one-way (west -> east only); north-south is two-way.
     ox, oy = origin(2, 1)
     b.node("ow_center", ox + 250, oy + 220)
     b.node("ow_w", ox + 80, oy + 220)
     b.node("ow_e", ox + 420, oy + 220)
-    b.node("ow_n", ox + 250, oy + 50)
-    b.node("ow_s", ox + 250, oy + 400)
-    # East-west road is one-way (west -> east only)
+    b.node("ow_n", ox + 250, oy + 400)
+    b.node("ow_s", ox + 250, oy + 50)
     b.road("ow_w", "ow_center", oneway=True)
     b.road("ow_center", "ow_e", oneway=True)
-    # North-south road is normal two-way
     b.road("ow_n", "ow_center")
     b.road("ow_center", "ow_s")
-    b.start("oneway_entry", "ow_w")            # legal: flows with the one-way
-    b.start("oneway_wrong_way", "ow_e")        # illegal: would drive against the one-way
+    b.start("oneway_entry", "ow_w")                # legal: flows with the one-way
+    b.start("oneway_wrong_way", "ow_e")            # illegal: against the one-way
     b.start("oneway_cross_from_north", "ow_n")
     b.start("oneway_cross_from_south", "ow_s")
 
     # --- Tile (3,1): S-curve (gentle degree-2 bends) ---
     ox, oy = origin(3, 1)
-    b.node("s_p0", ox + 100, oy + 50)
-    b.node("s_p1", ox + 150, oy + 150)
+    b.node("s_p0", ox + 100, oy + 400)
+    b.node("s_p1", ox + 150, oy + 300)
     b.node("s_p2", ox + 280, oy + 220)
-    b.node("s_p3", ox + 350, oy + 320)
-    b.node("s_p4", ox + 400, oy + 420)
+    b.node("s_p3", ox + 350, oy + 120)
+    b.node("s_p4", ox + 400, oy + 50)
     b.road("s_p0", "s_p1")
     b.road("s_p1", "s_p2")
     b.road("s_p2", "s_p3")
@@ -362,16 +317,17 @@ def build_basic_test_map() -> RoadNetwork:
 
     # --- Tile (0,2): Dead-end ---
     ox, oy = origin(0, 2)
-    b.node("dead_start", ox + 250, oy + 50)
-    b.node("dead_end", ox + 250, oy + 300)
+    b.node("dead_start", ox + 250, oy + 350)
+    b.node("dead_end", ox + 250, oy + 100)
     b.road("dead_start", "dead_end")
     b.start("dead_end_approach", "dead_start")
 
     # --- Tile (1,2): Tight hairpin turn (~150 deg direction change) ---
+    # Come down from the north, then fold back up to the east.
     ox, oy = origin(1, 2)
-    b.node("hair_a", ox + 100, oy + 50)
-    b.node("hair_corner", ox + 100, oy + 250)
-    b.node("hair_b", ox + 160, oy + 60)
+    b.node("hair_a", ox + 100, oy + 350)
+    b.node("hair_corner", ox + 100, oy + 100)
+    b.node("hair_b", ox + 160, oy + 340)
     b.road("hair_a", "hair_corner")
     b.road("hair_corner", "hair_b")
     b.start("hairpin_entry", "hair_a")
@@ -379,9 +335,9 @@ def build_basic_test_map() -> RoadNetwork:
 
     # --- Tile (2,2): Wide sweeping curve (gentle single bend, ~30 deg) ---
     ox, oy = origin(2, 2)
-    b.node("sweep_a", ox + 100, oy + 50)
-    b.node("sweep_mid", ox + 150, oy + 250)
-    b.node("sweep_b", ox + 300, oy + 420)
+    b.node("sweep_a", ox + 100, oy + 350)
+    b.node("sweep_mid", ox + 150, oy + 150)
+    b.node("sweep_b", ox + 300, oy + 50)
     b.road("sweep_a", "sweep_mid")
     b.road("sweep_mid", "sweep_b")
     b.start("sweeping_curve", "sweep_a")
@@ -394,35 +350,93 @@ def build_basic_test_map() -> RoadNetwork:
     D = R * 0.7071  # diagonal offset (NE/SE/SW/NW), R*cos(45deg)
     SPOKE = 150.0   # distance from ring out to each approach's far end
 
-    # 8-node ring, alternating cardinal (spoke-bearing) and diagonal
-    # (pure corner) nodes, for a reasonably round look once the corner
-    # rounding is applied. One-way, all in the same rotational sense.
-    b.node("rb_n", cx, cy - R)
-    b.node("rb_ne", cx + D, cy - D)
-    b.node("rb_e", cx + R, cy)
-    b.node("rb_se", cx + D, cy + D)
-    b.node("rb_s", cx, cy + R)
-    b.node("rb_sw", cx - D, cy + D)
-    b.node("rb_w", cx - R, cy)
-    b.node("rb_nw", cx - D, cy - D)
-    ring = ["rb_n", "rb_ne", "rb_e", "rb_se", "rb_s", "rb_sw", "rb_w", "rb_nw"]
-    for a, b_node in zip(ring, ring[1:] + ring[:1]):
+    # 32-node ring (every 11.25 deg) for a smooth curve. One-way,
+    # COUNTER-CLOCKWISE in this north-up frame (N -> W -> S -> E), the
+    # correct direction for right-hand traffic (Germany): the central
+    # island stays on your LEFT as you go around. Many nodes = very short
+    # straight chords = the curvature is detected on nearly every chord,
+    # so the speed profile slows the car down for the ring (a coarse ring
+    # has long straight chords where curvature reads 0, so the car blasts
+    # through the ring and swings wide).
+    import math as _m
+    N_RING = 64
+    ring_nodes = []
+    for i in range(N_RING):
+        # Start at north (90 deg) and go counter-clockwise (increasing angle
+        # in standard math = counter-clockwise in north-up frame).
+        ang = _m.radians(90 + i * (360.0 / N_RING))
+        nx = cx + R * _m.cos(ang)
+        ny = cy + R * _m.sin(ang)
+        name = f"rb_r{i}"
+        b.node(name, nx, ny)
+        ring_nodes.append(name)
+    for a, b_node in zip(ring_nodes, ring_nodes[1:] + ring_nodes[:1]):
         b.road(a, b_node, oneway=True)
-
-    # Four two-way spokes, one per cardinal ring node.
-    b.node("rb_north_far", cx, cy - R - SPOKE)
+    # Four two-way spokes, one per cardinal ring node. With 64 ring nodes
+    # (every 5.625 deg), the cardinal nodes are rb_r0 (north, 90 deg),
+    # rb_r16 (west, 180 deg), rb_r32 (south, 270 deg), rb_r48 (east, 0 deg).
+    b.node("rb_north_far", cx, cy + R + SPOKE)
     b.node("rb_east_far", cx + R + SPOKE, cy)
-    b.node("rb_south_far", cx, cy + R + SPOKE)
+    b.node("rb_south_far", cx, cy - R - SPOKE)
     b.node("rb_west_far", cx - R - SPOKE, cy)
-    b.road("rb_north_far", "rb_n")
-    b.road("rb_east_far", "rb_e")
-    b.road("rb_south_far", "rb_s")
-    b.road("rb_west_far", "rb_w")
+    b.road("rb_north_far", "rb_r0")
+    b.road("rb_east_far", "rb_r48")
+    b.road("rb_south_far", "rb_r32")
+    b.road("rb_west_far", "rb_r16")
 
     b.start("roundabout_from_north", "rb_north_far")
     b.start("roundabout_from_east", "rb_east_far")
     b.start("roundabout_from_south", "rb_south_far")
     b.start("roundabout_from_west", "rb_west_far")
+
+    # --- Tile (0,3): Sliver junction (the real-world 815 -> 1008 layout) ---
+    # A very SHORT approach (4.16 m) into a 4-way junction. The junction
+    # has a near-straight continuation, a sharp-right exit and a sharp-left
+    # exit - all 7 m wide. The approach is far too short to plan a turn in
+    # advance, which is exactly what made the rail model crash here.
+    #
+    # Local geometry (junction at the tile center, in the shared frame):
+    #   approach from the north (sliver, 4.16 m)
+    #   straight continuation to the south (+1.4 deg)
+    #   sharp-right exit to the west  (+91.5 deg)
+    #   sharp-left  exit to the east  (-87.9 deg)
+    ox, oy = origin(0, 3)
+    cx, cy = ox + 250, oy + 250
+    b.node("sliv_ap",   cx - 0.73, cy + 4.16)     # sliver approach (north)
+    b.node("sliv_junc", cx,        cy)            # the 4-way junction
+    b.node("sliv_str",  cx + 0.74, cy - 4.93)     # straight continuation (south)
+    b.node("sliv_w",    cx - 36.2, cy - 5.4)      # sharp-right exit (west)
+    b.node("sliv_e",    cx + 19.6, cy + 2.7)      # sharp-left exit (east)
+    b.road("sliv_ap", "sliv_junc")
+    b.road("sliv_junc", "sliv_str")
+    b.road("sliv_w", "sliv_junc")
+    b.road("sliv_junc", "sliv_e")
+    b.start("sliver_approach", "sliv_ap")   # spawn on the sliver, heading for the junction
+    b.start("sliver_from_west", "sliv_w")   # spawn on the sharp-right exit
+    b.start("sliver_from_east", "sliv_e")   # spawn on the sharp-left exit
+
+    # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
+    # A W-shaped zig-zag road: right-down, left-down, right-down.
+    # With §10 smoothed geometry the sharp kinks at B/C/D become
+    # slightly rounded curves instead of hard 90° corners.
+    # NOTE: offsets must be POSITIVE and inside 0..TILE. Written as
+    # `ox - 250` these landed at x=1750, which is exactly the T-junction
+    # tile's stem - the zig-zag was drawn straight through tile (3,0),
+    # silently wrecking every tjunction_* scenario.
+    ox, oy = origin(4, 0)
+    b.node("www_a", ox +  50, oy + 350)   # start, top-left
+    b.node("www_b", ox + 130, oy +  60)   # V bottom
+    b.node("www_c", ox + 210, oy + 350)   # peak
+    b.node("www_d", ox + 290, oy +  60)   # V bottom
+    b.node("www_e", ox + 370, oy + 350)   # peak
+    b.node("www_f", ox + 450, oy +  60)   # end, bottom-right
+    b.road("www_a", "www_b")
+    b.road("www_b", "www_c")
+    b.road("www_c", "www_d")
+    b.road("www_d", "www_e")
+    b.road("www_e", "www_f")
+    b.start("www_entry", "www_a")
+    b.start("www_exit", "www_f")
 
     return b.build()
 
@@ -430,7 +444,6 @@ def build_basic_test_map() -> RoadNetwork:
 # Registry of all available test maps
 TEST_MAPS = {
     "basic": build_basic_test_map,
-    "autobahn": build_autobahn_kreuz,
 }
 
 
