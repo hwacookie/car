@@ -6,7 +6,11 @@
 > (`src/raceline.py`, §14) rather than a fixed lane offset — the racing
 > line emerges from it rather than being coded. **16/18** deterministic
 > tests pass; the two failures are both `sliver_approach` turns.
-> Roadmap: §9 Miss Daisy authoring → §11 rendering/trails → §12 traffic sim.
+> **Next task: finish §10 — make `RefLine` a spline (see §0b).** First run on
+> real OSM data shows the car crawling at 12–18 km/h because every node of a
+> polyline reference line is a corner; the synthetic map's long clean
+> straights hid this completely.
+> Then: §9 Miss Daisy authoring → §11 rendering/trails → §12 traffic sim.
 > **New here? Read §14 first (it supersedes the turning parts of §3 and
 > §10), then §8.** Hard rule: `AGENTS.md` — never do physically impossible
 > things.
@@ -36,24 +40,75 @@ car on an ordinary local road (0.38 g measured); they used to be 4.3 km/h.
 - **`id()` reuse.** Per-car state keyed on `id(car)` was inherited by the
   next car allocated at the same address.
 
-**Still open.**
+**First run on real OSM data (2026-08-22).** Everything above was measured
+on the synthetic map. Kleinmachnow was started for the first time and the
+car crawls: **12-18 km/h on open residential road**. Cause measured, and it
+is not the speed profile - it is the input geometry:
 
-1. `sliver_approach` left/right — the car ends on the straight continuation
-   whatever it is told, *even armed from the first frame*, so this is not
-   the §2.5 slide-past behaviour: the turn is never attempted. Approach is
-   4.22 m against a 3.46 m minimum radius, so the scenario is marginal by
-   construction. Note all 18 passed at `2066311`, when a hard 1.2 m/s cap
-   made the car crawl everywhere — removing that cap (correct for realistic
-   corner speeds) plausibly took the sliver with it.
-2. **No restraint parameter.** The optimiser always uses the whole corridor,
-   so every driver is Schumacher. §9.5 says the line is shared and only the
-   speed profile scales per driver, but a cautious driver also would not use
-   the full lane width. Design decision outstanding.
-3. **§9.1 per-manoeuvre junction lines.** Junction turns are still built by
-   offsetting a centreline rounded THROUGH the node, then constraining the
-   offset, rather than as a line from lane centre to lane centre around the
-   node. The current lines are feasible, but by constraint rather than by
-   shape.
+| kink at a node | implied radius | implied speed |
+|---|---|---|
+| 2 deg | 28.6 m | 34 km/h |
+| 4 deg (median) | 14.3 m | 24 km/h |
+| 8 deg | 7.2 m | 17 km/h |
+| 15 deg | 3.8 m | 12.5 km/h |
+
+Real OSM roads are chains of short segments - median length 15.6 m, 722 of
+1970 under 10 m - with a direction kink at every node: median 4.1 deg, 75th
+percentile 16 deg, 90th 38.8 deg. The reference line is still a POLYLINE, so
+each of those is a genuine corner and the car brakes for cartographic noise.
+A straight street mapped every 15 m with 4 deg of wobble reads as a
+continuous 14 m-radius bend.
+
+The synthetic map hid this entirely: its roads are deliberately long clean
+straights, and its 407 m segment still profiles at 183 km/h median.
+
+This vindicates the fixed 1 m curvature window rather than undermining it.
+The old route-proportional window smeared kinks away, but it equally smeared
+away real 6 m fillets - which is what made corners 4x too slow. One cause,
+two symptoms: **curvature measured on a polyline is meaningless**, and no
+window size fixes both.
+
+---
+
+## 0b. Next steps (2026-08-22)
+
+**1. Finish §10: make the driving line a spline.** Now clearly the top
+item - it blocks any useful work on the real map. `SmoothCurve` and
+`SmoothedNetwork` already exist in `src/smooth_geometry.py` and the renderer
+consumes them; only `RefLine` in `bicycle_nav.py` is still a plain polyline,
+and still carries the marker
+`[TEMP-EXPERIMENT: reverted to 2066311 polyline to isolate the §10 spline]`.
+
+  *Caveat, learned the hard way:* feeding `SmoothCurve` the already-rounded,
+  lane-offset, densely-resampled points produces garbage (measured peak
+  radius 0.03 m - a centripetal Catmull-Rom through near-duplicate points
+  wanders wildly). Per §10 it must spline the ORIGINAL nodes, and the lane
+  offset must be applied after.
+
+**2. Sliver dead-end exits.** With the turn armed in time the car now routes
+correctly to segments 98/99 (see §14 and the `fit_edges` fix), but 3 of 4
+such runs go off-road AFTER the turn, on the short dead-end exits.
+Undiagnosed.
+
+**3. Test harness cannot arm a blinker on a short approach.** The sequence is
+teleport -> accelerate -> arm blinker, and a 4.22 m stub is consumed during
+the acceleration phase: the car is past the junction at t=0.00s. Tests 17/18
+cannot pass as written regardless of driving quality.
+
+**4. Restraint parameter ("Miss Daisy").** The optimiser maximises speed with
+no notion of caution, so it always uses the whole corridor - every driver is
+Schumacher. §9.5 says the line is shared and only the speed profile scales
+per driver, but a cautious driver would not use the full lane width either.
+Design decision outstanding.
+
+**5. §9.1 per-manoeuvre junction lines.** Junction turns are still built by
+offsetting a centreline rounded THROUGH the node and then constraining the
+offset, rather than as a line from lane centre to lane centre around it.
+Feasible today, but by constraint rather than by shape.
+
+**Also:** `--lenient` downgrades a wrong-side hit from fatal to a warning, so
+a map can be explored. Default stays fatal so the suite cannot silently pass
+a run that broke rule 2.
 
 ---
 

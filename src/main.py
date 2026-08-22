@@ -161,7 +161,8 @@ def main(smoke_test_frames: int = 0):
     
     # --- Lane guard (wrong-side detection, softer than validator) ---
     lane_guard = LaneGuard(enabled=True)
-    print("Lane guard: ENABLED")
+    lenient = "--lenient" in sys.argv
+    print(f"Lane guard: ENABLED{' (lenient - wrong-side warns, does not stop)' if lenient else ''}")
     
     # --- REST API (optional, enable with --api flag) ---
     api = None
@@ -394,7 +395,12 @@ def main(smoke_test_frames: int = 0):
         on_wrong_side = False
         if not in_turn:
             on_wrong_side = lane_guard.check(car, dt, network)
-            if on_wrong_side:
+            if on_wrong_side and not lenient:
+                # Fatal by default so the test suite cannot silently pass a
+                # run that broke rule 2. Pass --lenient to explore a map
+                # instead: the guard still reports and the HUD still blinks,
+                # but the process survives. (LaneGuard itself never raises -
+                # this escalation is the game loop's choice.)
                 raise RuntimeError(
                     f"WRONG-SIDE DRIVING! Car at ({car.x:.1f}, {car.y:.1f}), "
                     f"heading {car.heading:.1f}°, segment {car.seg_idx}"
