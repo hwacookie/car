@@ -616,7 +616,8 @@ class BicycleNav:
         # curvature alternates between 0 and 0.31 (an apparent 3.3 m radius)
         # along an arc that is actually a clean 6 m.
         rounded = _round_polyline_corners(raw, self.CORNER_RADIUS_M * PPPM,
-                                          arc_steps=self.CORNER_ARC_STEPS)
+                                          arc_steps=self.CORNER_ARC_STEPS,
+                                          fit_edges=True)
         # Shift the centerline into the driving lane (right-hand traffic).
         # The offset must be small enough that the car's right side stays on
         # the road for the NARROWEST segment in the route: the car's right
@@ -687,7 +688,8 @@ class BicycleNav:
         self._route = route
         raw = [self.network.nodes[n] for n in route]
         rounded = _round_polyline_corners(raw, self.CORNER_RADIUS_M * PPPM,
-                                          arc_steps=self.CORNER_ARC_STEPS)
+                                          arc_steps=self.CORNER_ARC_STEPS,
+                                          fit_edges=True)
         min_width = min(
             (self.network.segments[i].width for i in self._route_segments()),
             default=7.0,

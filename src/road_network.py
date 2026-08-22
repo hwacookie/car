@@ -786,13 +786,61 @@ def _build_smoothed_junction_fillets(network: "RoadNetwork",
     return extras
 
 
-def _round_polyline_corners(coords, radius, arc_steps=10):
+def _corner_tangent_budget(coords, radius):
+    """Per-vertex tangent-distance allowance, sharing each edge between the
+    two corners that use it in proportion to what they actually need.
+
+    The simple rule - give every corner half of each adjoining edge - is
+    safe but badly over-conservative when a corner's neighbour needs little
+    or nothing. On the sliver junction the 4.22 m approach ends at a dead
+    end, so the corner at the junction is the ONLY claimant, yet the half
+    rule still handed it 2.11 m: a 2.06 m fillet radius, well inside the
+    car's 3.46 m minimum turning radius, i.e. a reference line no car could
+    follow. Sharing proportionally gives it the whole edge and a 4.11 m
+    radius, which is drivable.
+    """
+    n = len(coords)
+    want = [0.0] * n
+    for i in range(1, n - 1):
+        ax, ay = coords[i - 1][0] - coords[i][0], coords[i - 1][1] - coords[i][1]
+        bx, by = coords[i + 1][0] - coords[i][0], coords[i + 1][1] - coords[i][1]
+        la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+        if la < 1e-9 or lb < 1e-9:
+            continue
+        dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+        gap = math.acos(dot)
+        if gap < 1e-6 or gap > math.pi - 1e-6:
+            continue
+        want[i] = radius / math.tan(gap / 2)
+
+    budget = [float("inf")] * n
+    for i in range(n - 1):
+        Le = math.hypot(coords[i + 1][0] - coords[i][0],
+                        coords[i + 1][1] - coords[i][1])
+        d1, d2 = want[i], want[i + 1]
+        if d1 + d2 > Le and (d1 + d2) > 1e-9:
+            scale = Le / (d1 + d2)
+            d1, d2 = d1 * scale, d2 * scale
+        budget[i] = min(budget[i], d1 if d1 > 0 else float("inf"))
+        budget[i + 1] = min(budget[i + 1], d2 if d2 > 0 else float("inf"))
+    return budget
+
+
+def _round_polyline_corners(coords, radius, arc_steps=10, fit_edges=False):
     """Replace every interior vertex of a polyline with a circular arc
     of the given radius, tangent to both adjoining edges - i.e. actually
     round the line's own corners, not just its eventual stroke outline.
-    Endpoints are left untouched."""
+    Endpoints are left untouched.
+
+    fit_edges: share each edge between its two corners in proportion to
+    demand (see _corner_tangent_budget) instead of giving each half. Used
+    for the driving line, where an over-tight fillet is not merely ugly but
+    unfollowable. Rendering keeps the half rule so road shapes are
+    unchanged.
+    """
     if len(coords) < 3 or radius <= 0:
         return coords
+    budget = _corner_tangent_budget(coords, radius) if fit_edges else None
 
     result = [coords[0]]
     for i in range(1, len(coords) - 1):
@@ -822,7 +870,10 @@ def _round_polyline_corners(coords, radius, arc_steps=10):
         tangent_dist = radius / math.tan(half_gap)
         # Cap the tangent distance so it never eats more than half of
         # either adjoining edge (avoids self-overlap on short segments).
-        tangent_dist = min(tangent_dist, a_len / 2, b_len / 2)
+        if budget is not None:
+            tangent_dist = min(tangent_dist, budget[i])
+        else:
+            tangent_dist = min(tangent_dist, a_len / 2, b_len / 2)
         actual_radius = tangent_dist * math.tan(half_gap)
 
         center_dist = actual_radius / math.sin(half_gap)
