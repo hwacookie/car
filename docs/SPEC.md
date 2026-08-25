@@ -9,7 +9,7 @@ A 2D top-down driving game rendered with **Pygame**, where the playable world is
 - Load the road network from the **OSM-Wars PostgreSQL database** (PostGIS, `road_geometry` table)
 - Parse the data into a graph of **nodes** (intersections/points) and **segments** (road pieces)
 - Render roads as **2D polygons** with real-world widths (no simple lines)
-- Two driving modes: **FREE** (manual steering) and **RAILS** (automatic road following with turn signals)
+- Two driving modes: **FREE** (manual steering) and **BICYCLE** (intent-based AI executed by the kinematic bicycle model). How the car executes each maneuver (parking, turning, U-turn, ...) is specified in [DRIVING_MANEUVERS.md](DRIVING_MANEUVERS.md)
 
 ## Technical Stack
 
@@ -90,35 +90,41 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 
 ## Driving Modes
 
+Maneuver-level behavior — how the car parks, pulls out, turns, does U-turns,
+avoids obstacles — is specified in [DRIVING_MANEUVERS.md](DRIVING_MANEUVERS.md).
+This section only defines the two drivers and their inputs.
+
 ### FREE Mode (Manual Steering)
 - **W/↑**: Accelerate
-- **S/↓**: Brake (immediate, 10 m/s²)
+- **S/↓**: Brake (immediate, 10 m/s²); fresh press at a standstill engages reverse
 - **A/←**: Steer left
 - **D/→**: Steer right
+- **Q / E**: Left / right blinker (momentary: held = on)
 - **Release W**: Speed maintained (cruise control, no friction)
 - **Off-road**: Car stops immediately
 - **Map edge**: Car stops at boundary
 
-### RAILS Mode (Automatic Road Following)
-- **W/↑**: Accelerate
-- **S/↓**: Brake (immediate, 10 m/s²)
-- **A/←**: Set **left blinker** → turns left at next junction
-- **D/→**: Set **right blinker** → turns right at next junction
-- **TAB**: Toggle between FREE ↔ RAILS mode
+### BICYCLE Mode (Intent-Based AI)
+The player gives high-level intent; the car executes it with the kinematic
+bicycle model (`src/bicycle_nav.py`: reference line + speed profile + pure pursuit).
+- **W/↑ / S/↓**: Gas / brake (manual override of the speed plan)
+- **A/← / D/→**: Toggle **left / right blinker** → turn that way at the next
+  junction where it is still physically possible (DRIVING_MANEUVERS.md §4)
+- **U**: Request a U-turn (Wenden, DRIVING_MANEUVERS.md §5)
 - **Features**:
-  - Car follows road automatically (stays on right lane)
-  - Blinker only turns off when **actually turned** in that direction (not at every junction)
-  - Automatic braking before sharp curves (physics-based braking distance)
-  - "Rechts vor links" logic: only brakes at junctions with roads from the right
-  - Dead ends / route end: car eases to the **right edge** of the road (as far
-    right as possible without leaving the paved area) and stops there (see
-    "Route-End / Dead-End Approach (Right Edge)")
+  - Car follows the road automatically (stays on the right lane)
+  - Cornering speed derived from the curvature of the driving line
+    (`v = sqrt(a_lat/kappa)`) — no angle-based speed tables
+  - Blinker auto-off is mechanical (steering-cam logic: steered in, then back to
+    centre), plus per-maneuver rules in DRIVING_MANEUVERS.md
+  - Dead ends / route end: car eases to the **right edge** of the road and stops
+    there (DRIVING_MANEUVERS.md §1, "Variante: Sackgassenende / Route-Ende")
   - Smooth segment transitions (no teleportation)
 
 ### Mode Switching
-- Press **TAB** to toggle between modes
-- When switching to RAILS: car snaps to nearest road segment
-- Start mode: **RAILS** (automatic)
+- Press **TAB** to toggle between FREE ↔ BICYCLE (REST API: `?mode=free` / `?mode=bicycle`)
+- When switching to BICYCLE: car snaps to the nearest road segment
+- Start mode: **BICYCLE**
 
 ## Physics
 
@@ -128,17 +134,15 @@ Driver → Car.update(control_input) → PhysicsValidator.check()
 - **Braking**: 10 m/s² (full ABS braking, ~1g)
 - **Cruise control**: W-release maintains speed (no automatic deceleration)
 
-### Automatic Braking (RAILS mode)
-- **Braking distance formula**: `s = (v₁² - v₂²) / (2a)`
-- **Safe speeds by turn angle**:
-  - >90°: 20 km/h (tight turn)
-  - >60°: 30 km/h
-  - >30°: 40 km/h
-  - <30°: no braking (gentle turn)
-- **Safety margin**: 5 meters before junction
-- **Only at junctions with right-of-way conflict** (road from right, 3+ connections)
+### Automatic Braking (BICYCLE mode)
 
-### Realistic Turning Physics (RAILS mode)
+There is no angle-based speed table. The speed profile derives the allowed
+speed from the curvature of the driving line (`v = sqrt(a_lat/kappa)` — see
+"Speed-Based Turning Radius" below). When a signaled turn is not feasible at
+the current speed, the car brakes or drives straight through with the blinker
+still on — specified in [DRIVING_MANEUVERS.md](DRIVING_MANEUVERS.md) §4.
+
+### Realistic Turning Physics
 
 **Core Rule**: The car must **ALWAYS stay completely on the road** with all four tires. No cutting corners, no off-road driving.
 
@@ -225,20 +229,10 @@ about 20 ms.
 
 #### Junction Centre: the White Dot
 
-The renderer paints a white dot at every node of degree >= 3. Going
-straight or turning **right**, that dot must stay on the car's **left** -
-this is just keep-right restated at the one place the centreline stops
-existing.
-
-Turning **left** it must not. StVO 9(4) makes *voreinander* the default:
-opposing left-turners pass in front of one another, each turning before
-the centre, which puts the dot on their **right**. *Umeinander* (around
-the centre) is the exception, not the rule.
-
-This matters concretely: constraining left turns to keep the dot on the
-left leaves only lines tighter than the car's 3.46 m minimum turning
-radius (measured 1.5 m), i.e. the constraint was simply wrong for that
-manoeuvre.
+The renderer paints a white dot at every node of degree >= 3. Where the
+driving line must pass relative to that dot (straight/right: left of the
+dot; left turn: *voreinander*, i.e. right of it) is specified in
+[DRIVING_MANEUVERS.md](DRIVING_MANEUVERS.md) §4 ("Kreuzungsmitte (der weiße Punkt)").
 
 #### On-Road Check: Single Source of Truth
 
@@ -265,118 +259,23 @@ This is now unified:
   live check honored (which used to cause plans that passed validation
   to immediately register as off-road once actually driven).
 
-#### Geometry-Based Turn Validation
+#### Turn Feasibility & Missed Turns
 
-Before starting any turn (at degree-2, degree-3, or degree-3+ nodes):
-
-1. **Calculate required turning radius** based on current speed
-2. **Check available road geometry**:
-   - Distance remaining on current segment
-   - Angle between current and next segment
-   - Width of both road segments
-   - Calculate if circular arc fits within both segments
-3. **Validate arc stays on road**:
-   - Start point: X meters before junction (on current road)
-   - End point: Y meters into next road
-   - Arc must stay within road boundaries at all points
-4. **If arc doesn't fit** → brake harder
-5. **If cannot brake in time** → **miss the turn**, continue straight
-
-#### Turn Execution
-
-**All nodes** (degree 2, 3, 4+) use the same physics:
-- Calculate angle change between segments
-- Determine if turn is possible at current speed
-- If yes: follow circular arc with calculated radius
-- If no: brake or miss turn
-
-**Smooth rotation at degree-2 nodes**:
-- Even when "following the road" without changing at an intersection
-- Car smoothly rotates to follow road curvature
-- No instant heading snaps
-
-**Turn sequence**:
-1. **Pre-turn phase** (10-30m before junction):
-   - Validate geometry
-   - Brake if needed
-   - Start rotation early if possible
-2. **Arc phase** (through the junction):
-   - Follow circular arc with constant radius
-   - Heading rotates smoothly
-   - Stay within both road segments
-3. **Post-turn phase** (settling onto new road):
-   - Complete rotation to new road direction
-   - Resume normal following
-
-#### Braking Strategy
-
-**Geometry-based braking** (not just angle-based):
-```
-required_radius = calculate_radius(current_speed)
-available_geometry = analyze_roads(current_seg, next_seg, junction)
-
-if arc_fits(required_radius, available_geometry):
-    execute_turn()
-else:
-    brake_harder()
-    
-if cannot_brake_in_time():
-    miss_turn()  # Continue on current road
-```
-
-**Missed turn behavior**:
-- Blinker stays on
-- Car continues on current road (follows "straight")
-- Will attempt turn at next junction if blinker still active
+How a signaled turn is validated against the current speed and executed — or
+missed (drive straight through, blinker stays on, retry at the next junction)
+— is specified in [DRIVING_MANEUVERS.md](DRIVING_MANEUVERS.md) §4 ("Abbiegen"
+→ "Erreichbarkeit"). The feasibility input is the curvature of the optimised
+driving line, not a pre-computed circular arc.
 
 ### Route-End / Dead-End Approach (Right Edge)
 
-**Goal**: When the car reaches the **end of its route** — a genuine dead end
-where no road continues beyond the node — it must **not** drift toward the
-centerline (the old behavior). Instead it pulls over to the **right edge** of
-the road, as far right as possible, and stops there, like a real driver
-parking at the end of a street.
-
-**Why not the centerline here?** At an ordinary junction the lane offset is
-blended down to the centerline because both adjacent segments share the exact
-node point there, so the segment hand-off has no lateral jump. At a genuine
-dead end there is **no** hand-off to a continuing segment — the car simply
-stops — so there is no reason to be on the centerline. The natural, expected
-position is the right curb.
-
-**Target position (right edge, not off-road)**:
-- The car's lateral offset is driven toward the **rightmost drivable position**:
-  the right road edge minus half the car width, minus the shared safety slack
-  `config.ROAD_EDGE_TOLERANCE_M` (0.5 m), so all four tires stay fully on the
-  paved area.
-- "As far right as possible" is bounded by the actual road geometry (the
-  Shapely paved polygon), never by a fixed fraction of the road width — a
-  narrow service road and a wide primary both end at their own right edge.
-- The final position must pass the same on-road check as everywhere else
-  (`RoadNetwork.is_on_road` / the shared paved polygon). The car must **never
-  leave the road** to reach the edge.
-
-**How the approach is executed (physically plausible)**:
-- The move to the right edge is a **smooth, distance-based ease** over the
-  final stretch before the dead end (the same ~20 m approach window used for
-  the centerline blend), **not** a lateral snap or teleport. Lateral velocity
-  stays within what the car can actually achieve at its current speed.
-- The right-edge blend **replaces** the centerline approach blend only for a
-  **genuine dead end** (no continuing segment). At any junction that *does*
-  hand off to a next segment (executed arc, slide-past, or near-straight
-  continuation) the centerline blend is unchanged, because that hand-off
-  still needs the shared node point to avoid a lateral jump.
-- Braking to the stop is unchanged (physics-based braking distance + 5 m
-  safety margin); only the *lateral* target changes from centerline to right
-  edge.
-- After stopping at the right edge, the existing dead-end turnaround (180°
-  heading flip, small fixed nudge back onto the road, blinkers cleared) still
-  applies if the route is to be retraced — the nudge preserves the right-edge
-  side the car arrived on.
+Pulling over to the right curb at a genuine dead end or an explicit
+destination and stopping there is a parking variant — specified in
+[DRIVING_MANEUVERS.md](DRIVING_MANEUVERS.md) §1 ("Variante: Sackgassenende / Route-Ende").
 
 ### Turning
 - **FREE mode**: Turn rate depends on speed (slower at high speed)
-- **RAILS mode**: Heading follows road direction automatically
+- **BICYCLE mode**: Heading follows the reference line automatically
 
 ### Teleportation Watchdog
 - **Purpose**: Detect unphysical position jumps (bugs)
@@ -398,8 +297,8 @@ Located in **bottom-left corner**, shows:
 - **Speedometer arc**: 0–180 km/h circular gauge (green → yellow → red)
 
 ### Mode Indicator
-- **Text**: "FREE" or "RAILS"
-- **Color**: Blue (FREE) or Green (RAILS)
+- **Text**: "FREE" or "BICYCLE"
+- **Color**: Blue (100,150,255) for FREE, Green (0,200,100) for BICYCLE
 - **Hint**: "(TAB)" to switch
 
 ### Status Indicators
@@ -533,7 +432,7 @@ Only roads with these highway types are loaded:
 - **Taillights**: 2× red circles (2px) at rear corners
   - Bright red when braking
   - Dark red otherwise
-- **Blinkers** (RAILS mode only): 3× orange circles (3px) at side
+- **Blinkers** (both modes: Q/E in FREE, AI-controlled in BICYCLE): 3× orange circles (3px) at side
   - Flash with 0.5s period (on 0.25s, off 0.25s)
   - Left or right depending on signal
 
@@ -659,11 +558,10 @@ car/
 #### Car & Physics
 - [x] **Driver class architecture** (Keyboard, AI drivers)
 - [x] **Car class** (pure physics, no input handling)
-- [x] Car physics with two modes (FREE/RAILS)
-- [x] Automatic road following (RAILS mode)
+- [x] Car physics with two modes (FREE/BICYCLE)
+- [x] Automatic road following (BICYCLE mode)
 - [x] Turn signals & intelligent blinker logic
 - [x] Automatic braking with physics-based distance calculation
-- [x] "Rechts vor links" junction logic
 - [x] Dead-end handling (180° turn)
 - [x] Off-road detection (FREE mode)
 - [x] **raceline module** (driving line as constrained optimisation)
@@ -676,13 +574,13 @@ car/
 - [x] Blinker visualization (flashing orange)
 - [x] **Breadcrumb trail** (toggleable with B key)
 - [x] **Breadcrumb trail v2** (continuous line + yellow/blue wheel paint buckets, replaces the rainbow chevron arrows — see "Breadcrumb Trail (Debug Overlay)")
-- [x] Mode indicator (RAILS/FREE)
+- [x] Mode indicator (BICYCLE/FREE)
 
 #### Debugging & Validation
 - [x] **PhysicsValidator class** (independent "physics judge")
   - Teleportation detection (>50m jumps)
   - Instant heading snap detection (>30° per frame)
-  - Off-road detection (RAILS mode)
+  - Off-road detection (BICYCLE mode)
   - Toggleable with V key
 - [x] Debug keys (B=breadcrumbs, R=random location, V=validator)
 
@@ -719,10 +617,6 @@ car/
 - **Pygame PNG support missing**: Worked around with PIL image loading
 
 ### 🔮 Future Enhancements
-- **Route-end / dead-end right-edge approach** (spec'd, not yet implemented): at a
-  genuine dead end the car eases to the rightmost drivable position (right edge
-  minus half car width minus `ROAD_EDGE_TOLERANCE_M`) and stops there instead of
-  blending to the centerline — see "Route-End / Dead-End Approach (Right Edge)"
 - Multiple AI cars (infrastructure ready - Driver class supports it)
 - Building footprints from OSM `building` polygons
 - Road surface textures (asphalt, cobblestone)
@@ -884,13 +778,15 @@ python -m src.main
 
 ## Controls Summary
 
-| Key | FREE Mode | RAILS Mode |
-|-----|-----------|------------|
-| W/↑ | Accelerate | Accelerate |
-| S/↓ | Brake | Brake |
-| A/← | Steer left | Left blinker → turn left at junction |
-| D/→ | Steer right | Right blinker → turn right at junction |
-| TAB | → RAILS mode | → FREE mode |
+| Key | FREE Mode | BICYCLE Mode |
+|-----|-----------|--------------|
+| W/↑ | Accelerate | Gas (manual override) |
+| S/↓ | Brake (fresh press at standstill = reverse) | Brake (manual override) |
+| A/← | Steer left | Toggle left blinker → turn left where still possible |
+| D/→ | Steer right | Toggle right blinker → turn right where still possible |
+| Q / E | Left / right blinker (momentary) | — |
+| U | — | Request U-turn (Wenden) |
+| TAB | → BICYCLE mode | → FREE mode |
 | C | Snap camera to car | Snap camera to car |
 | B | Toggle breadcrumb trail | Toggle breadcrumb trail |
 | R | Random location (teleport) | Random location (teleport) |
@@ -944,8 +840,8 @@ PhysicsValidator checks **only constraints that can NEVER be violated** by the l
 
 ### Current Checks
 1. **Teleportation detection**: Position jumps > 50m
-2. **Instant heading changes**: Rotations > 30° in one frame (RAILS mode)
-3. **Off-road violations**: Car leaving road in RAILS mode
+2. **Instant heading changes**: Rotations > 30° in one frame (BICYCLE mode)
+3. **Off-road violations**: Car leaving road in BICYCLE mode
 4. **Collision detection**: (TODO) Two cars occupying same space
 
 ### Future: TrafficPolice Class
@@ -990,7 +886,7 @@ Old position: (1280.9, 1566.7)
 New position: (4351.6, 3267.1)
 Distance: 1755.0m (max allowed: 50.0m)
 Speed: 0.0 m/s (0 km/h)
-Mode: rails
+Mode: bicycle
 Segment: 0, Progress: 0.500, Forward: True
 dt: 0.0170s
 ======================================================================
@@ -1012,17 +908,12 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ### Why Two Driving Modes?
 - **FREE**: Classic driving game feel, full control
-- **RAILS**: Relaxed driving, focus on route planning, realistic turn signals
+- **BICYCLE**: Relaxed driving — the player only gives intent (gas/brake/blinker), the kinematic bicycle model executes it; focus on route planning and realistic turn signals
 
 ### Why Teleportation Watchdog?
 - Catches segment transition bugs early
 - Provides detailed debug info
 - Prevents game-breaking jumps
-
-### Why "Rechts vor links" Logic?
-- Realistic German traffic rules
-- Reduces unnecessary braking (only at conflict junctions)
-- Makes automatic driving smoother
 
 ---
 
@@ -1033,7 +924,7 @@ python -m src.main --dump  # Saves frame 30 to /tmp/car_frame.bmp
 
 ---
 
-**Last Updated**: 2026-08-20  
+**Last Updated**: 2026-08-25  
 **Status**: ✅ Actively maintained - road corner rendering + on-road physics unified and calibrated against real-world turning behavior  
 **Version**: 0.96 (fully playable, comprehensive test suite, professional sprite, REST API, Shapely-based road geometry)  
 **Test Results**: `corner_right_entry` right-turn test passing (smooth arc, stays on road, realistic ~15 km/h corner speed)  

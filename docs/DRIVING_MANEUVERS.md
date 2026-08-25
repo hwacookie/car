@@ -8,23 +8,86 @@ der Driver setzt Blinker und Intent (Gas / Bremse).
 
 ## 1. Parken (Pull-Over)
 
-**Auslöser:** Rechtsblinker + Bremse (automatisch bei `PARK_DISTANCE_M ≤ 50 m` zum Ziel, oder manuell per Tastatur/API).
+**Auslöser:** Rechtsblinker + Bremse (automatisch, wenn der Abstand zum Ziel die **geschwindigkeitsabhängige** komfortable Bremsstrecke erreicht — `v²/(2·A_PARK)` plus kleine Reaktionsreserve; bei 65 km/h ≈ 50 m, bei 20 km/h nur ~7 m. Kein fester Wert. Oder manuell per Tastatur/API).
 
 | Phase | Beschreibung |
 |-------|-------------|
 | **Einleitung** | Blinker rechts an. Gas weg, Bremse an. Geschwindigkeit sinkt auf ~5–10 km/h. |
-| **Verschwenken nach rechts** | Referenzlinie blendet von Normalposition zum rechten Straßenrand (`PARK_BLEND_START_M` → `PARK_BLEND_END_M`). Das Auto fährt eine sanfte Rechtskurve zum Rand. |
-| **Parallel ausrichten** | Im letzten Abschnitt (`PARK_BLEND_END_M ≈ 12 m`) ist die Referenzlinie konstant am Rand – das Auto fährt geradeaus parallel zum Straßenrand. Räder werden parallel ausgerichtet (lateral error < `PARK_ALIGN_LATERAL_M`). |
-| **Anhalten** | Geschwindigkeit geht auf 0. Auto steht mit den Rädern parallel und möglichst nah am rechten Rand. |
+| **Verschwenken nach rechts** | Referenzlinie blendet von Normalposition zum rechten Straßenrand (`PARK_BLEND_START_M` → `PARK_BLEND_END_M`). Das Auto fährt eine sanfte Rechtskurve zum Rand. Der Zielabstand zum Rand ist das Ergebnis einer Suche: so nah wie möglich, ohne dass eine Fahrzeugecke während der Schrägfahrt über den Bordstein reicht. |
+| **Parallel ausrichten** | Im letzten Abschnitt (`PARK_ALIGN_M`) ist die Referenzlinie konstant am Rand – das Auto fährt geradeaus parallel zum Straßenrand. Geregelt wird hier nicht mehr per Pure Pursuit (das kommt an der Linie *drehend* an), sondern mit einem Stanley-Gesetz: Lenkwinkel = Kurswinkelfehler + Querabstandsterm. Beide Terme gehen gemeinsam gegen null – genau „bündig am Rand und parallel dazu“. |
+| **Anhalten** | Geschwindigkeit geht auf 0, dabei läuft die Verzögerung aus (progressive Bremsen) – kein Rucken beim Stillstand. Auto steht mit den Rädern parallel und möglichst nah am rechten Rand; bei einer Ziel-Flagge steht der vordere Stoßfänger an der Flagge. |
 | **Blinker aus** | Sobald das Auto gestoppt ist (`speed < 0.1 m/s` und `dist_to_dest < 1.0 m`), wird der Blinker automatisch ausgeschaltet. |
+
+Reproduzierbar headless: `.venv/bin/python scripts/sim_park.py [startpunkt] [--dest]`
+logt den kompletten Anhaltevorgang (Phase, Verzögerung, Restweg, Querablage,
+Kurswinkelfehler) und misst am Ende Bordsteinabstand und Stoßfängerposition.
 
 ### Parameter
 
-- `PARK_DISTANCE_M = 50.0` – Ab hier wird Parken eingeleitet
-- `PARK_BLEND_START_M = 40.0` – Verschwenken beginnt (m vom Ende)
-- `PARK_BLEND_END_M = 12.0` – Verschwenken abgeschlossen, gerade Linie zum Rand
+- **Auslösedistanz** – geschwindigkeitsabhängig: `v²/(2·A_PARK)` + Reaktionsreserve (explizite Entscheidung: kein fester Wert)
+- `A_PARK = 3.5 m/s²` – komfortables Bremsen beim Parken (~0,35 g), kein Volllastbremsen
+- `PARK_CREEP_SPEED_M = 2.0 m/s` (7 km/h) – Creep-Geschwindigkeit in der Verschwenkzone (Band 5–10 km/h)
+- `PARK_STOP_TAU = V_C / A_PARK` (≈ 0,57 s) – Zeitkonstante des Ausrollens.
+  Im Schlussabschnitt ist die Zielgeschwindigkeit **proportional zur
+  Restdistanz** (`v = d / τ`), die Verzögerung `a = v / τ` läuft also mit
+  der Geschwindigkeit aus und ist am Stillstand null. τ ist so gewählt,
+  dass die Verzögerung zu Beginn des Ausrollens genau `A_PARK` beträgt.
+  Unter `PARK_ROLL_END_M_S = 0.3 m/s` übernimmt eine kleine konstante
+  Verzögerung (`PARK_ROLL_END_A = 0.6 m/s²`), sonst kröche das Auto den
+  Exponentialschwanz noch sekundenlang aus.
+- **Zonengeometrie – abgeleitet, nicht frei gewählt** (die früher hier
+  genannten 40 m / 12 m stammen aus einer Zeit vor dem Brems-&-Park-Plan;
+  bei 2 m/s Creep wären 40 m *20 Sekunden Schrittgeschwindigkeit*):
+  - `PARK_ALIGN_M = 4.0` – gerades Stück am Rand zum Ausrichten. Kürzer
+    ging nicht: der Regler schleppt der Driftlinie ~0,35 m hinterher, ein
+    Auto das beim Halten noch verschwenkt, steht schräg (gemessen 5–12°).
+  - `PARK_BLEND_END_M = max(PARK_ALIGN_M, V_C·τ)` – Verschwenken
+    abgeschlossen, konstanter Offset bis zum Stillstand.
+  - `PARK_BLEND_START_M = V_C·PARK_SWERVE_S + PARK_BLEND_END_M` (≈ 12 m)
+    – mit `PARK_SWERVE_S = 4.0 s`, also 8 m Driftweg. Kürzer erzwingt die
+    Eckenprüfung einen Parkplatz weiter draußen (bei 6 m Drift 0,94 m vom
+    Bordstein statt 0,54 m), länger bringt nichts mehr.
+- **Alle Distanzen zählen ab dem HALTEPUNKT**, nicht ab dem Linienende:
+  am Flaggenziel steht der vordere Stoßfänger an der Flagge (Referenzpunkt
+  = Hinterachse, also `FRONT_OVERHANG_M` davor), an einer Sackgasse eine
+  ganze Fahrzeuglänge vor dem Asphaltende.
 - `PARK_TRACK_LOOKAHEAD_M` – Kurzer Lookahead für enges Tracking der Referenzlinie
-- `PARK_ALIGN_LATERAL_M` – Laterale Toleranz, ab der Räder parallel ausgerichtet werden
+- `PARK_ALIGN_GAIN = 1.0` – Querabstands-Verstärkung des Stanley-Reglers im Schlussabschnitt
+- `PARK_ALIGN_LATERAL_M` – Laterale Toleranz für „auf der Linie“
+
+### Variante: Sackgassenende / Route-Ende
+
+Gleiches Manöver wie Parken, ohne Ziel-Flagge: Die Route endet an einer echten
+Sackgasse (Knoten mit Grad ≤ 1 – keine Straße führt weiter). Das Auto darf dort
+**nicht** zur Mittellinie ausgleiten (altes Verhalten), sondern zieht an den
+**rechten Straßenrand** – so weit rechts wie möglich, ohne die befestigte Fläche
+zu verlassen – und hält.
+
+- **Zielposition**: rechteste befahrbare Position = rechter Fahrbahnrand − halbe
+  Fahrzeugbreite − `ROAD_EDGE_TOLERANCE_M` (0,5 m); alle vier Räder bleiben
+  vollständig auf der befestigten Fläche. Begrenzt durch die echte
+  Straßengeometrie (Shapely-Polygon), nie durch einen festen Anteil der
+  Straßenbreite – ein schmaler Wirtschaftsweg und eine breite Hauptstraße enden
+  jeweils an ihrem eigenen Rand.
+- **Warum nicht Mittellinie?** An einer normalen Kreuzung wird der Offset zur
+  Mittellinie geblendet, weil beide benachbarten Segmente den gemeinsamen
+  Knotenpunkt teilen und die Übergabe keinen lateralen Sprung haben soll. Am
+  Sackgassenende gibt es keine Übergabe an ein weiterführendes Segment – das
+  Auto stoppt einfach. Die natürliche Position ist der rechte Bordstein.
+- **Ausführung (physikalisch plausibel)**: sanftes, distanzbasiertes Ausweichen
+  über die letzten ~20 m (gleiches Fenster wie der Mittellinien-Blend), kein
+  lateraler Snap oder Teleport; die Lateralführung bleibt innerhalb dessen, was
+  das Auto bei seiner aktuellen Geschwindigkeit leisten kann. Der Rand-Blend
+  ersetzt den Mittellinien-Blend nur bei einer *echten* Sackgasse; an jeder
+  Kreuzung mit weiterführendem Segment (ausgeführter Bogen, Slide-past oder
+  geradewürdige Fortsetzung) bleibt der Mittellinien-Blend unverändert.
+- **Bremsen** bis zum Stillstand unverändert (physikbasierte Bremsstrecke +
+  5 m Sicherheitsreserve); nur das laterale Ziel ändert sich von Mittellinie
+  auf rechten Rand.
+- **Optional: Wenden am Ende.** Soll die Route wiederholt werden, greift nach dem
+  Anhalten am Rand die Sackgassen-Wende (180°-Heading-Flip, kleiner fester Nudge
+  zurück auf die Fahrbahn, Blinker aus) – der Nudge behält die erreichte
+  Randseite bei.
 
 ---
 

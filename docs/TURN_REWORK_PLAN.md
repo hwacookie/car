@@ -362,6 +362,9 @@ physically legal:
 
 ## 4. Verification
 
+> **OBSOLETE (2026-08-16).** Verification plan for the obsolete §3 phases
+> (rail model) — kept for the record only.
+
 1. **Reproduce first**: headless run that drives the car onto seg 815
    heading toward 1008 (teleport-to-segment + RAILS), confirm the
    current crash.

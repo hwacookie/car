@@ -53,7 +53,7 @@ Returns current game state:
   "progress": 0.65,
   "forward": true,
   "on_road": true,
-  "driver": "RAILS",
+  "driver": "BICYCLE",
   "trail_enabled": false,
   "validator_enabled": true,
   "camera_x": 1234.5,
@@ -118,7 +118,7 @@ Content-Type: application/json
 {
   "breadcrumbs": true,
   "validator": false,
-  "mode": "rails"  # or "free"
+  "mode": "bicycle"  # or "free"
 }
 ```
 
