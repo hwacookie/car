@@ -54,6 +54,12 @@ Returns current game state:
   "forward": true,
   "on_road": true,
   "driver": "BICYCLE",
+  "parking": {
+    "style": "reverse",
+    "phase": "stopped",
+    "parked": true,
+    "reversing": false
+  },
   "trail_enabled": false,
   "validator_enabled": true,
   "camera_x": 1234.5,
@@ -61,6 +67,14 @@ Returns current game state:
   "camera_zoom": 2.0
 }
 ```
+
+`parking` reflects the nav's parking state (fields are null when no
+parking plan is active): `style` is `"forward"` or `"reverse"`, `phase`
+tracks the approach (`lead/decel/swerve/final/reverse/stopped`), and
+`parked` becomes `true` only when the maneuver is complete - this is what
+the e2e suite waits for on reverse-in scenarios, because a back-in park
+deliberately crosses the end flag to stage the reverse (see
+`docs/TESTING.md` §3).
 
 ### Send Control Inputs
 ```bash

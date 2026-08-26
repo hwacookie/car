@@ -106,16 +106,24 @@ Debugging one specific case is much faster than the whole suite:
 
 ```bash
 python tests/test_turning.py --only corner_right_entry right 80
+python tests/test_turning.py --only corner_right_entry right 80 6   # + destination
 ```
 
-`--only <start_point> <direction> <speed_kmh>` teleports straight to
-that one start point, arms that one turn direction (or `straight`), and
-monitors just that one turn. `speed_kmh` is only "how fast to get up to
-before we start watching" (the driver always tries to accelerate to top
-speed and brakes only as needed for the upcoming turn - see
-the speed profile in `src/bicycle_nav.py`, which derives cornering speed
-from the curvature of the driving line); it does not force a specific
-cruising or cornering speed.
+`--only <start_point> <direction> <speed_kmh> [end_segment]` teleports
+straight to that one start point, arms that one turn direction (or
+`straight`), and monitors just that one turn. `speed_kmh` is only "how
+fast to get up to before we start watching" (the driver always tries to
+accelerate to top speed and brakes only as needed for the upcoming turn -
+see the speed profile in `src/bicycle_nav.py`, which derives cornering
+speed from the curvature of the driving line); it does not force a
+specific cruising or cornering speed.
+
+The optional `[end_segment]` sets the red end flag at that segment's 50%
+point, exactly like the full suite - making it the nav's destination and
+therefore activating the parking plan (including reverse-in parking where
+the geometry calls for it). Without it the nav has no destination and no
+parking plan: the car just drives through. This is the fast way to watch
+one parking maneuver live in the window.
 
 ### Cockpit controller (`tools/controller.py`)
 
@@ -173,6 +181,18 @@ scenario **passes** only if ALL of these hold:
    stops. Driving PAST the flag while moving is a FAILURE ("drove past the
    end flag") - parking at the destination is part of this test, not an
    afterthought.
+
+   **Reverse-in exception.** When the nav plans a back-in park (`/state`
+   reports `parking.style == "reverse"`), the car deliberately drives PAST
+   the flag: it stages the manoeuvre by stopping several metres beyond it,
+   then reverses into the spot at the kerb (DRIVING_MANEUVERS.md §1b). While
+   that plan is active and not yet complete, crossing the flag is NOT a
+   "drove past" failure, and the staging stop does NOT count as an arrival:
+   the run only passes once `/state` reports `parking.parked == true` with
+   the car at rest at the flag. The suite reads this from the `parking`
+   field of `GET /state` (`{style, phase, parked, reversing}`, sourced from
+   the nav in `src/main.py`) - note it must be read from the nav object,
+   not the driver, which does not carry these attributes.
 2. **Correct route.** The car ends on exactly `expected_end_segment` (a left
    turn that actually went right fails even if it "arrives" somewhere).
 3. **No off-road.** No validator violations (the car must stay on the
