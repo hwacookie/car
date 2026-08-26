@@ -10,7 +10,12 @@ reference-line heading + its error, cross-track error e_right, and the
 commanded steering angle. At rest it reports the final parallel error and
 the per-corner clearance to the pavement edges.
 
-Run: .venv/bin/python scripts/trace_park.py [start_point]
+Run: .venv/bin/python scripts/trace_park.py [start_point] [end_segment]
+
+The optional end_segment replicates the e2e suite's RED end flag at 50%
+of that segment (the car's destination): without it the route has no
+destination and the nav parks FORWARD; with it, the reverse-in style
+decision can engage exactly like in the live game.
 """
 import math
 import sys
@@ -57,6 +62,7 @@ def road_heading_deg(network, car):
 
 def main():
     start = sys.argv[1] if len(sys.argv) > 1 else "corner_right_entry"
+    end_seg = int(sys.argv[2]) if len(sys.argv) > 2 else None
     network = build_test_map("basic")
     keys = FakeKeys()
     car = spawn_at(network, start)
@@ -64,6 +70,7 @@ def main():
 
     t = 0.0
     traced = False
+    dest_set = False
     print(f"# start: {start}, blinker_right armed, throttle latched")
     for frame in range(int(180 * 60)):
         t += DT
@@ -71,6 +78,24 @@ def main():
         control["accelerate"] = True
         car.update(DT, network, control)
         nav = car.bicycle_nav
+
+        # Replicate the e2e red flag: destination at 50% of end_seg, set
+        # once the route covers that segment (like main.py's resolution).
+        if (end_seg is not None and not dest_set and nav is not None
+                and end_seg in getattr(nav, "_route_seg_set", set())):
+            seg = network.segments[end_seg]
+            route = getattr(nav, "_route", None) or []
+            for i in range(len(route) - 1):
+                a, b = route[i], route[i + 1]
+                if a != b and a in (seg.start_node, seg.end_node) \
+                        and b in (seg.start_node, seg.end_node):
+                    ax, ay = network.nodes[a]
+                    bx, by = network.nodes[b]
+                    nav.set_destination(ax + (bx - ax) * 0.5,
+                                        ay + (by - ay) * 0.5)
+                    dest_set = True
+                    print(f"# destination set: seg {end_seg} @ 50%")
+                    break
 
         d_stop = None
         if nav is not None and nav._ref is not None:

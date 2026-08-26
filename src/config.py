@@ -95,7 +95,7 @@ KERB_CLEARANCE_M = ROAD_EDGE_TOLERANCE_M
 # line any more, it is standing still against the kerb (spec §1 "möglichst
 # nah am rechten Rand"). The pull-over target uses this smaller clearance;
 # the driving-line corridor keeps KERB_CLEARANCE_M.
-PARK_KERB_CLEARANCE_M = 0.20
+PARK_KERB_CLEARANCE_M = 0.16   # empirically closest clean park (scripts/sweep_park_clearance.py): at <=0.14 the reverse-in tuck grows past what _reverse_park_ok allows and the style falls back to a forward park ~0.6 m out
 
 # How far into a segment a car spawns, as a FRACTION of the segment
 # length. Never 0: a node sits in the middle of the junction rounding,

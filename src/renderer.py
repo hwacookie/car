@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import pygame
 
 from . import config
@@ -38,6 +40,12 @@ class Renderer:
         self.flag_green: list | None = None
         self.flag_red: list | None = None
         self.flag_red_pending: tuple | None = None
+        # Debug overlay (G key / POST /toggle paved_edge): white outline of
+        # the exact paved-area polygon that defines off-road checks. The
+        # state persists across restarts (data/debug_overlays.json) so a
+        # game restart never silently turns it back off.
+        self.paved_edge_visible = self._load_overlay_state().get("paved_edge",
+                                                                 False)
         from collections import OrderedDict
         self._tiles: "OrderedDict[tuple, pygame.Surface]" = OrderedDict()
         self._tile_polys: list | None = None
@@ -52,6 +60,33 @@ class Renderer:
         # Note: pygame.font is broken on some platforms (SDL_ttf import
         # issue). All text rendering goes through PIL instead — see
         # _text_surface() below.
+
+    @staticmethod
+    def _overlay_state_path() -> str:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(root, "data", "debug_overlays.json")
+
+    @classmethod
+    def _load_overlay_state(cls) -> dict:
+        try:
+            with open(cls._overlay_state_path()) as f:
+                state = json.load(f)
+                return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
+    def set_paved_edge(self, visible: bool):
+        """Toggle the paved-edge overlay and persist the choice."""
+        self.paved_edge_visible = bool(visible)
+        try:
+            path = self._overlay_state_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            state = self._load_overlay_state()
+            state["paved_edge"] = self.paved_edge_visible
+            with open(path, "w") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
 
     @classmethod
     def _get_pil_font(cls, size: int):
@@ -83,6 +118,7 @@ class Renderer:
     def draw(self, surface: pygame.Surface, car):
         self._frame += 1
         self.draw_roads(surface)
+        self.draw_paved_edge(surface)
         self.draw_test_flags(surface)
         # Trail is drawn AFTER the car sprite (see main.py) so buckets
         # are visible at the car's edges rather than hidden underneath.
@@ -142,6 +178,45 @@ class Renderer:
         sa = self.camera.world_to_screen(*ap)
         pygame.draw.polygon(surface, fill, [(sx, sy), s1, s2, sa])
         pygame.draw.polygon(surface, outline, [(sx, sy), s1, s2, sa], 2)
+    def draw_paved_edge(self, surface: pygame.Surface):
+        """Debug overlay: the WHITE outline of the exact paved-area polygon
+        that defines BOTH the rendered road surface and the off-road check
+        (RoadNetwork.get_paved_polygon). If this line does not sit on the
+        visible asphalt edge somewhere, our perception of the road boundary
+        disagrees with what is drawn. Rings are cached once (the network is
+        static) and culled by bounding box per frame."""
+        if not self.paved_edge_visible:
+            return
+        poly = self.network.get_paved_polygon()
+        if getattr(self, "_paved_edge_cache", None) is None:
+            import numpy as np
+            polys = (poly.geoms if poly.geom_type == "MultiPolygon"
+                     else [poly])
+            rings = []
+            for p in polys:
+                for ring in (p.exterior, *p.interiors):
+                    arr = np.asarray(ring.coords, dtype=float)
+                    if arr.size == 0:
+                        continue
+                    rings.append((arr, (float(arr[:, 0].min()),
+                                        float(arr[:, 0].max()),
+                                        float(arr[:, 1].min()),
+                                        float(arr[:, 1].max()))))
+            self._paved_edge_cache = rings
+        cam = self.camera
+        hw = cam.width / (2.0 * cam.zoom) + 60.0 / cam.zoom
+        hh = cam.height / (2.0 * cam.zoom) + 60.0 / cam.zoom
+        wx0, wx1 = cam.x - hw, cam.x + hw
+        wy0, wy1 = cam.y - hh, cam.y + hh
+        for arr, (ax0, ax1, ay0, ay1) in self._paved_edge_cache:
+            if ax1 < wx0 or ax0 > wx1 or ay1 < wy0 or ay0 > wy1:
+                continue
+            sx = (arr[:, 0] - cam.x) * cam.zoom + cam.width / 2.0
+            sy = (cam.y - arr[:, 1]) * cam.zoom + cam.height / 2.0
+            pygame.draw.lines(surface, (255, 255, 255), True,
+                              [(float(a), float(b)) for a, b in zip(sx, sy)],
+                              2)
+
     # --- Roads (tile-cached) ---
     def _tile_geom(self):
         """Road polygons with precomputed world-space bounding boxes and

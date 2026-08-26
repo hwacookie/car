@@ -1,6 +1,6 @@
 # Camera / Viewport
 # Follows the car with smooth interpolation, supports zoom in/out,
-# and middle-mouse drag to pan the map.
+# and left-mouse drag to pan the map.
 
 from __future__ import annotations
 
@@ -82,15 +82,18 @@ class Camera:
     # --- Mouse drag ---
 
     def handle_mouse_down(self, button: int, pos: tuple[int, int]):
-        """Start dragging on middle mouse button (button 2)."""
-        if button == 2:  # middle mouse button
+        """Start dragging on left mouse button (button 1). The obstacle
+        palette gets first claim on LMB events; this only sees the presses
+        it declined (empty map area), so a plain click just starts and ends
+        a zero-length drag."""
+        if button == 1:  # left mouse button
             self._dragging = True
             self._drag_start_mouse = pos
             self._drag_start_camera = (self.x, self.y)
 
     def handle_mouse_up(self, button: int):
         """Stop dragging."""
-        if button == 2:
+        if button == 1:
             self._dragging = False
 
     def handle_mouse_motion(self, pos: tuple[int, int]):

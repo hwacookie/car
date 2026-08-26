@@ -1097,12 +1097,25 @@ class TurnTester:
                     crossed_now = (prog is not None and entry is not None and (
                         (entry < 0.5 and prog >= 0.5)
                         or (entry > 0.5 and prog <= 0.5)))
+                    # Reverse-in parking (§1b): the car deliberately drives
+                    # PAST the flag to stage the back-in, stops ~3 m beyond
+                    # it, then reverses into the spot at the kerb. The
+                    # crossing is expected and the staging stop is NOT an
+                    # arrival - only the nav's 'parked' flag (manoeuvre
+                    # complete) counts.
+                    parking = state.get('parking') or {}
+                    reverse_planned = parking.get('style') == 'reverse'
+                    reverse_done = not reverse_planned \
+                        or bool(parking.get('parked'))
                     # STRICT arrival criterion (docs/TESTING.md §3, rule 1):
                     # the scenario passes only if the car comes to rest AT
                     # the flag. Crossing it while moving is "drove past the
                     # destination" - a FAILURE, not an arrival (see
-                    # FLAG_CRAWL_KMH for the crawl-speed exception).
-                    if crossed_now and state['speed_kmh'] >= FLAG_CRAWL_KMH:
+                    # FLAG_CRAWL_KMH for the crawl-speed exception). A
+                    # planned reverse-in crosses on purpose - exempt until
+                    # it has parked.
+                    if crossed_now and state['speed_kmh'] >= FLAG_CRAWL_KMH \
+                            and not reverse_planned:
                         passed_flag = True
                         passed_flag_speed_kmh = state['speed_kmh']
                         print(f"\n   ❌ DROVE PAST THE END FLAG at "
@@ -1111,6 +1124,8 @@ class TurnTester:
                     crossed_half = (crossed_now and state['speed_kmh'] < FLAG_CRAWL_KMH) \
                         or (prog is not None and entry is not None
                             and abs(entry - 0.5) < 0.02)
+                    if crossed_half and not reverse_done:
+                        crossed_half = False   # staging, not arrival
                     if passed_flag:
                         final_pos = (state['x'], state['y'])
                         print(f"      Time: {time.time() - start_time:.2f}s")
@@ -1128,7 +1143,10 @@ class TurnTester:
                         speed_ms = state['speed_kmh'] / 3.6
                         brake_dist_m = (speed_ms ** 2) / (2.0 * CAR_BRAKING) \
                             + max(1.0, speed_ms * 0.15)   # polling/reaction slack
+                        # (Never during a reverse-in staging approach - the
+                        # car is supposed to keep rolling past the flag.)
                         if not braking_for_end and not crossed_half \
+                                and reverse_done \
                                 and dist_flag_m <= brake_dist_m:
                             braking_for_end = True
                             self.send_control(accelerate=False, brake=True)
@@ -1137,7 +1155,10 @@ class TurnTester:
                         # Arrival = at rest within tolerance of the flag,
                         # regardless of who latched the brake (normally the
                         # nav's parking block, sometimes the safety net).
+                        # A reverse-in only counts once 'parked' - the
+                        # staging stop ~3 m past the flag must not latch.
                         if not crossed_half \
+                                and reverse_done \
                                 and state['speed_kmh'] < 1.0 \
                                 and dist_flag_m <= STOP_AT_FLAG_TOLERANCE_M:
                             crossed_half = True   # stopped right at the flag
@@ -1584,11 +1605,15 @@ def main():
     Pass --random to instead teleport to random locations on whatever
     map is currently loaded (real OSM data or a test map).
     
-    Pass --only <start_point> <direction> <speed_kmh> to run a SINGLE
-    scenario directly instead of the whole suite (much faster when
+    Pass --only <start_point> <direction> <speed_kmh> [end_segment] to run
+    a SINGLE scenario directly instead of the whole suite (much faster when
     debugging one known-failing case):
-    
-        python tests/test_turning.py --only corner_right_entry right 120
+
+        python tests/test_turning.py --only corner_right_entry right 120 6
+
+    With end_segment, the red end flag is set at its 50% point exactly like
+    in the full suite - without it the nav has no destination and therefore
+    no parking plan (no reverse-in).
     """
     # Ctrl-C handling: the SIGINT handler just sets a flag and tells the user
     # we're wrapping up; the suite loop then stops scheduling new tests, saves
@@ -1612,8 +1637,11 @@ def main():
             start_point = sys.argv[idx + 1]
             direction = sys.argv[idx + 2]
             speed = float(sys.argv[idx + 3])
-            tester.monitor_turn(direction, duration=15.0, target_speed=speed,
-                               start_point=start_point, results=results)
+            end_seg = int(sys.argv[idx + 4]) if len(sys.argv) > idx + 4 \
+                else None
+            tester.monitor_turn(direction, duration=60.0, target_speed=speed,
+                               start_point=start_point, results=results,
+                               expected_end_segment=end_seg)
             save_results(results)
             tester.print_summary()
         elif '--random' in sys.argv:

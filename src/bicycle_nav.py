@@ -615,6 +615,30 @@ class BicycleNav:
     # 2 m/s creep speed that is ~27 deg of steering for a half-metre of
     # error, and it decays smoothly to zero on the line.
     PARK_ALIGN_GAIN = 1.0
+    # Heading-error gain of the same law. With the conventional 1:1 match,
+    # the heading error decays with time constant WHEELBASE/v - at the
+    # 2 m/s creep that is 1.35 s, but the alignment window (drift end to
+    # roll-out) is only ~1 s, so the car mathematically can close barely
+    # half its error and freezes nose-in (measured: +0.9 deg off-parallel,
+    # wheels held hard over - see scripts/trace_park.py). x3 gives a 0.45 s
+    # time constant at V_C: an 8 deg entry error is down to <1 deg before
+    # the roll-out decay starts. The lateral-accel cap keeps the implied
+    # radius physical (at 2 m/s and -15 deg that is ~10 m, no in-place
+    # rotation).
+    PARK_ALIGN_HDG_GAIN = 3.0
+    # Cross-track fade of the same law (see update()): in the last metre
+    # of the roll-out the lateral correction can no longer be completed -
+    # at crawl speed it takes longer than the remaining distance, and while
+    # it is being done the nose rotates PAST parallel (steering left to
+    # pull a right-of-line car back onto the line). Measured on
+    # corner_right_entry: the car froze 0.84 deg nose-in with 0.12 m of
+    # cross error still uncorrected. A real driver straightens out and
+    # rolls to a stop; the leftover lateral offset (a few cm) is invisible,
+    # a crooked nose is not. The cross term fades to zero over
+    # [PARK_ALIGN_CROSS_FADE_END_M, PARK_ALIGN_CROSS_FADE_START_M] of
+    # remaining distance to the stop point.
+    PARK_ALIGN_CROSS_FADE_START_M = 1.0
+    PARK_ALIGN_CROSS_FADE_END_M = 0.4
     # Reserves kept when picking how close to the kerb to park: line
     # discretisation, and the controller's residual tracking error.
     PARK_LINE_MARGIN_M = 0.05
@@ -636,16 +660,45 @@ class BicycleNav:
     # on our own half of the road: unlike a U-turn, parking may NOT use the
     # oncoming lane.
     PARK_CENTRELINE_MARGIN_M = 0.10
+    # Reverse-in arc steering candidates, sharpest first (degrees). Full
+    # lock is tried first because it is the shortest back-in; gentler locks
+    # are only needed when the nose swing would otherwise cross into the
+    # oncoming half - they let a deeper tuck stay legal (measured on the
+    # 7 m two-way road: from lane offset 1.75 m, full lock caps the tuck
+    # at ~0.3 m while 20 deg allows ~0.7 m over a ~4.5 m back-in).
+    REVERSE_STEER_CANDIDATE_DEGS = (38.0, 30.0, 25.0, 20.0, 16.0)
     # Planning margin at the kerb for the swept body corners.
     PARK_REVERSE_KERB_MARGIN_M = 0.05
     # Below this the manoeuvre is not worth it - park forwards.
     PARK_REVERSE_MIN_TUCK_M = 0.10
     # Gains of the reverse-in follower (heading, and cross-track -> heading).
-    PARK_REVERSE_HDG_GAIN = 1.5
-    PARK_REVERSE_LAT_GAIN = 0.6
+    # Feedback parking law gains (see _update_reverse_park): steer from
+    # (heading error, offset error) only - no precomputed arc steering.
+    # Path-following with corrections oscillated on this tight manoeuvre
+    # (measured: eR swung +0.34 m outboard in arc 1 to -0.30 m inboard by
+    # the end of the line; gain increases only moved the limit cycle).
+    #   delta = PSI_GAIN * psi - POS_GAIN * e_off      (radians)
+    # Reversing kinematics give the heading term a POSITIVE sign (a right
+    # steer rotates the nose away from the kerb, damping a nose-towards-
+    # kerb angle) and the position term a negative one (too far inboard ->
+    # nose towards centreline swings the rear out to the kerb).
+    PARK_REVERSE_PSI_GAIN = 2.8     # heading damping, ~1.2 s time constant
+    PARK_REVERSE_POS_GAIN = 1.4     # offset correction, ~2.5 s at creep
     # Straight run-out at the end of the reverse arc (m). See
     # _start_reverse_park: the arcs alone leave the car still rotating.
-    PARK_REVERSE_TAIL_M = 0.8
+    # Straight run-out after the arcs. Must be long enough for heading and
+    # cross-track error to converge AT SPEED: below ~0.3 m/s the roll-out
+    # decel engages and the car rotates proportionally slower, so a short
+    # tail left the final straightening unfinished (measured: 6.5 deg
+    # nose-in frozen for the last 0.3 m of the line).
+    PARK_REVERSE_TAIL_M = 2.4
+    # The staging stop can sit this much closer to the centreline than the
+    # planned lane offset (the racing line is not exactly on LANE_OFFSET_M;
+    # measured 1.55 vs 1.75 m on the basic map). A deeper start needs a
+    # longer back-in for the same tuck, so plan from the deeper offset -
+    # otherwise the executed tuck is stage-fit limited and the car parks
+    # short of the kerb (measured: 0.42 m tuck instead of 0.89).
+    PARK_PLAN_START_MARGIN_M = 0.35
     # ...but if the staging turned out shorter than planned, this much is
     # still enough to settle on.
     PARK_REVERSE_MIN_TAIL_M = 0.3
@@ -846,12 +899,15 @@ class BicycleNav:
         # nose deep into the oncoming lane.
         width = self._dest_segment_width()
         o_lane = min(self.LANE_OFFSET_M, config.kerb_offset_m(width))
-        # A little pessimism about the forward phase: the real drift starts
-        # from wherever the racing line happens to be and may fall short of
-        # the analytic optimum. Under-estimating it only makes the staging
-        # slightly longer, which the straight run-out absorbs; over-
-        # estimating it would leave the reverse arcs no room.
-        o_fwd = self.forward_drift_target(width, o_lane) - 0.10
+        # Reverse-ONLY parking: the forward phase does NOT pull over. The
+        # car drives straight past the spot in its lane and stops there;
+        # the reverse covers the FULL lateral distance from lane to kerb -
+        # the classic back-in. Planning the tuck from the drift target
+        # instead left most of the parking to the forward swerve, so the
+        # manoeuvre read as "forward park + a bit of reverse" (user
+        # complaint 2026-08-26: show reverse parking only). The actual tuck
+        # is re-solved from the car's real pose at staging anyway.
+        o_fwd = o_lane
         plan = self.plan_reverse_tuck(width, o_fwd)
         if plan is None:
             return
@@ -1372,7 +1428,13 @@ class BicycleNav:
         """
         offs = list(offsets)
 
-        if pulling_over and edge_offset > 0:
+        # Reverse-ONLY parking (user decision 2026-08-26): a reverse-in
+        # does NO forward pull-over drift at all - the line keeps its
+        # normal lane offset to the staging stop, so the car drives past
+        # the spot in its lane and the reverse covers the full lateral
+        # distance to the kerb (the classic back-in).
+        if pulling_over and edge_offset > 0 \
+                and self._park_style != 'reverse':
             # Everything below is measured from the STOP POINT, not from
             # the line's end: the car halts a car length short of a dead
             # end (and its front overhang short of a flag), so anchoring
@@ -1463,11 +1525,13 @@ class BicycleNav:
 
             # Park as close to the kerb as the remaining distance allows:
             # the smoothstep drift's peak slant is 1.5*|dlat|/drift_len and
-            # at mid-drift the front edge-side corner reaches
-            # off + (axle+L/2)*sin(th) + (W/2)*cos(th). Search for the
-            # largest target offset that keeps every body corner on the
-            # pavement - a driver who can't make it to the kerb parks a bit
-            # further out, never at an angle into the kerb.
+            # at mid-drift the front wheel contact patch reaches
+            # off + WHEELBASE*sin(th) + TIRE_OUTBOARD*cos(th). Search for
+            # the largest target offset that keeps every WHEEL on the
+            # pavement - only the wheels need to stay on the road; the body
+            # may overhang the kerb (a real pull-over swings the nose past
+            # the curb line all the time). A driver who can't make it to
+            # the kerb parks a bit further out, never at an angle into it.
             # Half the road, minus what the manoeuvre must keep in hand:
             # the U-turn's 0.30 m tracking reserve was far too pessimistic
             # here - with the Stanley alignment the car now ends within
@@ -1477,8 +1541,12 @@ class BicycleNav:
                          + config.KERB_CLEARANCE_M
                          - self.PARK_LINE_MARGIN_M
                          - self.PARK_TRACKING_MARGIN_M)
-            front_reach = (config.REAR_AXLE_OFFSET_M
-                           + config.CAR_LENGTH / 2.0)
+            # Wheel contact patch, not body corner: rear axle -> front
+            # axle along the body, TIRE_OUTBOARD_M outboard (the paint
+            # points). The nose overhang beyond the front axle may swing
+            # past the kerb - it is in the air.
+            front_reach = self.WHEELBASE
+            lateral_reach = config.TIRE_OUTBOARD_M
             drift_len = d_car - self.PARK_BLEND_END_M
 
             def blend_offs(off_target):
@@ -1518,7 +1586,7 @@ class BicycleNav:
                                       P[i_ + 1][1] - P[i_ - 1][1])
                     slant = abs(th_t - th_a)
                     reach = (cand[i_] + front_reach * math.sin(slant)
-                             + config.CAR_WIDTH / 2.0 * math.cos(slant))
+                             + lateral_reach * math.cos(slant))
                     worst = max(worst, reach)
                 # ...plus an analytic scan of the drift profile itself. The
                 # geometric tangent above under-reads the slant whenever the
@@ -1537,7 +1605,7 @@ class BicycleNav:
                                         / drift_len)
                         worst = max(worst,
                                     off_ + front_reach * math.sin(th_)
-                                    + config.CAR_WIDTH / 2.0 * math.cos(th_))
+                                    + lateral_reach * math.cos(th_))
                 return worst
 
             # Both feasibility constraints are monotone in the target
@@ -1779,21 +1847,27 @@ class BicycleNav:
         return [(front, half), (front, -half), (-rear, half), (-rear, -half)]
 
     def _reverse_park_path(self, v0: float, psi0: float, dv: float,
-                           ds: float = 0.02):
+                           ds: float = 0.02, delta=None):
         """Two-arc reverse path in ROAD-LOCAL coordinates.
 
         (u = along the direction of travel, v = to the car's right, psi =
         heading relative to the road axis, + = nose towards the kerb.)
-        The car reverses on full lock one way, then full lock the other, and
-        ends parallel to the road (psi = 0) exactly dv further towards the
-        kerb. Returns (points, ok) with points = [(u, v, psi, steer)] and
-        u <= 0 throughout (the car moves backwards).
+        The car reverses on `delta` lock one way, then `delta` the other,
+        and ends parallel to the road (psi = 0) exactly dv further towards
+        the kerb. Returns (points, ok) with points = [(u, v, psi, steer)]
+        and u <= 0 throughout (the car moves backwards).
+
+        Full lock is the SHORTEST back-in but also the sharpest nose swing;
+        a gentler `delta` trades reverse length for a shallower swing - the
+        same tuck keeps the front corners further off the oncoming half.
 
         Closed form for the swing angle: with R = 1/k the lateral gain of
         the pair of arcs is R*(cos(psi0) + 1 - 2*cos(psi0 - th)), so
             th = psi0 + acos((cos(psi0) + 1 - dv/R) / 2).
         """
-        k = math.tan(self.MAX_STEER) / self.WHEELBASE      # 1/R, full lock
+        if delta is None:
+            delta = self.MAX_STEER
+        k = math.tan(delta) / self.WHEELBASE               # 1/R
         R = 1.0 / k
         arg = (math.cos(psi0) + 1.0 - dv / R) / 2.0
         if not -1.0 <= arg <= 1.0:
@@ -1838,14 +1912,16 @@ class BicycleNav:
         """How close to the kerb the FORWARD pull-over can get on a straight
         road of this width, starting from lane offset `o_car`.
 
-        The same corner-sweep rule _apply_end_blends applies to the real
-        line, evaluated analytically so the parking style can be decided
-        long before the drift is built.
+        The same wheel-sweep rule _apply_end_blends applies to the real
+        line (only the wheels must stay on the pavement), evaluated
+        analytically so the parking style can be decided long before the
+        drift is built.
         """
         drift_len = max(0.1, self.PARK_BLEND_START_M - self.PARK_BLEND_END_M)
         limit_lat = (width / 2.0 - self.PARK_LINE_MARGIN_M
                      - self.PARK_TRACKING_MARGIN_M)
-        front_reach = config.REAR_AXLE_OFFSET_M + config.CAR_LENGTH / 2.0
+        front_reach = self.WHEELBASE
+        lateral_reach = config.TIRE_OUTBOARD_M
         cand = config.park_offset_m(width)
         while cand > o_car:
             dlat = abs(cand - o_car)
@@ -1856,7 +1932,7 @@ class BicycleNav:
                 th_ = math.atan(dlat * _park_ease_slope(t_) / drift_len)
                 worst = max(worst,
                             off_ + front_reach * math.sin(th_)
-                            + config.CAR_WIDTH / 2.0 * math.cos(th_))
+                            + lateral_reach * math.cos(th_))
             if worst <= limit_lat:
                 return cand
             cand -= 0.05
@@ -1873,17 +1949,29 @@ class BicycleNav:
         Returns (tuck_m, stage_m): the lateral distance the reverse covers,
         and how far PAST the parking spot the car stops first. None when
         reversing buys nothing here.
+
+        Searches over arc steering as well as tuck: a gentler lock gives a
+        deeper feasible tuck (less nose swing into the oncoming half) at
+        the price of a longer back-in, so the deepest park wins regardless
+        of which lock makes it legal.
         """
         o_park = config.park_offset_m(width)
-        tuck = o_park - o_forward
-        while tuck >= self.PARK_REVERSE_MIN_TUCK_M - 1e-9:
-            pts, ok = self._reverse_park_path(o_park - tuck, 0.0, tuck)
-            if ok and self._reverse_park_ok(pts, width):
-                # u is negative (backwards); add the straight run-out.
-                stage = -pts[-1][0] + self.PARK_REVERSE_TAIL_M
-                return tuck, stage
-            tuck -= 0.05
-        return None
+        start = max(0.0, o_forward - self.PARK_PLAN_START_MARGIN_M)
+        best = None
+        for delta_deg in self.REVERSE_STEER_CANDIDATE_DEGS:
+            delta = math.radians(delta_deg)
+            tuck = o_park - start
+            while tuck >= self.PARK_REVERSE_MIN_TUCK_M - 1e-9:
+                pts, ok = self._reverse_park_path(o_park - tuck, 0.0, tuck,
+                                                  delta=delta)
+                if ok and self._reverse_park_ok(pts, width):
+                    # u is negative (backwards); add the straight run-out.
+                    stage = -pts[-1][0] + self.PARK_REVERSE_TAIL_M
+                    if best is None or tuck > best[0] + 1e-9:
+                        best = (tuck, stage)
+                    break
+                tuck -= 0.05
+        return best
 
     def _start_reverse_park(self) -> bool:
         """Generate and arm the reverse-in tuck from the car's ACTUAL pose.
@@ -1921,19 +2009,33 @@ class BicycleNav:
         # it was staged past its parking spot, so the front bumper ends up
         # on the flag again.
         stage = self._park_stage_m
-        pts = []
-        while dv >= self.PARK_REVERSE_MIN_TUCK_M - 1e-9:
-            cand, ok = self._reverse_park_path(v0, psi0, dv)
-            # The arcs must leave room for a straight run-out: the follower
-            # arrives at the end of an arc still rotating (feed-forward
-            # assumes perfect tracking), and without a straight stretch to
-            # settle on, the car stopped 2.5 deg nose-in.
-            if (ok and self._reverse_park_ok(cand, seg.width)
-                    and -cand[-1][0] <= stage - self.PARK_REVERSE_MIN_TAIL_M):
-                pts = cand
-                break
-            dv -= 0.05
-        if not pts:
+        # Search tuck AND arc steering: from the full lane offset a deep
+        # tuck is only legal with a gentler lock (less nose swing into the
+        # oncoming half). The deepest feasible park wins; among equals the
+        # sharpest (shortest) back-in is kept.
+        best = None
+        for delta_deg in self.REVERSE_STEER_CANDIDATE_DEGS:
+            delta = math.radians(delta_deg)
+            dv_try = o_park - v0
+            while dv_try >= self.PARK_REVERSE_MIN_TUCK_M - 1e-9:
+                cand, ok = self._reverse_park_path(v0, psi0, dv_try,
+                                                   delta=delta)
+                # The arcs must leave room for a straight run-out: the
+                # follower arrives at the end of an arc still rotating
+                # (feed-forward assumes perfect tracking), and without a
+                # straight stretch to settle on, the car stopped 2.5 deg
+                # nose-in.
+                if (ok and self._reverse_park_ok(cand, seg.width)
+                        and -cand[-1][0]
+                        <= stage - self.PARK_REVERSE_MIN_TAIL_M):
+                    if best is None or dv_try > best[0] + 1e-9:
+                        best = (dv_try, cand)
+                    break
+                dv_try -= 0.05
+        if best is not None:
+            dv, pts = best
+        else:
+            pts = []
             # No feasible tuck from here after all. Still back up: the car
             # is standing PAST its destination (it drove there to stage the
             # manoeuvre), so reversing straight to the spot is the only way
@@ -1963,6 +2065,7 @@ class BicycleNav:
             'psi': [p[2] for p in pts],
             'road_h': road_h,
             'v_target': o_park - (o_park - v0 - dv),   # reached kerb offset
+            'o_park': o_park,
             'tx': tx, 'ty': ty, 'rx': rx, 'ry': ry,
             'seg': car.seg_idx,
         }
@@ -1976,27 +2079,50 @@ class BicycleNav:
         """Per-frame execution of the reverse-in tuck (replaces the normal
         update body while it runs).
 
-        Steering is the path's own steering angle (the line was generated
-        with the same bicycle model the car integrates, so the feed-forward
-        IS the solution), plus a correction on heading and cross-track
-        error. In reverse a right steer rotates the nose LEFT, hence the
-        mirrored signs.
+        Steering is a pure FEEDBACK parking law - steer from (heading
+        error, offset error) only, the way a driver does it. The planned
+        two-arc path is used for feasibility and staging distance, not for
+        steering: following its full-lock feed-forward with correction
+        loops oscillated on this tight manoeuvre (the corrections fight
+        each other; measured residuals up to 0.3 m / 9 deg at the end of
+        the line). The feedback law converges offset and heading
+        simultaneously, so the car stops parallel AND at the kerb.
+
+        State (road frame of the parking segment):
+            e_off = rear-axle offset - o_park   (+ = too far towards kerb)
+            psi   = nose relative to road axis  (+ = nose towards kerb)
+        Reversing kinematics (v < 0): a right steer (delta > 0) rotates the
+        nose AWAY from the kerb, which swings the rear TOWARDS it - hence
+        delta = +PSI_GAIN*psi - POS_GAIN*e_off (heading damping is positive
+        in reverse: the classic counter-intuitive bit).
         """
         car = self.car
         ref = self._ref
         st = self._reverse_park
         self._s = project_s(ref, car.x, car.y, self._s,
                             window=1.0, global_fallback=False, refine=True)
-        i = max(0, min(len(st['steer']) - 1,
-                       bisect.bisect_left(ref.cum, self._s)))
         d_rem = max(0.0, ref.total - self._s)
 
-        # --- longitudinal: creep backwards, rolling out to a stop at the
-        # end of the line (same progressive law as the forward park).
-        v_target = -min(self.PARK_REVERSE_CREEP_M_S, d_rem / self.PARK_STOP_TAU)
+        # --- state ---
+        psi_car = math.radians((car.heading - st['road_h'] + 180.0) % 360.0
+                               - 180.0)
+        rx_, ry_ = st['rx'], st['ry']
+        seg = self.network.segments[st['seg']]
+        v_car = (((car.x - seg.x1) * rx_ + (car.y - seg.y1) * ry_) / PPPM)
+        e_off = v_car - st['o_park']
+        converged = (abs(e_off) < 0.06
+                     and abs(psi_car) < math.radians(1.5))
+
+        # --- longitudinal: creep backwards; brake to a stop when the pose
+        # has converged or the line is used up (progressive roll-out in the
+        # last moment, same as the forward park).
+        if converged or d_rem <= 0.05:
+            v_target = 0.0
+        else:
+            v_target = -min(self.PARK_REVERSE_CREEP_M_S,
+                            d_rem / self.PARK_STOP_TAU)
         brake_rate = self.A_PARK
         if abs(car.speed) < self.PARK_ROLL_END_M_S:
-            v_target = min(v_target, 0.0) if d_rem > 0.05 else 0.0
             brake_rate = min(brake_rate, self.PARK_ROLL_END_A)
         if car.speed > v_target + 0.02:
             car.speed = max(v_target, car.speed - brake_rate * dt)
@@ -2005,24 +2131,45 @@ class BicycleNav:
         car._braking = False
         car.target_speed = car.speed
 
-        # --- steering: feed-forward + error correction ---
-        psi_line = st['psi'][i]
-        psi_car = math.radians((car.heading - st['road_h'] + 180.0) % 360.0
-                               - 180.0)
-        rx_, ry_ = st['rx'], st['ry']
-        ref_x, ref_y = ref.point_at(self._s)
-        e_right = ((car.x - ref_x) * rx_ + (car.y - ref_y) * ry_) / PPPM
-        # Cross-track error is corrected through the heading target: to move
-        # LEFT (towards the centreline) while reversing, the nose must point
-        # right, i.e. psi must increase.
-        psi_cmd = psi_line + max(-0.17, min(0.17,
-                                            self.PARK_REVERSE_LAT_GAIN * e_right))
-        delta = st['steer'][i] - self.PARK_REVERSE_HDG_GAIN * (psi_cmd - psi_car)
+        # --- steering: feedback parking law + envelope guard ---
+        delta = (self.PARK_REVERSE_PSI_GAIN * psi_car
+                 - self.PARK_REVERSE_POS_GAIN * e_off)
         delta = max(-self.MAX_STEER, min(self.MAX_STEER, delta))
+        # The feedback trajectory is NOT the checked two-arc path, so enforce
+        # the SAME envelope it was validated against (body corners on the
+        # pavement and off the oncoming half) with a one-step look-ahead:
+        # if integrating this delta for dt would push any corner outside,
+        # ease off the wheel until it won't - exactly what a driver does
+        # when the nose swings too close to oncoming traffic.
+        if delta != 0.0 and car.speed < -1e-3:
+            kerb_lim = seg.width / 2.0 - self.PARK_REVERSE_KERB_MARGIN_M
+            centre_lim = -self.PARK_CENTRELINE_MARGIN_M
+            corners = self._park_corner_offsets()
+
+            def inside(d: float) -> bool:
+                rate = (car.speed / self.WHEELBASE) * math.tan(d)
+                psi_n = psi_car + rate * dt
+                v_n = v_car + math.sin(psi_car) * car.speed * dt
+                for (lf, lr) in corners:
+                    lat = v_n + lf * math.sin(psi_n) + lr * math.cos(psi_n)
+                    if lat > kerb_lim or lat < centre_lim:
+                        return False
+                return True
+
+            for f in (1.0, 0.75, 0.5, 0.35, 0.2, 0.0):
+                if inside(delta * f):
+                    delta *= f
+                    break
         car.steer_angle = delta
 
         # --- bicycle kinematics (signed speed) ---
-        max_rate = (self.A_LAT_MAX / abs(car.speed)) if abs(car.speed) > 0.3 else 0.0
+        # The rotation rate is proportional to speed by construction
+        # (rate = v/L * tan(delta)): a slowing car rotates slower, and at a
+        # standstill it does not rotate at all - there is no in-place turn
+        # to guard against. Freezing the rate below 0.3 m/s instead killed
+        # the final straightening exactly when the roll-out began (measured:
+        # heading locked 6.5 deg nose-in for the last 0.3 m of the line).
+        max_rate = self.A_LAT_MAX / max(abs(car.speed), 0.1)
         desired_rate = (car.speed / self.WHEELBASE) * math.tan(delta)
         rate = max(-max_rate, min(max_rate, desired_rate))
         car.heading = (car.heading + math.degrees(rate) * dt) % 360
@@ -2032,7 +2179,29 @@ class BicycleNav:
         self._sync_segment()
 
         self.park_phase = 'reverse'
-        if d_rem <= 0.05 and abs(car.speed) < self.PARK_STANDSTILL_M_S:
+        if PARK_DEBUG:
+            # Also watch the swept body corners: the feedback trajectory is
+            # NOT the checked path, so verify it stays inside the same
+            # envelope (kerb margin + oncoming-lane margin).
+            kerb_lim = seg.width / 2.0 - self.PARK_REVERSE_KERB_MARGIN_M
+            centre_lim = -self.PARK_CENTRELINE_MARGIN_M
+            worst_k = min(v_car + lf * math.sin(psi_car)
+                          + lr * math.cos(psi_car)
+                          for (lf, lr) in self._park_corner_offsets())
+            worst_o = max(v_car + lf * math.sin(psi_car)
+                          + lr * math.cos(psi_car)
+                          for (lf, lr) in self._park_corner_offsets())
+            if worst_k < centre_lim or worst_o > kerb_lim:
+                print(f"[RVWARN] n={getattr(self, '_rv_dbg', 0)} "
+                      f"corner out of envelope: [{worst_k:.2f}, {worst_o:.2f}] "
+                      f"lims [{centre_lim:.2f}, {kerb_lim:.2f}]")
+            self._rv_dbg = getattr(self, '_rv_dbg', 0) + 1
+            print(f"[RVDBG] n={self._rv_dbg} s={self._s:.2f} "
+                  f"d_rem={d_rem:.2f} v={car.speed:+.3f} "
+                  f"psi={(math.degrees(psi_car)):+.2f} e={e_off:+.3f} "
+                  f"delta={math.degrees(delta):+.1f}")
+        if (converged or d_rem <= 0.05) \
+                and abs(car.speed) < self.PARK_STANDSTILL_M_S:
             car.speed = 0.0
             self._reverse_park = None
             self._parked = True
@@ -2656,8 +2825,16 @@ class BicycleNav:
                                    if d_stop <= 0.5 and car.speed < 0.3
                                    else plan[0])
             # Standing at the staging point: back into the space (§1b).
+            # The roll-out can come to rest up to ~0.3 m SHORT of the stop
+            # point (the tail's constant decel engages below 0.3 m/s, i.e.
+            # while d/tau still says "keep rolling"), so the threshold must
+            # swallow that variance - measured live: a stop at d_stop=0.22
+            # sat forever two centimetres outside a 0.2 gate and the car
+            # never reversed. The reverse path is anchored to the car's ACTUAL
+            # pose (it re-solves the tuck from here), so starting slightly
+            # early just means a marginally longer back-up.
             if (self._park_style == 'reverse' and plan is not None
-                    and d_stop <= 0.2 and abs(car.speed) < 0.05):
+                    and d_stop <= 0.5 and abs(car.speed) < 0.05):
                 if self._start_reverse_park():
                     self._update_reverse_park(dt)
                     return
@@ -2752,8 +2929,18 @@ class BicycleNav:
                 (line_heading - car.heading + 180.0) % 360.0 - 180.0)
             cross = math.atan2(self.PARK_ALIGN_GAIN * e_right,
                                max(car.speed, 1.0))
-            delta = max(-self.MAX_STEER,
-                        min(self.MAX_STEER, heading_err - cross))
+            # Fade the cross term out over the last metre (see constant):
+            # only the heading correction survives into the final roll-out.
+            if d_to_stop < self.PARK_ALIGN_CROSS_FADE_START_M:
+                cross *= max(0.0, min(1.0,
+                            (d_to_stop - self.PARK_ALIGN_CROSS_FADE_END_M)
+                            / (self.PARK_ALIGN_CROSS_FADE_START_M
+                               - self.PARK_ALIGN_CROSS_FADE_END_M)))
+            # Heading term with PARK_ALIGN_HDG_GAIN (see constant): the
+            # 1:1 match is too slow for this window at creep speed.
+            delta = max(-self.MAX_STEER, min(self.MAX_STEER,
+                                             self.PARK_ALIGN_HDG_GAIN
+                                             * heading_err - cross))
 
         # --- longitudinal: throttle/brake toward the speed profile ---
         # The profile ALREADY encodes the cruising speed on straights and
@@ -2849,6 +3036,18 @@ class BicycleNav:
             car.speed = 0.0
         car.target_speed = car.speed
         car._braking = brake or (car.speed > v_target + 0.05)
+
+        # End-of-stop wheel straightening (parking only): below the yaw-
+        # clamp threshold (0.3 m/s, see the kinematics below) the car
+        # physically cannot rotate, so a large held steering command only
+        # reads as "fighting the wheel" while it rolls straight to its stop
+        # (measured: -10 deg held over the last 0.5 s). Fade the command to
+        # zero across [0.3, 0.5] m/s while the parking plan is active -
+        # continuous, and free above 0.5 m/s where the rotation budget
+        # actually lives. Other maneuvers (U-turn, reverse-in) keep their
+        # full commands.
+        if plan is not None and car.speed < 0.5:
+            delta *= max(0.0, min(1.0, (car.speed - 0.3) / 0.2))
 
         # Expose the steering angle for the driver's mechanical blinker
         # auto-off (steered in + steered back = indicator cancels itself).

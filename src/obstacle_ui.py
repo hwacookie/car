@@ -1,7 +1,8 @@
 # Obstacle palette UI (docs/OBSTACLES.md)
 # Fixed panel in the top-right corner, immediately left of the minimap.
-# Interactions use the LEFT mouse button only (middle-mouse pan and scroll
-# zoom are untouched; left click was previously unused in the game window):
+# Interactions use the LEFT mouse button, shared with map panning: every
+# press that starts a palette drag (a slot, a world obstacle) is consumed,
+# so a LMB hold-drag on empty map area falls through to the camera pan.
 #   1. Place:  press a palette slot -> ghost car follows the cursor with its
 #              final heading live-updating; release over the paved area ->
 #              placed, off-road or back over the palette -> cancelled.
@@ -106,8 +107,10 @@ class ObstaclePalette:
 
     def handle_event(self, event) -> bool:
         """Returns True if the event was consumed (NOT passed to the camera).
-        Only the LEFT mouse button is ever consumed; middle-button panning
-        and scroll zoom go through untouched."""
+        Only LEFT-mouse events are ever consumed, and only when they start a
+        palette drag (slot press, world-obstacle pick-up) or hit a panel
+        widget. LMB presses on empty map area are declined - the camera
+        turns them into a pan drag."""
         if event.type == pygame.MOUSEMOTION:
             self.cursor = event.pos
             return False

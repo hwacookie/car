@@ -400,7 +400,7 @@ Only roads with these highway types are loaded:
 
 ### Controls
 - **Mouse wheel**: Zoom in/out
-- **Middle mouse button + drag**: Pan map manually
+- **Left mouse button + drag** (on empty map area): Pan map manually
 - **+/- keys**: Zoom in/out
 - **C key**: Snap camera to car position
 
@@ -408,7 +408,7 @@ Only roads with these highway types are loaded:
 - **Follow mode**: Camera follows car when `speed > 0.1 m/s`
 - **Zoom range**: 0.64× to 16× (configurable)
 - **Smooth follow**: Interpolated camera movement
-- **Manual override**: Middle-mouse drag disables follow temporarily
+- **Manual override**: Left-mouse drag disables follow temporarily
 
 ## Minimap
 

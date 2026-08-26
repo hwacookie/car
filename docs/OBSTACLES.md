@@ -68,8 +68,9 @@ A fixed panel in the top-right corner, **immediately left of the minimap**
 - **SAVE / LOAD** buttons (see "Save / Load" below).
 - **Trashcan** at the bottom of the box.
 
-### Interactions (left mouse button; middle-mouse pan and scroll zoom are
-untouched, left click is currently unused in the game window)
+### Interactions (left mouse button, shared with map panning: a LMB
+hold-drag on empty map area pans the camera; every press that starts a
+palette drag - a slot or a world obstacle - is consumed by the UI)
 
 1. **Place**: press on a palette slot → a ghost car follows the cursor over
    the map, already shown with its final heading (lane travel direction under

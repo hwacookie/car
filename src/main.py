@@ -310,8 +310,9 @@ def main(smoke_test_frames: int = 0):
             elif event.type == pygame.MOUSEWHEEL:
                 camera.handle_zoom(event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                # Left mouse belongs to the obstacle palette (docs/OBSTACLES.md);
-                # middle-mouse panning goes through when it declines the event.
+                # Left mouse is shared: the obstacle palette gets first claim
+                # (slots, world obstacles); what it declines - empty map area -
+                # starts a camera pan drag.
                 if not obstacle_ui.handle_event(event):
                     camera.handle_mouse_down(event.button, event.pos)
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -396,6 +397,19 @@ def main(smoke_test_frames: int = 0):
                 validator.enable()
         main._last_v = keys[pygame.K_v]
         
+        # Paved-edge debug outline with G: white line along the exact
+        # paved-area polygon that defines the off-road check, so you can
+        # see where the game THINKS the road edge is (vs. what is drawn).
+        if _typing:
+            main._last_g = keys[pygame.K_g]
+        elif keys[pygame.K_g] and not hasattr(main, '_last_g'):
+            main._last_g = False
+        if keys[pygame.K_g] and not main._last_g and not _typing:
+            renderer.set_paved_edge(not renderer.paved_edge_visible)
+            print(f"Paved edge outline: "
+                  f"{'ON' if renderer.paved_edge_visible else 'OFF'}")
+        main._last_g = keys[pygame.K_g]
+        
         # U-turn (Wenden) with 'U' - one-shot request to the nav
         if _typing:
             main._last_u = keys[pygame.K_u]
@@ -457,6 +471,10 @@ def main(smoke_test_frames: int = 0):
                         validator.enable()
                     else:
                         validator.disable()
+                if 'paved_edge' in toggle_params:
+                    renderer.set_paved_edge(bool(toggle_params['paved_edge']))
+                    print(f"API: Paved edge outline "
+                          f"{'ON' if renderer.paved_edge_visible else 'OFF'}")
                 if 'mode' in toggle_params and car is not None:
                     mode = toggle_params['mode']
                     if mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
@@ -786,6 +804,10 @@ def main(smoke_test_frames: int = 0):
                     'camera_zoom': camera.zoom,
                 })
             else:
+                # Parking state lives on the nav, not the driver (reading
+                # car.driver yields None and silently disables the e2e
+                # suite's reverse-in gate).
+                _nav = getattr(car, 'bicycle_nav', None)
                 api.update_state({
                     'frame': frame,
                     'time': frame * dt_fixed if smoke_test_frames else frame / 60.0,
@@ -811,6 +833,17 @@ def main(smoke_test_frames: int = 0):
                     'accelerating': bool(getattr(car, '_accelerating', False)),
                     'wrong_side': on_wrong_side,
                     'driver': car.driver.get_name(),
+                    # Parking state for the e2e suite: a reverse-in park
+                    # deliberately crosses the flag to stage the back-in, so
+                    # the suite must wait for 'parked' instead of latching
+                    # arrival at the flag (see tests/test_turning.py).
+                    'parking': {
+                        'style': getattr(_nav, '_park_style', None),
+                        'phase': getattr(_nav, 'park_phase', 'none'),
+                        'parked': bool(getattr(_nav, '_parked', False)),
+                        'reversing':
+                            getattr(_nav, '_reverse_park', None) is not None,
+                    },
                     'trail_enabled': car.trail_enabled,
                     'validator_enabled': validator.enabled,
                     'validator_violations': len(validator.violations),
