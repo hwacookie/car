@@ -7,6 +7,8 @@ import io
 import time
 from typing import Dict, Any
 
+from .obstacles import PlacementError
+
 
 class GameAPI:
     """REST API for controlling the game and reading state."""
@@ -25,9 +27,16 @@ class GameAPI:
             'steer_right': False,
             'blinker_left': False,
             'blinker_right': False,
+            'uturn': False,
         }
         self.commands: Dict[str, Any] = {}  # For one-shot commands (teleport, etc.)
         self.screenshot_buffer: bytes = None
+        
+        # Obstacle system (docs/OBSTACLES.md): wired in by the game via
+        # set_obstacles(). Placement/removal goes through the SAME logic as
+        # the palette UI.
+        self.obstacle_manager = None
+        self.obstacle_network = None
         
         self._setup_routes()
     
@@ -55,7 +64,10 @@ class GameAPI:
                 "steer_left": bool,
                 "steer_right": bool,
                 "blinker_left": bool,
-                "blinker_right": bool
+                "blinker_right": bool,
+                "uturn": bool   (one-shot: request an on-site U-turn / Wenden),
+                "hazard": bool  (one-shot: true = hazard lights ON, false = OFF;
+                                 they stay on for at least 5 s once triggered)
             }
             """
             data = request.get_json()
@@ -63,6 +75,10 @@ class GameAPI:
                 for key in self.control_input.keys():
                     if key in data:
                         self.control_input[key] = bool(data[key])
+                # Hazard is a one-shot command (both on AND off are explicit),
+                # so it goes through the commands channel, not control_input.
+                if 'hazard' in data:
+                    self.commands['hazard'] = bool(data['hazard'])
             return jsonify({'ok': True, 'control': self.control_input})
         
         @self.app.route('/teleport', methods=['POST'])
@@ -78,6 +94,24 @@ class GameAPI:
                 self.commands['teleport'] = data
             return jsonify({'ok': True, 'command': 'teleport', 'params': data})
         
+        @self.app.route('/flags', methods=['POST'])
+        def flags():
+            """Set/clear the test start/end flags (visual confirmation
+            markers drawn on the map, to the RIGHT of the road).
+
+            Body: {"green": [x, y, heading_deg] | null,
+                   "red": [segment_idx, progress] | null}
+            Green is a world position (usually the car's); red is the
+            expected END as segment index + progress along it - the game
+            loop resolves it to a map position once the route covers that
+            segment, so the end flag is visible from the start of the
+            test. The renderer offsets both past the right kerb itself.
+            """
+            data = request.get_json(silent=True) or {}
+            with self.lock:
+                self.commands['flags'] = data
+            return jsonify({'ok': True, 'command': 'flags', 'params': data})
+
         @self.app.route('/label', methods=['POST'])
         def label():
             """Set (or clear) a short text label shown in the HUD - handy for
@@ -171,6 +205,57 @@ class GameAPI:
                 for key in self.control_input.keys():
                     self.control_input[key] = False
             return jsonify({'ok': True, 'control': self.control_input})
+        
+        @self.app.route('/obstacles', methods=['GET'])
+        def obstacles_list():
+            """List placed obstacles.
+            
+            Returns: [{id, type, color, x, y, heading}, ...]
+            (x/y in world coordinates, same as in saved layouts; heading
+            is the auto-aligned lane direction, never a client input.)
+            """
+            if self.obstacle_manager is None:
+                return jsonify({'error': 'obstacle system not available'}), 404
+            return jsonify(self.obstacle_manager.snapshot_dicts())
+        
+        @self.app.route('/obstacles', methods=['POST'])
+        def obstacles_place():
+            """Place an obstacle (same placement logic as the palette UI).
+            
+            Body: {"type": "car", "color": "blue|yellow|white",
+                   "x": <world px>, "y": <world px>}
+            Returns 201 + the created obstacle (id + computed heading);
+            4xx if the point is off-road or the request is invalid.
+            """
+            if self.obstacle_manager is None:
+                return jsonify({'error': 'obstacle system not available'}), 404
+            data = request.get_json(silent=True) or {}
+            try:
+                ob = self.obstacle_manager.place(
+                    self.obstacle_network,
+                    str(data.get("type", "car")),
+                    str(data.get("color", "")),
+                    float(data["x"]), float(data["y"]))
+            except (KeyError, TypeError, ValueError) as e:
+                return jsonify({'error': f'invalid request: {e}'}), 400
+            except PlacementError as e:
+                return jsonify({'error': str(e)}), 400
+            return jsonify(ob.to_dict()), 201
+        
+        @self.app.route('/obstacles/<int:ob_id>', methods=['DELETE'])
+        def obstacles_delete(ob_id: int):
+            """Remove an obstacle; 404 if unknown id."""
+            if self.obstacle_manager is None:
+                return jsonify({'error': 'obstacle system not available'}), 404
+            if not self.obstacle_manager.remove(ob_id):
+                return jsonify({'error': f'no obstacle with id {ob_id}'}), 404
+            return jsonify({'ok': True, 'id': ob_id})
+    
+    def set_obstacles(self, manager, network):
+        """Wire the obstacle system (docs/OBSTACLES.md) into the API.
+        Called by the game once the ObstacleManager exists."""
+        self.obstacle_manager = manager
+        self.obstacle_network = network
     
     def update_state(self, state: Dict[str, Any]):
         """Update game state (called from game loop)."""

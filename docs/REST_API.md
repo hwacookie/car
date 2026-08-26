@@ -143,6 +143,42 @@ Content-Type: application/json
 
 Blocks until condition is met or timeout.
 
+### Obstacles (docs/OBSTACLES.md)
+
+The game has a static obstacle system (parked cars). Placement and removal
+go through the same logic as the palette UI in the game window.
+
+**List obstacles**
+```bash
+GET /obstacles
+```
+Returns `[{id, type, color, x, y, heading}, ...]` — `x`/`y` in world pixels
+(2 px per meter), `heading` in degrees (0 = north). Empty list if none are
+placed.
+
+**Place an obstacle**
+```bash
+POST /obstacles
+Content-Type: application/json
+
+{"type": "car", "color": "blue", "x": 194, "y": 300}
+```
+- `type`: currently only `"car"` (a parked car, same size as the player car)
+- `color`: `blue`, `yellow` or `white`
+- `x`, `y`: world pixels (2 px per meter — divide by 2 for meters)
+
+The heading is NOT an input: it is computed from the lane direction under the
+drop point (right half of the road faces forward, left/oncoming half faces
+back; on curves and in junctions it follows the local road tangent).
+Returns `201` + the created obstacle (with its stable `id`). Returns `400`
+if the point is off the paved area or the request is invalid.
+
+**Remove an obstacle**
+```bash
+DELETE /obstacles/1
+```
+Returns `200` (`{"ok": true, "id": 1}`) or `404` for an unknown id.
+
 ## Example Usage
 
 ### Python (requests)

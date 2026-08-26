@@ -34,7 +34,21 @@ class Car:
         # Speed
         self.speed = 0.0  # m/s
         self.target_speed = 0.0
-        
+        # Engaged gear (FREE mode, like a real shifter): None = neutral,
+        # 'fwd' or 'rev'. Set by a FRESH key press at a standstill and
+        # persists afterwards; each gear only responds to its own throttle
+        # key (see Car._update_free_mode).
+        self._gear = None
+        # Virtual steering wheel position (FREE mode), -1..+1. Ramps toward
+        # the demanded direction at a finite rate instead of jumping to
+        # full lock on key-down (see config.STEER_LOCK_TIME_S).
+        self._steer_pos = 0.0
+
+        # Current steering angle in RADIANS, set by the navigation model
+        # each physics step (+ = right). The driver's mechanical blinker
+        # auto-off (real-car steering cam) reads this.
+        self.steer_angle = 0.0
+
         # Road following state (segment index + progress along it)
         self.seg_idx = seg_idx
         self.progress = 0.5  # 0.0 to 1.0 along segment
@@ -82,7 +96,7 @@ class Car:
                 self.bicycle_nav = BicycleNav(self, network)
             self.bicycle_nav.update(dt, control_input)
         else:
-            self._update_free_mode(dt, control_input)
+            self._update_free_mode(dt, control_input, network)
         
         # Update trail
         if self.trail_enabled:
@@ -95,38 +109,137 @@ class Car:
     
     # --- FREE Mode Physics ---
     
-    def _update_free_mode(self, dt: float, control_input: dict):
-        """Manual steering mode with cruise control."""
-        accel = control_input.get('accelerate', False)
-        brake = control_input.get('brake', False)
+    def _update_free_mode(self, dt: float, control_input: dict, network=None):
+        """Manual steering mode with a real-car gear model.
+
+        Speed is signed: positive = forward, negative = reverse. A real
+        car must brake through zero before it can back up - you cannot
+        jump from +v straight to -v:
+          moving forward  : S brakes to a stop, W accelerates
+          moving backward : W brakes to a stop, S accelerates (reverse)
+          at a standstill : a FRESH press of S engages reverse, a fresh
+                            press of W drives forward. Holding the brake
+                            key through zero never shifts gears.
+        """
+        accel = control_input.get('accelerate', False)      # W held
+        brake = control_input.get('brake', False)           # S held
+        accel_pressed = control_input.get('accelerate_pressed', False)
+        brake_pressed = control_input.get('brake_pressed', False)
         steer_left = control_input.get('steer_left', False)
         steer_right = control_input.get('steer_right', False)
         
-        # Speed control
-        if accel:
-            self.speed += config.CAR_ACCELERATION * dt
-        elif brake:
-            self.speed -= config.CAR_BRAKING * dt
+        # Speed control (signed, explicit gear state like a real car):
+        #   moving forward  : S brakes to a stop, W accelerates
+        #   moving backward : W brakes to a stop, S accelerates (reverse)
+        #   at a standstill : a FRESH press of S shifts into reverse, a
+        #                     fresh press of W shifts into drive. The gear
+        #                     then persists (like a shifter) and only its
+        #                     own throttle key moves the car - so holding
+        #                     the brake through zero never engages anything.
+        if self.speed > 0:            # moving forward
+            if brake:
+                self.speed -= config.CAR_BRAKING * dt
+            elif accel:
+                self.speed += config.CAR_ACCELERATION * dt
+            if self.speed < 0:        # braking ends exactly at zero
+                self.speed = 0.0
+        elif self.speed < 0:          # moving backward
+            if accel:                 # W is the brake in reverse
+                self.speed += config.CAR_BRAKING * dt
+            elif brake:               # S is the throttle in reverse
+                self.speed -= config.CAR_ACCELERATION * dt
+            if self.speed > 0:        # ...and ends exactly at zero
+                self.speed = 0.0
+        else:                         # standstill: shifting + throttle
+            if brake_pressed:
+                self._gear = 'rev'
+            elif accel_pressed:
+                self._gear = 'fwd'
+            if self._gear == 'rev' and brake:
+                self.speed -= config.CAR_ACCELERATION * dt
+            elif self._gear == 'fwd' and accel:
+                self.speed += config.CAR_ACCELERATION * dt
         
-        self.speed = max(0, min(config.CAR_SPEED, self.speed))
+        self.speed = max(-config.REVERSE_MAX_SPEED_M,
+                         min(config.CAR_SPEED, self.speed))
+        # Deadband so the car doesn't oscillate around 0 when neither
+        # gear input is held.
+        if not accel and not brake and abs(self.speed) < 0.05:
+            self.speed = 0.0
         self.target_speed = self.speed
+
+        # Brake lights: S while moving forward, W while reversing.
+        self._braking = (self.speed > 0 and brake) or \
+                        (self.speed < 0 and accel)
         
-        # Steering (only when moving)
-        if self.speed > 0:
-            turn_factor = max(0.3, 1.0 - self.speed / config.CAR_SPEED * 0.7)
+        # Steering (only when moving). The wheel position ramps toward the
+        # demanded direction at a finite rate (config.STEER_LOCK_TIME_S)
+        # and eases back to center on release - instant full lock on
+        # key-down felt twitchy and "too direct". In reverse the yaw goes
+        # the OTHER way for the same steering input (bicycle model:
+        # omega = v*tan(d)/L with signed v) - that is how backing a car
+        # into a spot works.
+        steer_target = 0.0
+        if steer_left:
+            steer_target -= 1.0
+        if steer_right:
+            steer_target += 1.0
+        wheel_rate = dt / config.STEER_LOCK_TIME_S
+        if self._steer_pos < steer_target:
+            self._steer_pos = min(steer_target, self._steer_pos + wheel_rate)
+        elif self._steer_pos > steer_target:
+            self._steer_pos = max(steer_target, self._steer_pos - wheel_rate)
+
+        if abs(self.speed) > 0 and abs(self._steer_pos) > 1e-6:
+            speed_abs = abs(self.speed)
+            turn_factor = max(0.3, 1.0 - speed_abs / config.CAR_SPEED * 0.7)
             turn_rate = config.CAR_TURN_SPEED * turn_factor * dt
-            if steer_left:
-                self.heading -= turn_rate
-            if steer_right:
-                self.heading += turn_rate
-            self.heading = self.heading % 360
+            # A real car's yaw rate at FULL lock is v / R_min (the bicycle
+            # model): the fixed arcade rate above would imply a turning
+            # radius below the mechanical minimum at low speed - physically
+            # impossible, and exactly what the validator rejects. Cap the
+            # per-frame heading change with the same limit BICYCLE mode has.
+            max_rate = math.degrees(speed_abs / config.MIN_TURN_RADIUS_M) * dt
+            # Partial lock scales the yaw proportionally (the cap above is
+            # the full-lock value).
+            turn_rate = min(turn_rate, max_rate) * abs(self._steer_pos)
+            sign = 1.0 if self.speed >= 0 else -1.0
+            self.heading = (self.heading
+                            + self._steer_pos * sign * turn_rate) % 360
         
-        # Movement
+        # Movement (signed speed handles reverse)
         rad = math.radians(self.heading)
         dx = math.sin(rad) * self.speed * dt * config.PIXELS_PER_METER
         dy = math.cos(rad) * self.speed * dt * config.PIXELS_PER_METER
         self.x += dx
         self.y += dy
+        
+        # Keep seg_idx/progress/forward current: the lane guard (wrong-side
+        # check) and API state read them, but FREE mode never updates them
+        # on its own - without this, every check silently measures against
+        # the segment the car spawned on. Cheap per frame (one projection);
+        # the full nearest-segment search only runs when the car has left
+        # the current segment (junctions, off-road excursions).
+        if network is not None:
+            self._refresh_segment_if_left(network)
+    
+    def _refresh_segment_if_left(self, network):
+        """Re-derive seg_idx/progress/forward once the car has left its
+        current segment (FREE mode only - BICYCLE mode tracks this itself)."""
+        seg = network.segments[self.seg_idx]
+        dx = seg.x2 - seg.x1
+        dy = seg.y2 - seg.y1
+        length_sq = dx * dx + dy * dy
+        if length_sq < 1e-9:
+            self.snap_to_road(network)
+            return
+        t = ((self.x - seg.x1) * dx + (self.y - seg.y1) * dy) / length_sq
+        proj_x = seg.x1 + t * dx
+        proj_y = seg.y1 + t * dy
+        lat_px = math.hypot(self.x - proj_x, self.y - proj_y)
+        half_width_px = (seg.width / 2.0 + 1.0) * config.PIXELS_PER_METER
+        if not (-0.15 <= t <= 1.15) or lat_px > half_width_px:
+            self.snap_to_road(network)
     
     # --- Utility ---
     
@@ -221,6 +334,34 @@ class Car:
         off = config.REAR_AXLE_OFFSET_M * config.PIXELS_PER_METER
         return self.x + math.sin(rad) * off, self.y + math.cos(rad) * off
 
+    # Interpolated render position (x, y, heading), set by the main loop
+    # every frame. Physics runs in fixed 1/60 s substeps; a rendered frame
+    # can contain 0 or 2 of them (the accumulator aliasing against the
+    # render rate), which without interpolation makes the car freeze for a
+    # frame and then jump - visible as a periodic 2-3 px hop. Rendering at
+    # lerp(prev_state, curr_state, alpha) instead moves smoothly every
+    # frame. None = draw the live state (frozen / before first step).
+    _render_state: tuple[float, float, float] | None = None
+
+    def render_body_center(self) -> tuple[float, float]:
+        """body_center() at the interpolated render position.
+
+        Only for DRAWING. Physics and validation keep using the exact state
+        via body_center().
+        """
+        if self._render_state is None:
+            return self.body_center()
+        x, y, h = self._render_state
+        rad = math.radians(h)
+        off = config.REAR_AXLE_OFFSET_M * config.PIXELS_PER_METER
+        return x + math.sin(rad) * off, y + math.cos(rad) * off
+
+    def render_heading(self) -> float:
+        """Heading at the interpolated render position (drawing only)."""
+        if self._render_state is None:
+            return self.heading
+        return self._render_state[2]
+
     def is_on_road(self, network) -> bool:
         """Check if the car (all four corners, not just its center) is on
         any road.
@@ -237,8 +378,9 @@ class Car:
     def draw(self, surface: pygame.Surface, camera):
         """Draw the car sprite."""
         # The sprite is the BODY, which sits ahead of the rear axle that
-        # (self.x, self.y) tracks - see Car.body_center().
-        sx, sy = camera.world_to_screen(*self.body_center())
+        # (self.x, self.y) tracks - and at the INTERPOLATED render position
+        # so fixed-timestep substeps never show up as pixel jumps.
+        sx, sy = camera.world_to_screen(*self.render_body_center())
         sx, sy = int(sx), int(sy)
         scale = camera.zoom
         
@@ -254,14 +396,16 @@ class Car:
         scaled_sprite = pygame.transform.scale(base_sprite, (int(car_width_px), int(car_length_px)))
         
         # Rotate sprite
-        rotated = pygame.transform.rotate(scaled_sprite, -self.heading)
+        rotated = pygame.transform.rotate(
+            scaled_sprite, -self.render_heading())
         
         # Center and draw
         rect = rotated.get_rect(center=(sx, sy))
         surface.blit(rotated, rect)
         
-        # Draw dynamic lights on top (blinkers)
-        if self.driver and self.driver.get_name() == "BICYCLE":
+        # Draw dynamic lights on top (blinkers) - in BOTH modes: in FREE
+        # mode the human flicks Q/E and of course expects to see the light.
+        if self.driver and hasattr(self.driver, 'blinker_left'):
             self._draw_blinkers(surface, sx, sy, scale)
     
     def _get_base_sprite(self) -> pygame.Surface:
@@ -294,27 +438,48 @@ class Car:
         return Car._sprite_cache[sprite_file]
     
     def _draw_blinkers(self, surface: pygame.Surface, sx: float, sy: float, scale: float):
-        """Draw blinker lights (orange, flashing)."""
+        """Draw the four CORNER blinker lights (orange, flashing).
+
+        One light at each body corner (front/rear x left/right). A normal
+        indicator lights its two corners; the hazard lights (Warnblinkanlage)
+        light all four in sync.
+        """
         if not self.driver or not hasattr(self.driver, 'blinker_left'):
             return
-        
-        if not (self.driver.blinker_left or self.driver.blinker_right):
+
+        left = self.driver.blinker_left
+        right = self.driver.blinker_right
+        hazard = getattr(self.driver, 'hazard', False)
+        if not (left or right or hazard):
             return
-        
-        # Flash with 0.5s period
+
+        # Flash with 0.5s period (all corners in sync, like real hazards)
         import time
         if (time.time() % 0.5) > 0.25:
             return
-        
+
         half_wid = (config.CAR_WIDTH / 2) * config.PIXELS_PER_METER * scale
-        rad = math.radians(self.heading)
-        
-        for side in ((-1, self.driver.blinker_left), (1, self.driver.blinker_right)):
-            sign, active = side
-            if not active:
-                continue
-            bx = sx + math.sin(rad) * config.CAR_LENGTH / 3 * config.PIXELS_PER_METER * scale
-            bx += math.cos(rad) * sign * half_wid * 0.8
-            by = sy - math.cos(rad) * config.CAR_LENGTH / 3 * config.PIXELS_PER_METER * scale
-            by += math.sin(rad) * sign * half_wid * 0.8
-            pygame.draw.circle(surface, (255, 180, 0), (int(bx), int(by)), 3)
+        fore = (config.CAR_LENGTH / 2) * 0.85 * config.PIXELS_PER_METER * scale
+        lat = half_wid * 0.75
+        rad = math.radians(self.render_heading())
+
+        for fore_sign in (+1, -1):          # front, rear
+            for side_sign, active in ((-1, left), (1, right)):
+                if hazard:
+                    active = True           # hazards: all four corners
+                if not active:
+                    continue
+                bx = sx + math.sin(rad) * fore_sign * fore \
+                       + math.cos(rad) * side_sign * lat
+                by = sy - math.cos(rad) * fore_sign * fore \
+                       + math.sin(rad) * side_sign * lat
+                # Scales with zoom like the sprite does, but sub-linearly
+                # and clamped: a real indicator is a small fraction of the
+                # body width. At zoom 1 the car is ~9 px long and the light
+                # stays a visible dot; at zoom 7 (62 px car) it's a proper
+                # corner light - not a blob covering half the body.
+                r = max(2, min(7, int(scale * 0.8)))
+                pygame.draw.circle(surface, (160, 90, 0),
+                                   (int(bx), int(by)), r + 3)
+                pygame.draw.circle(surface, (255, 180, 0),
+                                   (int(bx), int(by)), r)

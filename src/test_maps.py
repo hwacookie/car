@@ -200,6 +200,10 @@ def build_basic_test_map() -> RoadNetwork:
         Tile (0,3): Sliver junction - a very short approach into a 4-way
                     with a near-straight, a sharp-right and a sharp-left
                     exit (mirrors the real-world 815 -> 1008 layout).
+        Tile (4,0): Widths road - straight dead-end street in four 50 m
+                    sections of decreasing width: 13 m, 9 m, 7 m, 4 m.
+                    Used for U-turn tests at different road widths
+                    (single swing on 13 m, three-point on 9/7 m, ...).
     """
     b = MapBuilder()
     TILE = 500.0  # pitch between tiles, meters
@@ -214,6 +218,22 @@ def build_basic_test_map() -> RoadNetwork:
     b.road("straight_n", "straight_s")
     b.start("straight", "straight_n")           # spawn at north, heading south
     b.start("straight_reverse", "straight_s")   # spawn at south, heading north
+
+    # --- Tile (4,0): Widths road - four 50 m sections, one width each ---
+    # Straight dead-end street, north to south: 13 m, 9 m, 7 m, 4 m.
+    # U-turn scenarios run in the widest section; the narrow sections are
+    # for future "too tight -> back up and retry" tests.
+    ox, oy = origin(4, 0)
+    b.node("widths_n",  ox + 100, oy + 300)    # north dead end (in 13 m section)
+    b.node("widths_139", ox + 100, oy + 250)   # 13 -> 9
+    b.node("widths_97",  ox + 100, oy + 200)   # 9 -> 7
+    b.node("widths_74",  ox + 100, oy + 150)   # 7 -> 4
+    b.node("widths_s",  ox + 100, oy + 100)    # south dead end (in 4 m section)
+    b.road("widths_n", "widths_139", width=13.0)
+    b.road("widths_139", "widths_97", width=9.0)
+    b.road("widths_97", "widths_74", width=7.0)
+    b.road("widths_74", "widths_s", width=4.0)
+    b.start("widths", "widths_n")              # spawn at north, heading south
 
     # --- Tile (1,0): 90 deg RIGHT turn (approach heading south) ---
     # Come down from the north, turn right (WEST) at the corner.

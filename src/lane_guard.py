@@ -51,12 +51,20 @@ class LaneGuard:
         offset_m = self._lateral_offset(car, seg, network)
         car_id = getattr(car, "uid", id(car))
 
-        # If distance to centerline < half car width (0.9m), the left edge
-        # crosses into the opposing lane.
-        HALF_CAR_WIDTH = 0.9
+        # Wrong-side threshold, relative to the road width:
+        #   7 m and wider: 0.9 m (half car width) - the left edge crossing
+        #       the centreline is already wrong-side driving.
+        #   narrow two-way roads (3.5-4 m service lanes): the lane is
+        #       NARROWER than the car, so correct driving sits at only
+        #       ~0.5-0.75 m from the centreline and the fixed 0.9 m test
+        #       fired constantly (crashing BICYCLE runs on OSM maps).
+        #       There, wrong-side means the car's CENTRE has crossed into
+        #       the opposing half: threshold 0.15 m (noise margin).
+        threshold = max(0.15, min(0.9,
+                                  config.kerb_offset_m(seg.width) - 0.9))
         EPSILON = 0.02  # avoid false positives from floating-point noise at exact boundary
-        was_wrong = car_id in self._last_offset and self._last_offset[car_id] < (HALF_CAR_WIDTH - EPSILON)
-        is_wrong = offset_m < (HALF_CAR_WIDTH - EPSILON)
+        was_wrong = car_id in self._last_offset and self._last_offset[car_id] < (threshold - EPSILON)
+        is_wrong = offset_m < (threshold - EPSILON)
         
         if is_wrong:
             self.violations += 1
@@ -65,7 +73,8 @@ class LaneGuard:
             if not was_wrong:
                 print(
                     f"\n⚠️  WRONG-SIDE DRIVING! distance to centerline "
-                    f"{offset_m:.2f} m (half car width = 0.90 m) on segment {car.seg_idx}\n"
+                    f"{offset_m:.2f} m (threshold = {threshold:.2f} m, "
+                    f"road width {seg.width} m) on segment {car.seg_idx}\n"
                 )
         
         self._last_offset[car_id] = offset_m

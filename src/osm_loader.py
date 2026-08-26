@@ -1,7 +1,13 @@
 # OSM Data Loader
-# Fetches road network from the OSM-Wars PostgreSQL database.
+# Fetches road network from the OSM-Wars PostgreSQL database, with a
+# file-based cache so the game runs without any database once a bounding
+# box has been fetched once.
 
 from __future__ import annotations
+
+import hashlib
+import json
+import os
 
 import psycopg
 from psycopg.rows import dict_row
@@ -44,6 +50,52 @@ DRIVABLE_HIGHWAY_IDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14)
 
 def _connect():
     return psycopg.connect(**DB_CONFIG, row_factory=dict_row)
+
+
+# --- File cache -----------------------------------------------------------
+# After the first successful DB fetch, the result is stored as JSON under
+# data/osm_cache/ keyed by bounding box. Subsequent starts load from that
+# file and never touch the database - so a stopped Postgres (or Docker)
+# does not block the game.
+
+def _cache_path(north: float, south: float, west: float, east: float) -> str:
+    key = f"{north:.7f}_{south:.7f}_{west:.7f}_{east:.7f}"
+    digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..",
+        "data", "osm_cache", f"osm_{digest}.json",
+    )
+
+
+def _load_cache(north: float, south: float, west: float, east: float):
+    """Return cached OSM data for the bbox, or None if absent/stale."""
+    if os.environ.get("OSM_FORCE_REFRESH") == "1":
+        return None
+    path = _cache_path(north, south, west, east)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not data.get("ways"):
+            return None
+        print(f"  Using cached OSM data: {path} "
+              f"({len(data['ways'])} segments, no database needed)")
+        return data
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  (cache unreadable, ignoring: {e})")
+        return None
+
+
+def _write_cache(north: float, south: float, west: float, east: float, data: dict):
+    path = _cache_path(north, south, west, east)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+        print(f"  Cached OSM data to {path}")
+    except OSError as e:
+        print(f"  (could not write cache file: {e})")
 
 
 def _get_map_schema(conn, west: float, south: float, east: float, north: float) -> str:
@@ -95,8 +147,34 @@ def fetch_osm_data(
                     "highway": str,
                     "oneway": bool,
                 }, ... ]
+
+    The result is cached to data/osm_cache/ (see _cache_path); if a cache
+    file exists for this bounding box it is returned without touching the
+    database. Set OSM_FORCE_REFRESH=1 to bypass the cache.
     """
-    conn = _connect()
+    cached = _load_cache(north, south, west, east)
+    if cached is not None:
+        return cached
+
+    try:
+        conn = _connect()
+    except psycopg.OperationalError as e:
+        raise RuntimeError(
+            "Cannot reach the OSM-Wars PostgreSQL database "
+            f"({DB_CONFIG['host']}:{DB_CONFIG['port']}, db '{DB_CONFIG['dbname']}').\n"
+            "No local cache exists for this bounding box yet, so the map\n"
+            "cannot be loaded. To fix:\n"
+            "  1. Start a Postgres that has the osm_wars database with an\n"
+            "     imported road_geometry schema, e.g. the OSM-Wars Docker setup:\n"
+            "         cd ~/prj/OSM-Wars/docker && docker compose up -d\n"
+            "     or a local Homebrew cluster (if it holds the data):\n"
+            "         brew services start postgresql@14\n"
+            "  2. Check connectivity:  pg_isready\n"
+            "  3. Restart the game - the first successful fetch is cached to\n"
+            f"     {_cache_path(north, south, west, east)}\n"
+            "     and afterwards the game runs WITHOUT any database.\n"
+            "(Delete that cache file or set OSM_FORCE_REFRESH=1 to re-fetch.)"
+        ) from e
     try:
         map_schema = _get_map_schema(conn, west, south, east, north)
         print(f"  Using map schema: {map_schema}")
@@ -139,6 +217,8 @@ def fetch_osm_data(
                 "oneway": oneway,
             })
 
-        return {"nodes": nodes, "ways": ways}
+        data = {"nodes": nodes, "ways": ways}
+        _write_cache(north, south, west, east, data)
+        return data
     finally:
         conn.close()

@@ -225,19 +225,86 @@ Dreipunkt-Wende erfordert folgende Erweiterungen:
 
 ## 6. Ausweichen (Obstacle Avoidance)
 
-**Auslöser:** Hindernis in der eigenen Spur erkannt (z.B. stehendes Fahrzeug, Baustelle, Gegenstand).
+Gilt für den **BICYCLE-Modus** (AI-Fahrt): das Auto weicht selbst aus. Im
+**FREE-Modus** ist das Ausweichen Sache des Spielers; das Auto hält sich dort
+an Stop-on-Contact (`docs/OBSTACLES.md`).
 
-| Phase | Beschreibung |
-|-------|-------------|
-| **Hindernis erkennen** | Sensorik/API meldet Objekt in der Fahrspur innerhalb von `DETECTION_DISTANCE_M`. |
-| **Versuch: Auf eigener Spur bleiben** | Auto versucht, das Hindernis so dicht wie möglich an der rechten Seite zu passieren, ohne die Mittellinie zu überqueren. Dazu blendet die Referenzlinie kurz nach rechts (zum Rand) und zurück. |
-| **Falls nötig: Mittellinie überqueren** | Wenn das Hindernis zu weit in die eigene Spur ragt und ein Passieren auf der eigenen Seite unmöglich ist, schwenkt das Auto nach links über die Mittellinie – analog an einem langsamen Fahrzeug vorbeifahren. Blinker links an. |
-| **Hindernis passiert** | Sobald das Hindernis hinter dem Auto ist, blendet die Referenzlinie zurück in die normale Spurposition. |
-| **Blinker aus (falls aktiv)** | Wenn der Blinker wegen Mittellinie-Überquerung aktiv war, wird er automatisch ausgeschaltet, sobald das Auto wieder komplett auf der eigenen Spur ist. |
+Hindernisse werden über die Palette neben der Minimap oder per REST API auf
+die Straße gesetzt und lassen sich als Layout speichern/laden —
+`docs/OBSTACLES.md`.
 
-### Parameter
+### Zwei Hindernisklassen
 
-- `DETECTION_DISTANCE_M` – Erkennungsbereich für Hindernisse
-- `MIN_CLEARANCE_M` – Minimaler Sicherheitsabstand zum Hindernis
-- LaneGuard wird unterdrückt, solange das Ausweichmanöver aktiv ist
-- Geschwindigkeit wird während des Manövers reduziert
+- **Statisch** (dieses Kapitel): z.B. parkende Autos. Stehen still, Position
+  bekannt → reine Geometrie: Lücken, Korridor, Bremsstrecke.
+- **Beweglich** (später, noch nicht spezifiziert): andere Fahrzeuge,
+  Fußgänger, Kinder. Sie können sich vor Erreichen des Kollisionspunkts
+  entfernen und sind oft erst in großer Entfernung sichtbar → erfordert die
+  **Vorhersage** möglicher Kollisionen (Zukunftsbelegung statt fester Boxen).
+  Die Erkennungs-/Entscheidungslogik wird so gehalten, dass statische und
+  bewegliche Hindernisse später dieselbe Schnittstelle speisen: „Belegung
+  entlang der Route“.
+
+### Erkennung (statische Hindernisse)
+
+Ein Hindernis ist **relevant**, wenn sein Footprint den Korridor um die
+Referenzlinie schneidet (Korridorbreite = Fahrzeugbreite + Reserve) und es in
+Fahrtrichtung vor dem Auto liegt. Spätestens relevant ist es, wenn der Abstand
+die geschwindigkeitsabhängige komfortable Bremsstrecke bis zum Halten hinter
+dem Hindernis erreicht hat — `v²/(2·A_AVOID)` plus Reaktionsreserve, wie beim
+Parken (explizite Entscheidung: kein fester Wert).
+
+### Optionen (Priorität: rechts → links → halten)
+
+| Option | Bedingung | Verhalten |
+|--------|-----------|-----------|
+| **1. Rechts vorbei** (eigene Spur) | Lücke zwischen Hindernis und rechtem Fahrbahnrand ≥ Fahrzeugbreite + `AVOID_CLEARANCE_M` (Hindernisseite) + `ROAD_EDGE_TOLERANCE_M` (Randseite) | Referenzlinie läuft durch die rechte Lücke, so nah am Rand wie erlaubt; **kein Blinker** |
+| **2. Links vorbei** (Mittellinie überqueren) | Option 1 nicht möglich, **und** die Gegenfahrbahn ist innerhalb von `AVOID_ONCOMING_AHEAD_M` (vorne) bzw. `AVOID_ONCOMING_BEHIND_M` (hinten) frei | Referenzlinie überquert die Mittellinie; LaneGuard wird im Ausweichbereich unterdrückt; **Linker Blinker** an |
+| **3. Halten** | Keine Passage-Option ist an der aktuellen Position noch sicher ausführbar (beide Seiten blockiert, zu nah, zu schnell) | Komfortables Bremsen mit `A_AVOID` zum Stillstand hinter dem Hindernis, Standabstand ≥ `STOP_GAP_M` |
+
+**Erreichbarkeit wie beim Abbiegen (§4):** Ist die gewählte Option nicht mehr
+physikalisch ausführbar, wird **nicht** unsicher ausgewichen — das Auto bremst
+(Option 3). Ein Ausweichmanöver ist ein Manöver wie jedes andere: nichts
+Unmögliches.
+
+Mehrere Hindernisse (z.B. Slalom): die Entscheidung gilt über den gesamten
+relevanten Abschnitt — maßgebend ist die **engste** freie Breite.
+
+### Ausführung
+
+- Das Hindernis wird als **zusätzliche harte Grenze** in die Raceline-
+  Optimierung eingegeben: der Korridor wird um den dilatierten Footprint des
+  Hindernisses (+ `AVOID_CLEARANCE_M`) verkleinert. Die Ausweichlinie ist dann
+einfach die krümmungsärmste Linie durch die Lücke — dieselbe Maschine wie
+Spurhalten und Abbiegen, keine Sonderlogik.
+- Für Option 2 wird die Korridor-Untergrenze (Mittellinie) im Ausweichbereich
+  aufgehoben (analog zur Einbahnregelung in §4).
+- Die Geschwindigkeit ergibt sich aus dem bestehenden Speed-Profile aus der
+  Krümmung der Ausweichlinie — enge Lücke bedeutet automatisch langsamer.
+- **Blinker:** Der für Option 2 gesetzte Linker Blinker wird für die Dauer des
+  Manövers gehalten (wie beim Wenden) und erst ausgeschaltet, wenn das Auto
+  wieder vollständig auf der eigenen Spur ist — die mechanische Cam-Logik ist
+  während des Ausweichens unterdrückt.
+- **Rückkehr in die Normalposition:** Sobald das Heck des Autos die Vorderkante
+des Hindernisses um `RECOVERY_MARGIN_M` passiert hat, greift die
+  Hindernis-Grenze nicht mehr; die krümmungsärmste Linie ist wieder die
+  Spurmitte — die Rückblendung ergibt sich von selbst (wie hinter einer
+  Kreuzung).
+
+### Parameter (Vorschläge — noch nicht implementiert)
+
+- `A_AVOID = 3.5 m/s²` – komfortable Verzögerung für Erkennung und Halten
+  (wie `A_PARK`, kein Grund zum Notbremsen)
+- `AVOID_CLEARANCE_M = 0.5` – lateraler Mindestabstand zum Hindernis beim Passieren
+- `AVOID_ONCOMING_AHEAD_M = 60` / `AVOID_ONCOMING_BEHIND_M = 30` – die
+  Gegenfahrbahn muss in diesem Bereich frei sein (in Teil 1: frei von
+  statischen Hindernissen; später auch von vorhergesagtem Verkehr)
+- `STOP_GAP_M = 5.0` – Standabstand hinter dem Hindernis
+- `RECOVERY_MARGIN_M` – Heck-Vorsprung, ab dem das Hindernis „passiert“ gilt
+
+### Interaktion mit anderen Manövern
+
+- **Aktives Abbiegen** (Blinker + Turn-Blend-Zone): keine Mittellinie-
+  Überquerung zum Ausweichen — nur Option 1 oder 3.
+- **Parken / Wenden am Ziel:** explizite Kommandos haben Vorrang; liegt das
+  Ziel hinter einem Hindernis, gilt Option 3 (halten) statt drüberzufahren.

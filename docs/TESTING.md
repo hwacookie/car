@@ -1,10 +1,23 @@
-# How Testing Works Here (via the REST Server)
+# How Testing Works Here
 
-This project has no in-process unit-test harness for driving behavior -
-instead, the running game exposes a REST API, and test scripts drive the
-actual game (actual physics, actual rendering, actual road network) from
-the outside, exactly like a human or another program would. This
-document explains that workflow end-to-end.
+Testing has two layers:
+
+1. **Headless pytest suites** (`tests/test_obstacles.py`,
+   `tests/test_road_network.py`) - no game process, no window, no REST
+   server: they build the road network and car directly in-process and
+   assert on placement rules, collision geometry, stop-on-contact
+   physics, layout save/load, and the obstacle REST handlers (via
+   Flask's test client). They run in seconds and are the first thing to
+   run after a change:
+   ```bash
+   .venv/bin/python -m pytest tests/test_obstacles.py tests/test_road_network.py -q
+   ```
+2. **Live e2e suite** (the rest of this document) - the running game
+   exposes a REST API, and test scripts drive the actual game (actual
+   physics, actual rendering, actual road network) from the outside,
+   exactly like a human or another program would: `tests/test_turning.py`
+   for the turning scenarios, `scripts/verify_obstacles_live.py` for the
+   obstacle stop-on-contact scenario.
 
 See `docs/REST_API.md` for the full endpoint reference; this document
 focuses on the *testing workflow* itself.
@@ -229,8 +242,24 @@ then top-to-bottom - note this is the *visual* minimap position, which is
 vertically flipped from the map's internal world-grid row; see the comment
 above `START_POINT_NUMBER` for why).
 
-## 6. Other test scripts
+## 6. Other test scripts and suites
 
+- **`tests/test_obstacles.py`** (headless pytest) - the obstacle system:
+  placement validation (paved-area only; lane-direction alignment
+  including corners and the roundabout ring), SAT collision geometry,
+  stop-on-contact physics (full braking, no interpenetration, plus a
+  high-speed approach with per-substep heading drift as regression for
+  the live pass-through bug), layout save/load and map scoping, the
+  `/obstacles` REST handlers via Flask's test client, and headless
+  palette drag handling. No game process needed:
+  `.venv/bin/python -m pytest tests/test_obstacles.py -q`.
+- **`tests/test_road_network.py`** (headless pytest) - road network /
+  smoothed geometry unit tests.
+- **`scripts/verify_obstacles_live.py`** (live, REST-driven) - places a
+  parked-car obstacle in the lane of the running game via `POST
+  /obstacles`, drives into it, and asserts the car stops on contact
+  without interpenetrating or passing through. Run against a fresh
+  `python -m src.main --map basic --api` process.
 - `tests/test_api.py` - basic REST API smoke tests (health check,
   control endpoints respond, etc.) - not scenario/physics testing.
 

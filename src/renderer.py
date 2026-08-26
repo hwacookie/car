@@ -15,15 +15,40 @@ class Renderer:
     # Cache of PIL fonts by size (class-level, shared across instances)
     _pil_fonts: dict[int, object] = {}
 
+    # --- Static road tiling ---
+    # The road network never changes at runtime, so instead of transforming
+    # and re-drawing every (often huge, merged-corridor) road polygon on
+    # EVERY frame - which cost ~35 ms/frame on the Kleinmachnow OSM map -
+    # roads + markings + junction dots are rendered once per 512x512 screen-
+    # pixel tile at the current zoom and cached. Per-frame cost drops to a
+    # handful of blits; new tiles pay a one-time render when first visited.
+    TILE_PX = 512
+    _MAX_TILES = 96
+
     def __init__(self, network: RoadNetwork, camera: Camera):
         self.network = network
         self.camera = camera
-        # HUD text is re-rendered via PIL only every Nth frame (~0.1s at
-        # 60fps) - text rasterization is the most expensive part of the
-        # HUD, and a 10 Hz speed readout is indistinguishable from 60 Hz.
-        self._hud_frame = 0
-        self._HUD_TEXT_INTERVAL = 6
-        self._hud_texts: dict[str, pygame.Surface] = {}
+        # Test confirmation flags (set via POST /flags): a GREEN flag at
+        # the scenario's start and a RED flag at its end, both drawn as
+        # pennants to the right of the road so the player can see exactly
+        # where the test begins and stops. [x_px, y_px, heading_deg].
+        # The end flag arrives as (segment, progress) first and is resolved
+        # to a position by the main loop once the route covers that segment
+        # (flag_red_pending), so it is visible from the START of the test.
+        self.flag_green: list | None = None
+        self.flag_red: list | None = None
+        self.flag_red_pending: tuple | None = None
+        from collections import OrderedDict
+        self._tiles: "OrderedDict[tuple, pygame.Surface]" = OrderedDict()
+        self._tile_polys: list | None = None
+        # HUD text: re-rendered via PIL only when its content CHANGES,
+        # rate-limited to one change per key every few frames (<=50 ms lag
+        # at 60 fps - indistinguishable from live); unchanged strings are
+        # never re-rendered at all. See _hud_text for why the old
+        # per-CALL counter was wrong.
+        self._frame = 0
+        self._HUD_TEXT_MIN_INTERVAL = 3
+        self._hud_texts: dict[str, tuple] = {}
         # Note: pygame.font is broken on some platforms (SDL_ttf import
         # issue). All text rendering goes through PIL instead — see
         # _text_surface() below.
@@ -56,49 +81,245 @@ class Renderer:
         return pygame.image.fromstring(img.tobytes(), img.size, img.mode)
 
     def draw(self, surface: pygame.Surface, car):
+        self._frame += 1
         self.draw_roads(surface)
+        self.draw_test_flags(surface)
         # Trail is drawn AFTER the car sprite (see main.py) so buckets
         # are visible at the car's edges rather than hidden underneath.
-        self.draw_minimap(surface, car)
-        self.draw_hud(surface, car)
-    # --- Roads ---
-    def draw_roads(self, surface: pygame.Surface):
-        """Draw the road network as filled polygons with properly rounded
-        bends and caps.
+        if car is not None:
+            # Minimap + HUD describe the CAR (position, speed, segment);
+            # with no car on the map there is nothing to show.
+            self.draw_minimap(surface, car)
+            self.draw_hud(surface, car)
+        self.draw_zoom_indicator(surface)
 
-        Rather than hand-rolling trigonometry for each junction corner
-        (which turned into an unreliable mess of "fillet" hacks), the
-        roads are built with the standard, well-tested approach for this
-        exact problem: treat each road as a stroked line and use
-        Shapely's `buffer()` with round joins/caps. Contiguous same-width
-        segments are merged (via `linemerge`) into one continuous line
-        first, so a 90-degree bend becomes a single interior vertex of
-        one LineString - buffering that naturally produces a smooth
-        circular arc on the outer side and a clean single point on the
-        inner side, exactly like a normal road/curb. This is computed
-        once (cached) since the road network never changes at runtime.
+    def draw_zoom_indicator(self, surface: pygame.Surface):
+        """Top-left 'zoom N.Nx' readout - always visible (even before a
+        car exists), so the current camera zoom is never a mystery. The
+        viewport width in metres makes the scale concrete."""
+        view_w_m = surface.get_width() / self.camera.zoom / config.PIXELS_PER_METER
+        text = f"zoom {self.camera.zoom:.1f}x  ({view_w_m:.0f} m wide)"
+        surf = self._hud_text("zoom", text, 20, (220, 220, 220))
+        pygame.draw.rect(surface, (20, 20, 20, 180),
+                         (8, 8, surf.get_width() + 14, surf.get_height() + 12))
+        surface.blit(surf, (15, 13))
+
+    def draw_test_flags(self, surface: pygame.Surface):
+        """Draw the green start / red end test flags.
+
+        Top-down pennants in WORLD space (they scale with camera zoom like
+        everything else). Each is placed to the RIGHT of the road at the
+        given position/heading: offset past the kerb along the right
+        perpendicular of the heading, so it sits on the grass, never on
+        the carriageway.
         """
+        if self.flag_green:
+            self._draw_flag(surface, self.flag_green,
+                            (0, 200, 80), (0, 90, 40))
+        if self.flag_red:
+            self._draw_flag(surface, self.flag_red,
+                            (230, 50, 50), (120, 20, 20))
+
+    def _draw_flag(self, surface: pygame.Surface, pos: list,
+                   fill: tuple, outline: tuple):
+        x, y, hdg = pos[0], pos[1], pos[2]
+        rad = math.radians(hdg)
+        fwd = (math.sin(rad), math.cos(rad))      # direction of travel
+        right = (math.cos(rad), -math.sin(rad))   # right-hand side
+        PPPM = config.PIXELS_PER_METER
+        off_m = 3.0                               # well past the kerb
+        bx, by = x + right[0] * off_m * PPPM, y + right[1] * off_m * PPPM
+        # Solid pennant: base across the travel direction, apex pointing
+        # away from the road.
+        w = 1.3 * PPPM      # half base (m -> px)
+        h = 2.2 * PPPM      # length toward the grass
+        p1 = (bx - fwd[0] * w, by - fwd[1] * w)
+        p2 = (bx + fwd[0] * w, by + fwd[1] * w)
+        ap = (bx + right[0] * h, by + right[1] * h)
+        sx, sy = self.camera.world_to_screen(bx, by)
+        s1 = self.camera.world_to_screen(*p1)
+        s2 = self.camera.world_to_screen(*p2)
+        sa = self.camera.world_to_screen(*ap)
+        pygame.draw.polygon(surface, fill, [(sx, sy), s1, s2, sa])
+        pygame.draw.polygon(surface, outline, [(sx, sy), s1, s2, sa], 2)
+    # --- Roads (tile-cached) ---
+    def _tile_geom(self):
+        """Road polygons with precomputed world-space bounding boxes and
+        numpy point arrays.
+
+        The polygons themselves come from the network's cached builder:
+        each road is a stroked line buffered with Shapely (round
+        joins/caps), contiguous same-width segments merged first, so a
+        90-degree bend becomes one smooth arc instead of a fillet hack.
+        Merged corridors span whole towns (the biggest on Kleinmachnow
+        has ~52k points), so per-tile rendering clips them to the tile
+        rect BEFORE handing them to pygame - see _sh_clip().
+        """
+        if self._tile_polys is None:
+            import numpy as np
+            polys = []
+            # One uniform color for every road type (config.ROAD_COLOR) -
+            # the per-color grouping is only used to iterate the polygons.
+            for _color, groups in self.network.get_road_polygons_by_color():
+                for ext, holes in groups:
+                    xs = [p[0] for p in ext]
+                    ys = [p[1] for p in ext]
+                    arr = np.asarray(ext, dtype=np.float64)
+                    hole_arrs = [np.asarray(h, dtype=np.float64) for h in holes]
+                    polys.append((config.ROAD_COLOR, arr, hole_arrs,
+                                  (min(xs), min(ys), max(xs), max(ys))))
+            self._tile_polys = polys
+        return self._tile_polys
+
+    @staticmethod
+    def _sh_clip(pts, nx, ny, c):
+        """Vectorized Sutherland-Hodgman clip of a closed polygon (Nx2)
+        against the half-plane n·p >= c. Returns an (Mx2) array of the
+        kept/interpolated vertices IN BOUNDARY ORDER.
+
+        Per edge S->E: inside/inside -> E; inside/outside -> X;
+        outside/inside -> X AND E (the interior end vertex is easy to
+        forget - dropping it cuts corners); outside/outside -> nothing.
+        Order is preserved by stacking per-edge items [X, E] and
+        flattening row-major (edge order).
+        """
+        import numpy as np
+        if len(pts) == 0:
+            return pts
+        p = np.vstack([pts, pts[:1]])   # close the ring: edge n-1 wraps to 0
+        d = p[:, 0] * nx + p[:, 1] * ny - c
+        din, dout = d[:-1] >= 0, d[1:] >= 0
+        E = p[1:]
+        cross = din ^ dout
+        X = np.full_like(E, np.nan)
+        if cross.any():
+            di, dj = d[:-1][cross], d[1:][cross]
+            t = di / (di - dj)
+            X[cross] = p[:-1][cross] + t[:, None] * (E[cross] - p[:-1][cross])
+        items = np.stack([X, E], axis=1)          # (n-1, 2, 2)
+        valid = np.stack([cross, dout], axis=1)   # X when crossing; E when inside
+        return items[valid] if valid.any() else np.empty((0, 2))
+
+    @classmethod
+    def _clip_rect(cls, pts, x0, y0, x1, y1):
+        """Clip a closed polygon (Nx2 local coords) to an axis-aligned rect."""
+        import numpy as np
+        if len(pts) == 0:
+            return pts
+        pts = cls._sh_clip(pts, 1.0, 0.0, x0)     # x >= x0
+        if len(pts) == 0:
+            return pts
+        pts = cls._sh_clip(pts, -1.0, 0.0, -x1)   # x <= x1
+        if len(pts) == 0:
+            return pts
+        pts = cls._sh_clip(pts, 0.0, 1.0, y0)     # y >= y0
+        if len(pts) == 0:
+            return pts
+        return cls._sh_clip(pts, 0.0, -1.0, -y1)  # y <= y1
+
+    def draw_roads(self, surface: pygame.Surface):
+        """Blit the cached road tiles covering the viewport."""
         w, h = surface.get_size()
+        cam = self.camera
+        zoom = cam.zoom
+        zkey = round(zoom, 4)
+        tw_world = self.TILE_PX / zoom          # tile size in world px
+        x0 = cam.x - w / 2.0 / zoom
+        y0 = cam.y - h / 2.0 / zoom              # south (min world y)
+        x1 = cam.x + w / 2.0 / zoom
+        y1 = cam.y + h / 2.0 / zoom              # north
+        tx0, ty0 = int(math.floor(x0 / tw_world)), int(math.floor(y0 / tw_world))
+        tx1 = int(math.floor((x1 - 1e-9) / tw_world))
+        ty1 = int(math.floor((y1 - 1e-9) / tw_world))
 
-        for color, polys in self.network.get_road_polygons_by_color():
-            for ext, holes in polys:
-                screen_pts = [self.camera.world_to_screen(x, y) for x, y in ext]
-                xs = [p[0] for p in screen_pts]
-                ys = [p[1] for p in screen_pts]
-                if max(xs) < 0 or min(xs) > w or max(ys) < 0 or min(ys) > h:
-                    continue
-                pygame.draw.polygon(surface, color, [(int(x), int(y)) for x, y in screen_pts])
-                # Punch out any holes (e.g. a roundabout's island) with
-                # the background color - pygame can't fill a polygon
-                # with a hole in one call, so paint the exterior first
-                # and then re-paint each hole over it.
-                for hole in holes:
-                    hole_pts = [self.camera.world_to_screen(x, y) for x, y in hole]
-                    pygame.draw.polygon(surface, config.BG_COLOR, [(int(x), int(y)) for x, y in hole_pts])
+        # Collect the visible tiles; missing ones are rendered at most two
+        # per frame (closest to the viewport centre first). Without the cap,
+        # a zoom change re-renders all ~6 visible tiles in one frame - a
+        # 100-150 ms hitch. With it, new tiles fill in over a few frames.
+        needed = []
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                key = (zkey, tx, ty)
+                tile = self._tiles.get(key)
+                if tile is None:
+                    cx_ = (tx + 0.5) * tw_world - cam.x
+                    cy_ = (ty + 0.5) * tw_world - cam.y
+                    needed.append((cx_ * cx_ + cy_ * cy_, key, tx, ty))
+                else:
+                    self._tiles.move_to_end(key)
+        needed.sort()
+        for _dist, key, tx, ty in needed[:2]:
+            tile = self._render_tile(zkey, tx, ty)
+            self._tiles[key] = tile
+            while len(self._tiles) > self._MAX_TILES:
+                self._tiles.popitem(last=False)
 
-        self.draw_road_markings(surface)
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                tile = self._tiles.get((zkey, tx, ty))
+                if tile is None:
+                    continue   # not rendered yet this frame - bg shows
+                sx = (tx * tw_world - cam.x) * zoom + w / 2.0
+                sy = (cam.y - (ty + 1) * tw_world) * zoom + h / 2.0
+                surface.blit(tile, (int(round(sx)), int(round(sy))))
 
-    def draw_road_markings(self, surface: pygame.Surface):
+    def _render_tile(self, zoom: float, tx: int, ty: int) -> pygame.Surface:
+        """Render one road tile: background + all intersecting road
+        polygons + lane markings + junction dots, at the given zoom.
+        Purely a function of (zoom, tile coords) - the network is static."""
+        import numpy as np
+        tile = pygame.Surface((self.TILE_PX, self.TILE_PX))
+        tile.fill(config.BG_COLOR)
+        tw_world = self.TILE_PX / zoom
+        wx0 = tx * tw_world
+        wy_north = (ty + 1) * tw_world           # world y of the tile's top edge
+
+        def xform(wx: float, wy: float):
+            return ((wx - wx0) * zoom, (wy_north - wy) * zoom)
+
+        # Tile rect in local coords, with a small margin so polygon edges
+        # touching the tile boundary don't leave 1px seams.
+        m = 2.0
+        for color, arr, hole_arrs, box in self._tile_geom():
+            if (box[2] < wx0 or box[0] > wx0 + tw_world
+                    or box[3] < wy_north - tw_world or box[1] > wy_north):
+                continue
+            # local coords: x grows right, y grows DOWN (tile top = the
+            # tile's NORTH edge wy_north)
+            pts = np.column_stack((
+                (arr[:, 0] - wx0) * zoom,
+                (wy_north - arr[:, 1]) * zoom))
+            pts = self._clip_rect(pts, -m, -m, self.TILE_PX + m, self.TILE_PX + m)
+            if len(pts) >= 3:
+                pygame.draw.polygon(tile, color,
+                                    [(int(x), int(y)) for x, y in pts])
+            # Punch out any holes (e.g. a roundabout's island) with the
+            # background color - pygame can't fill a polygon with a hole
+            # in one call.
+            for harr in hole_arrs:
+                hpts = self._clip_rect(
+                    np.column_stack(((harr[:, 0] - wx0) * zoom,
+                                     (wy_north - harr[:, 1]) * zoom)),
+                    -m, -m, self.TILE_PX + m, self.TILE_PX + m)
+                if len(hpts) >= 3:
+                    pygame.draw.polygon(tile, config.BG_COLOR,
+                                        [(int(x), int(y)) for x, y in hpts])
+
+        self.draw_road_markings(tile, xform=xform)
+
+        # Section numbers: each segment's index at its 50% point, so the
+        # road on screen can be matched against log/test segment IDs.
+        # Baked into the tile cache - rendered once per (zoom, tile), not
+        # every frame.
+        for i, seg in enumerate(self.network.segments):
+            lx, ly = xform((seg.x1 + seg.x2) / 2.0, (seg.y1 + seg.y2) / 2.0)
+            if -24 < lx < self.TILE_PX + 24 and -24 < ly < self.TILE_PX + 24:
+                txt = self._hud_text(f"segnum_{i}", str(i), 14, (175, 180, 185))
+                tile.blit(txt, (int(round(lx - txt.get_width() / 2.0)),
+                                int(round(ly)) - 16))
+        return tile
+
+    def draw_road_markings(self, surface: pygame.Surface, xform=None):
         """Dashed white centerline down the middle of each road (the same
         merged, corner-rounded centerlines the paved-area polygons are
         buffered from - see RoadNetwork.get_centerlines() - so the dashes
@@ -106,6 +327,8 @@ class Renderer:
         straight across it), plus a single white dot at the middle of
         every real (3+-way) junction instead of trying to dash through
         the intersection itself."""
+        if xform is None:
+            xform = self.camera.world_to_screen
         w, h = surface.get_size()
         zoom = self.camera.zoom
         pppm = config.PIXELS_PER_METER
@@ -130,8 +353,11 @@ class Renderer:
             need_overlay = (0 < a_c < 255) or (0 < a_l < 255)
             target = surface if not need_overlay else pygame.Surface((w, h), pygame.SRCALPHA)
             if a_c > 0:
-                for coords in self.network.get_centerlines():
-                    self._draw_dashed_polyline(target, coords, c_dash_px, c_gap_px, w, h, a_c)
+                # Width-filtered set (>= CENTERLINE_MIN_WIDTH_M) - the
+                # LaneGuard uses the unfiltered get_centerlines().
+                for coords in self.network.get_marking_centerlines():
+                    self._draw_dashed_polyline(target, coords, c_dash_px, c_gap_px,
+                                               w, h, a_c, xform)
             if a_l > 0:
                 # Multi-lane one-way carriageways, RQ 31: narrow solid
                 # median-side edge, dashed Leitlinie, broad solid
@@ -140,36 +366,47 @@ class Renderer:
                 # draw.)
                 for style, coords, width_m in lane_marks:
                     if style == "dashed":
-                        self._draw_dashed_polyline(target, coords, l_dash_px, l_gap_px, w, h, a_l)
+                        self._draw_dashed_polyline(target, coords, l_dash_px,
+                                                   l_gap_px, w, h, a_l, xform)
                     elif style == "solid":
-                        self._draw_solid_polyline(target, coords, w, h, a_l, width_m)
+                        self._draw_solid_polyline(target, coords, w, h, a_l,
+                                                  width_m, xform=xform)
                     else:  # guardrail
                         self._draw_solid_polyline(
-                            target, coords, w, h, a_l, 0.15, (183, 189, 186))
+                            target, coords, w, h, a_l, 0.15, (183, 189, 186),
+                            xform=xform)
             if target is not surface:
                 surface.blit(target, (0, 0))
 
-        dot_radius_px = 4
+        # Junction dots scale with zoom (world-space radius, capped).
+        dot_radius_px = min(int(config.JUNCTION_DOT_RADIUS_M * config.PIXELS_PER_METER * zoom),
+                            config.JUNCTION_DOT_MAX_PX)
+        if dot_radius_px < 1:
+            return   # sub-pixel at this zoom - skip the dots entirely
         for node_id, degree in self.network.node_degree.items():
             if degree < 3:
                 continue
             node_xy = self.network.nodes.get(node_id)
             if node_xy is None:
                 continue
-            sx, sy = self.camera.world_to_screen(*node_xy)
+            sx, sy = xform(*node_xy)
             if sx < -dot_radius_px or sx > w + dot_radius_px or \
                sy < -dot_radius_px or sy > h + dot_radius_px:
                 continue
             pygame.draw.circle(surface, (255, 255, 255), (int(sx), int(sy)), dot_radius_px)
 
     def _draw_dashed_polyline(self, surface, coords, dash_px, gap_px, w, h,
-                              alpha=255):
+                              alpha=255, xform=None):
         """Walk a polyline (world coords) at constant arc length, drawing
         alternating dash/gap segments - works for the rounded-corner
         centerlines (many short segments approximating an arc) just as
         well as a single long straight stretch. `alpha` fades the dashes
         out at low zoom (see draw_road_markings); when it is < 255 the
-        surface must be SRCALPHA."""
+        surface must be SRCALPHA. `xform` maps world px -> local px
+        (camera transform per frame, tile-local transform for cached
+        tiles)."""
+        if xform is None:
+            xform = self.camera.world_to_screen
         period = dash_px + gap_px
         if period <= 0:
             return
@@ -180,6 +417,15 @@ class Renderer:
             x2, y2 = coords[i + 1]
             seg_len = math.hypot(x2 - x1, y2 - y1)
             if seg_len < 1e-9:
+                continue
+            # Cull segments that lie entirely outside the target rect:
+            # tiles are small while centerlines span whole towns. The dash
+            # phase still advances so the pattern stays arc-length aligned.
+            cx1, cy1 = xform(x1, y1)
+            cx2, cy2 = xform(x2, y2)
+            if ((cx1 < -8 and cx2 < -8) or (cx1 > w + 8 and cx2 > w + 8) or
+                    (cy1 < -8 and cy2 < -8) or (cy1 > h + 8 and cy2 > h + 8)):
+                distance_into_period = (distance_into_period + seg_len) % period
                 continue
             ux, uy = (x2 - x1) / seg_len, (y2 - y1) / seg_len
 
@@ -194,8 +440,8 @@ class Renderer:
                 if drawing:
                     ax, ay = x1 + ux * traveled, y1 + uy * traveled
                     bx, by = x1 + ux * (traveled + step), y1 + uy * (traveled + step)
-                    sax, say = self.camera.world_to_screen(ax, ay)
-                    sbx, sby = self.camera.world_to_screen(bx, by)
+                    sax, say = xform(ax, ay)
+                    sbx, sby = xform(bx, by)
                     if not ((sax < 0 and sbx < 0) or (sax > w and sbx > w) or
                             (say < 0 and sby < 0) or (say > h and sby > h)):
                         # Real lane markings are ~0.15m wide, not 2m.
@@ -207,18 +453,20 @@ class Renderer:
 
     def _draw_solid_polyline(self, surface, coords, w, h, alpha=255,
                              width_m: float = 0.15,
-                             color: tuple = (251, 251, 245)):
+                             color: tuple = (251, 251, 245), xform=None):
         """Draw a solid line along a world-coordinate polyline - the
         RQ 31 edge lines / Breitstrich / median guardrails of multi-lane
         carriageways (see RoadNetwork.get_lane_markings). width_m >= 0.25
         (the Breitstrich) is drawn at twice the normal line thickness.
         When alpha < 255 the surface must be SRCALPHA."""
+        if xform is None:
+            xform = self.camera.world_to_screen
         cam = self.camera
         thin_w = max(1, int(0.15 * config.PIXELS_PER_METER * cam.zoom))
         line_w = max(2, 2 * thin_w) if width_m >= 0.25 else thin_w
         for i in range(len(coords) - 1):
-            ax, ay = cam.world_to_screen(*coords[i])
-            bx, by = cam.world_to_screen(*coords[i + 1])
+            ax, ay = xform(*coords[i])
+            bx, by = xform(*coords[i + 1])
             if not ((ax < 0 and bx < 0) or (ax > w and bx > w) or
                     (ay < 0 and by < 0) or (ay > h and by > h)):
                 pygame.draw.line(surface, (*color, alpha), (ax, ay), (bx, by), line_w)
@@ -295,15 +543,30 @@ class Renderer:
 
     # --- HUD / Dashboard ---
     def _hud_text(self, key: str, text: str, size: int, color: tuple[int, int, int]) -> pygame.Surface:
-        """Cached HUD text: re-rendered via PIL only every Nth frame.
-        The previous surface is blitted in the meantime, so between
-        re-renders the (up to 0.1s) stale text is shown."""
-        self._hud_frame += 1
-        cached = self._hud_texts.get(key)
-        if cached is None or self._hud_frame % self._HUD_TEXT_INTERVAL == 0:
-            cached = self._text_surface(text, size, color)
-            self._hud_texts[key] = cached
-        return cached
+        """Cached HUD text.
+
+        A CHANGED string is re-rendered at most once every few frames per
+        key (<=50 ms display lag); an UNCHANGED string is never re-rendered.
+
+        The previous implementation incremented a counter per CALL and
+        gated on `counter % N == 0`. Since the number of calls per frame
+        varies with which indicators are lit, that gate depended on the
+        call count: when it was a multiple of N, any key whose phase did
+        not land on 0 was NEVER re-rendered again - until some indicator
+        toggled and changed the count. That is why the test-number label
+        and one of the two speed readouts appeared to update 'at random
+        times' mid-test instead of at test start.
+        """
+        entry = self._hud_texts.get(key)   # ((text,size,color), surface, frame)
+        if entry is not None:
+            content, surf, frame = entry
+            if content == (text, size, color):
+                return surf
+            if self._frame - frame < self._HUD_TEXT_MIN_INTERVAL:
+                return surf    # changed, but too soon - <=50 ms stale
+        surf = self._text_surface(text, size, color)
+        self._hud_texts[key] = ((text, size, color), surf, self._frame)
+        return surf
 
     def draw_hud(self, surface: pygame.Surface, car):
         """Draw speedometer HUD in bottom-left corner of main window."""
@@ -395,6 +658,19 @@ class Renderer:
         if blinker_right:
             pygame.draw.circle(surface, (255, 180, 0), (panel_x + panel_w - 100, indicator_y), 5)
             surface.blit(self._hud_text("ind_r", "R", 12, (255, 255, 255)), (panel_x + panel_w - 104, indicator_y - 7))
+        # Hazard lights (all four corners flash) - the car recognises it
+        # cannot continue (or was told to via the REST API).
+        if getattr(driver, 'hazard', False):
+            import time as _time
+            if (_time.time() % 0.5) <= 0.25:
+                pygame.draw.circle(surface, (255, 180, 0), (panel_x + panel_w - 125, indicator_y), 5)
+                surface.blit(self._hud_text("ind_h", "H", 12, (255, 255, 255)), (panel_x + panel_w - 128, indicator_y - 7))
+
+        # Current segment ID (network index) - lets the player match what
+        # they see on screen against test logs / expected end segments.
+        surface.blit(self._hud_text("seg", f"seg {car.seg_idx}", 20,
+                                    (160, 200, 255)),
+                     (panel_x + panel_w - 95, panel_y + 100))
 
     # --- Minimap ---
     def draw_minimap(self, surface: pygame.Surface, car):
@@ -417,7 +693,7 @@ class Renderer:
         sy = mm_h / bounds[3]
 
         for seg in self.network.segments:
-            color = config.ROAD_TYPES.get(seg.highway, {}).get("color", (150, 150, 150))
+            color = config.ROAD_COLOR
             x1 = mm_x + seg.x1 * sx
             y1 = mm_y + mm_h - seg.y1 * sy
             x2 = mm_x + seg.x2 * sx

@@ -35,8 +35,17 @@ class PhysicsValidator:
         self.enabled = False
         print("❌ Physics validator DISABLED")
     
-    def check(self, car, dt: float, network):
-        """Run all physics checks on a car. Called after car.update()."""
+    def check(self, car, dt: float, network, in_contact: bool = False):
+        """Run all physics checks on a car. Called after car.update().
+        
+        in_contact: the car is pressed against an obstacle (stop-on-contact,
+        docs/OBSTACLES.md). A contact stop is EXPECTED behavior, not a
+        violation - but while resting against a solid object the motion is
+        externally constrained (like being pushed by a truck), so the
+        implied-turning-radius invariant is suspended for that frame. The
+        jump / heading-snap / off-road checks keep running: the stop itself
+        must stay physical (no teleport, no instant snap, no penetration).
+        """
         if not self.enabled:
             return
         
@@ -50,7 +59,8 @@ class PhysicsValidator:
         
         self._check_jump(car, old_x, old_y, dt)
         self._check_heading_snap(car, old_heading)
-        self._check_turning_radius(car, old_x, old_y, old_heading)
+        if not in_contact:
+            self._check_turning_radius(car, old_x, old_y, old_heading)
         self._check_off_road(car, network)
         
         self._last_state[car_id] = (car.x, car.y, car.heading)
@@ -58,7 +68,9 @@ class PhysicsValidator:
     def _check_jump(self, car, old_x: float, old_y: float, dt: float):
         """Impossible position jump."""
         distance_m = math.hypot(car.x - old_x, car.y - old_y) / config.PIXELS_PER_METER
-        max_allowed = car.speed * dt + 0.1 * dt + 0.01
+        # abs(): speed is signed (negative = reverse gear); the bound is on
+        # how far the car can travel per frame in EITHER direction.
+        max_allowed = abs(car.speed) * dt + 0.1 * dt + 0.01
         
         if distance_m > max_allowed:
             import traceback

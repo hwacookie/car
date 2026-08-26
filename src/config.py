@@ -1,5 +1,6 @@
 # Configuration
 
+import math
 import pygame
 
 # --- Window ---
@@ -40,7 +41,22 @@ ZOOM_STEP = 1.15
 CAR_SPEED = 55.6        # meters/second = 200 km/h (top speed of a normal car)
 CAR_ACCELERATION = 2.8  # m/s²  → 0-100 km/h in ~10s (normales Auto)
 CAR_BRAKING = 10.0      # m/s²  → starke Bremsung mit ABS (~1g)
-CAR_TURN_SPEED = 180    # degrees/second
+PARK_BRAKING = 3.5      # m/s²  → komfortables Bremsen beim Parken (~0,35 g)
+                        #          kein Volllastbremsen) - Spec §1 (A_PARK)
+PARK_CREEP_SPEED_M = 2.0  # m/s (7 km/h) → Creep-Tempo in der Verschwenkzone
+                          #                (Spec §1 Band 5–10 km/h)
+CAR_TURN_SPEED = 180    # degrees/second (FREE-mode arcade feel, capped below)
+# Mechanical minimum turning radius: wheelbase / tan(max steer angle) - the
+# same limit the BICYCLE model uses (bicycle_nav.WHEELBASE / MAX_STEER).
+# No car can turn tighter than this at ANY speed, so FREE mode clamps its
+# yaw rate to v / MIN_TURN_RADIUS_M (see Car._update_free_mode).
+MIN_TURN_RADIUS_M = 2.7 / math.tan(math.radians(38.0))   # ~3.46 m
+# FREE mode: time for the virtual steering wheel to travel from center to
+# full lock (and back). Instant full lock on key-down feels twitchy and
+# "too direct"; a real wheel takes a moment to sweep over.
+STEER_LOCK_TIME_S = 0.35
+# Reverse top speed: 30 km/h (user spec - a fast parking-lot crawl).
+REVERSE_MAX_SPEED_M = 30.0 / 3.6   # ~8.33 m/s
 CAR_LENGTH = 4.4        # meters
 CAR_WIDTH = 1.8         # meters
 
@@ -75,6 +91,11 @@ TIRE_OUTBOARD_M = CAR_WIDTH * 36 / 100        # 0.648 m from the centreline
 # its own driving line is ever allowed to go, i.e. outside the corridor
 # it is then asked to follow.
 KERB_CLEARANCE_M = ROAD_EDGE_TOLERANCE_M
+# ...but a PARKED car sits closer than a driving one: it is not tracking a
+# line any more, it is standing still against the kerb (spec §1 "möglichst
+# nah am rechten Rand"). The pull-over target uses this smaller clearance;
+# the driving-line corridor keeps KERB_CLEARANCE_M.
+PARK_KERB_CLEARANCE_M = 0.20
 
 # How far into a segment a car spawns, as a FRACTION of the segment
 # length. Never 0: a node sits in the middle of the junction rounding,
@@ -118,6 +139,13 @@ def kerb_offset_m(road_width_m: float) -> float:
     target so the two cannot drift apart."""
     return max(0.0, road_width_m / 2.0 - CAR_WIDTH / 2.0 - KERB_CLEARANCE_M)
 
+
+def park_offset_m(road_width_m: float) -> float:
+    """Lateral offset (m) of a PARKED car's centre from the centreline:
+    flush against the kerb with only PARK_KERB_CLEARANCE_M to spare."""
+    return max(0.0, road_width_m / 2.0 - CAR_WIDTH / 2.0
+               - PARK_KERB_CLEARANCE_M)
+
 # --- Road rendering ---
 # Real-world widths in meters (2-way / 1-way)
 # Levels 1-7: motorway, trunk, primary, secondary, tertiary, residential, unclassified
@@ -143,6 +171,19 @@ DRIVABLE_ROADS = set(ROAD_TYPES.keys())
 # --- Colors ---
 BG_COLOR = (34, 120, 34)       # grass green
 ROAD_EDGE_COLOR = (50, 50, 50) # road markings
+# All road types are drawn in this ONE uniform asphalt color (the per-type
+# grays of ROAD_TYPES are only used for widths now).
+ROAD_COLOR = (120, 120, 124)
+# Centerline rule: every two-way road at least as wide as the test map's
+# standard road (7 m) gets a dashed white centerline. Narrow service lanes
+# (3.5 m) and one-ways don't. (Class-based filtering was tried first - but
+# Kleinmachnow has no motorway/trunk/primary at all, its normal streets are
+# 'secondary'/'residential', all 7 m wide like the test map.)
+CENTERLINE_MIN_WIDTH_M = 7.0
+# Junction dots (white circle at 3+-way nodes) scale with zoom: world-space
+# radius, capped so they stay dots instead of giant circles when zoomed in.
+JUNCTION_DOT_RADIUS_M = 2.0
+JUNCTION_DOT_MAX_PX = 12
 MINIMAP_BG = (20, 60, 20)
 MINIMAP_CAR_COLOR = (255, 0, 0)
 MINIMAP_BORDER = (80, 80, 80)

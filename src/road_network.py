@@ -382,9 +382,9 @@ class RoadNetwork:
         return self._paved_polygon_cache
 
     def get_centerlines(self):
-        """Merged, corner-rounded road CENTERLINES (no buffering) - used
-        for drawing the dashed lane-marking line down the middle of each
-        road. Reuses the exact same merge-through-plain-bends +
+        """Merged, corner-rounded road CENTERLINES (no buffering), ALL
+        two-way roads. Used by the LaneGuard (wrong-side check); the
+        dashed-line rendering uses get_marking_centerlines() instead. Reuses the exact same merge-through-plain-bends +
         corner-rounding logic as the paved-area polygons (see
         _build_road_polygons), so the markings visually follow the same
         smooth curve as the road edges instead of cutting straight across
@@ -394,6 +394,21 @@ class RoadNetwork:
         if getattr(self, "_centerlines_cache", None) is None:
             self._centerlines_cache = _build_centerlines(self)
         return self._centerlines_cache
+
+    def get_marking_centerlines(self):
+        """Centerlines that actually GET a dashed white line drawn: only
+        roads at least as wide as the test map's standard road (7 m).
+        Narrow service lanes (3.5 m) would just be visual noise. Kept
+        separate from get_centerlines() because the LaneGuard needs the
+        unfiltered set."""
+        if getattr(self, "_marking_centerlines_cache", None) is None:
+            groups = _merge_and_round_lines(self, only_two_way=True)
+            self._marking_centerlines_cache = [
+                coords for (_hw, w), lines in groups.items()
+                if w >= config.CENTERLINE_MIN_WIDTH_M
+                for coords in lines
+            ]
+        return self._marking_centerlines_cache
 
     def get_lane_markings(self):
         """Lane markings for multi-lane one-way carriageways (segments
@@ -516,7 +531,12 @@ def _build_centerlines(network: "RoadNetwork"):
     """Flatten _merge_and_round_lines()'s per-group coordinate lists into
     one plain list of polylines (color/width no longer matter for a
     lane-marking line). One-way segments are excluded - see
-    _merge_and_round_lines(only_two_way=...)."""
+    _merge_and_round_lines(only_two_way=...).
+
+    Returns ALL two-way centerlines: the LaneGuard needs every one of them
+    (it falls back to a broken chord-distance heuristic when its list is
+    empty). The dashed-line rendering filters by width separately - see
+    RoadNetwork.get_marking_centerlines()."""
     groups = _merge_and_round_lines(network, only_two_way=True)
     return [coords for lines in groups.values() for coords in lines]
 

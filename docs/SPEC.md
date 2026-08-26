@@ -598,6 +598,15 @@ car/
   - Off-road violation detection
   - Screenshot capture on failure
 - [x] 10 unit tests passing
+- [x] **Obstacle system, Part 1** (docs/OBSTACLES.md)
+  - Palette UI next to the minimap: drag & drop parked cars (blue/yellow/white)
+  - Paved-area-only placement; auto-alignment to lane direction — on curves
+    and junctions it follows the local tangent of the smoothed centerline
+  - Save/load obstacle layouts per map (`data/obstacles/<map>/<name>.json`)
+  - REST API: `GET/POST /obstacles`, `DELETE /obstacles/<id>`
+  - Stop on contact: full braking + no interpenetration, all driving modes
+  - `tests/test_obstacles.py` (36 headless tests) +
+    `scripts/verify_obstacles_live.py` (live REST verification)
 
 ### 🚧 In Progress
 - [ ] **Realistic turning physics** (circular arc with validation)
@@ -617,6 +626,9 @@ car/
 - **Pygame PNG support missing**: Worked around with PIL image loading
 
 ### 🔮 Future Enhancements
+- Obstacle system Part 2+: movable obstacles (other cars, pedestrians) and
+  the Ausweichen avoidance maneuver itself (docs/OBSTACLES.md,
+  DRIVING_MANEUVERS.md §6)
 - Multiple AI cars (infrastructure ready - Driver class supports it)
 - Building footprints from OSM `building` polygons
 - Road surface textures (asphalt, cobblestone)
@@ -636,14 +648,19 @@ car/
 
 ## Testing
 
-### Unit Tests
+### Unit Tests (headless, no game process needed)
 ```bash
-python -m pytest tests/test_road_network.py
+python -m pytest tests/test_road_network.py tests/test_obstacles.py
 ```
-10 unit tests covering:
-- Lat/lon to world coordinate projection
-- Spatial queries (nearest road)
-- Snapping logic
+- `test_road_network.py`: 10 unit tests — lat/lon projection, spatial
+  queries, snapping logic.
+- `test_obstacles.py`: 36 tests — placement validation and lane alignment
+  (incl. corners/roundabout), SAT collision geometry, stop-on-contact
+  physics, layout save/load, `/obstacles` REST handlers, headless palette
+  drag handling.
+
+The full two-layer testing setup (headless pytest + live REST-driven e2e)
+is documented in `docs/TESTING.md`.
 
 ### REST API Tests
 ```bash
@@ -680,6 +697,16 @@ sliver junction). Each test:
   (>30° per frame), teleports/unexpected jumps, and arrival at the exact
   expected end segment (then drives to the segment's far end and stops)
 - Captures a screenshot on violation
+
+### Obstacle Verification (live)
+```bash
+# Terminal 1: Start game with API (synthetic test map)
+python -m src.main --map basic --api
+
+# Terminal 2: Place a parked car in the lane via POST /obstacles,
+# drive into it, assert stop-on-contact
+python scripts/verify_obstacles_live.py
+```
 
 `--random` instead teleports to random locations on whatever map is loaded
 (works with real OSM data too); `--only <start_point> <direction> <speed>`

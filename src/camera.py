@@ -59,6 +59,13 @@ class Camera:
         sy = (self.y - wy) * self.zoom + self.height / 2   # north = up
         return sx, sy
 
+    def screen_to_world(self, sx: float, sy: float) -> tuple[float, float]:
+        """Inverse of world_to_screen (needed by the obstacle palette to
+        know where on the map the cursor is)."""
+        wx = (sx - self.width / 2) / self.zoom + self.x
+        wy = self.y - (sy - self.height / 2) / self.zoom   # north = up
+        return wx, wy
+
     def zoom_in(self):
         self.zoom = min(self.zoom * config.ZOOM_STEP, config.MAX_ZOOM)
 
