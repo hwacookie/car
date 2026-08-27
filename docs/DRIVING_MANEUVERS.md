@@ -89,6 +89,31 @@ zu verlassen – und hält.
   zurück auf die Fahrbahn, Blinker aus) – der Nudge behält die erreichte
   Randseite bei.
 
+### Variante: Rückwärts einparken aus verschiedenen Startquerlagen
+
+**Anforderung:** Das Rückwärtseinparken (Back-in) muss unabhängig von der
+Startquerlage funktionieren – aus jedem lateralen Abstand zum rechten
+Bordstein innerhalb der Fahrbahn. In der Realität zwingen andere parkende
+Autos dazu, weiter links zu fahren; ein Back-in-Plan darf sich nicht nur für
+den Fall „direkt am Rand startend" aufbauen lassen.
+
+**Test (basic map):** Neue e2e-Scenario-Familie auf einer geraden,
+zweispurigen Einbahnstraße (eine Fahrtrichtung, keine Kreuzungen, keine
+Hindernisse). Route und Ziel-Flagge am rechten Rand bleiben in allen Fällen
+gleich – variiert wird ausschließlich die laterale Startposition:
+
+| # | Startquerlage |
+|---|---------------|
+| 1 | fast am rechten Rand (so nah am Bordstein wie möglich) |
+| 2 | Mitte der rechten Spur |
+| 3 | Mitte der Straße (Mittellinie) |
+| 4 | Mitte der linken Spur |
+| 5 | ganz links (am linken Rand) |
+
+**Erfolgskriterium:** In allen fünf Fällen vollendet das Auto den Back-in an
+der Flagge: parallel zum Rand, so nah am Bordstein wie erlaubt, `parked == true` –
+dasselbe Endbild unabhängig von der Startquerlage.
+
 ---
 
 ## 2. Anfahren (Pull-Out)

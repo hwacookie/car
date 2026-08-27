@@ -94,7 +94,8 @@ def _band_solve(A: list[list[float]], b: list[float]) -> list[float]:
 
 
 def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
-                          ds: float, max_rounds: int = 40) -> list[float]:
+                          ds: float, max_rounds: int = 40,
+                          base: float | None = None) -> list[float]:
     """Lateral offsets minimising line curvature inside [lo, hi].
 
     Minimise  sum_i ( kappa0_i - (o_{i-1} - 2 o_i + o_{i+1}) / ds^2 )^2
@@ -103,10 +104,18 @@ def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
     Box constraints are handled by an active set: solve, clamp whatever
     escaped its bound with a stiff penalty (which preserves the band, so
     every round stays O(n)), and repeat until the solution is feasible.
+
+    `base` (the nominal lane offset) breaks the tie on STRAIGHT sections,
+    where the objective is flat and any constant offset is optimal: the
+    line settles at `base` instead of drifting to the corridor centre. On
+    a wide one-way (no centreline bound) the corridor centre IS the middle
+    of the road - which would make the car abandon its lane position.
     """
     n = len(kappa0)
     if n < 5:
-        return [max(lo[i], min(hi[i], 0.5 * (lo[i] + hi[i]))) for i in range(n)]
+        return [max(lo[i], min(hi[i],
+                               base if base is not None
+                               else 0.5 * (lo[i] + hi[i]))) for i in range(n)]
 
     inv = 1.0 / (ds * ds)
     stencil = ((-1, -inv), (0, 2.0 * inv), (1, -inv))
@@ -118,8 +127,19 @@ def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
     for _ in range(max_rounds):
         A = [[0.0] * (2 * BW + 1) for _ in range(n)]
         b = [0.0] * n
+        # Regularise toward the nominal lane position at EVERY station.
+        # On curves the curvature term dominates by many orders of
+        # magnitude, so this only matters where the objective is flat:
+        # it pins the line at `base` (spec §3's normal position) instead
+        # of leaving it to the solver's whim. Pulling ONLY the endpoints
+        # is not enough: the stencil chain then solves a long straight to
+        # a LINEAR profile between them - dipping through the middle of
+        # the road (measured: 1.67 m at both ends, -0.11 m mid-line on a
+        # 300 m one-way). base=None reproduces the old pull-toward-zero.
         for i in range(n):
             A[i][BW] += LAMBDA
+            b[i] += LAMBDA * max(lo[i], min(hi[i],
+                                            base if base is not None else 0.0))
         # One residual row per interior station.
         for i in range(1, n - 1):
             for da, ca in stencil:
@@ -135,11 +155,14 @@ def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
             A[i][BW] += PENALTY
             b[i] += PENALTY * v
         # Endpoints are free to sit anywhere legal but must not float
-        # away from the corridor centre, which would tilt the whole line.
+        # away from the nominal lane position, which would tilt the whole
+        # line (on straights this is what pins the line at `base`).
         for i in (0, n - 1):
             if i not in pinned:
                 A[i][BW] += 1e-3
-                b[i] += 1e-3 * (0.5 * (lo[i] + hi[i]))
+                tgt = (max(lo[i], min(hi[i], base)) if base is not None
+                       else 0.5 * (lo[i] + hi[i]))
+                b[i] += 1e-3 * tgt
 
         o = _band_solve(A, b)
 
@@ -376,8 +399,14 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
     return lo, hi
 
 
-def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M):
+def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
+               base_offset: float | None = None):
     """The fastest legal line for a route, as a dense uniform polyline.
+
+    `base_offset` overrides the nominal lane offset used to pin straight
+    sections (see min_curvature_offsets); default is the normal right-lane
+    centre. The nav passes the car's spawn lateral position here so the
+    car holds its initial line instead of re-centering (docs §1 variant).
 
     Returns (points, normals, offsets, cum) sampled every ~ds metres.
 
@@ -390,8 +419,9 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M):
     uniform stations keep every vertex-to-vertex bend small.
     """
     P, S, total = _resample(rounded, ds)
-    base = min(config.LANE_OFFSET_DEFAULT_M,
-               config.kerb_offset_m(_min_width(network, route_seg_idx)))
+    base = (base_offset if base_offset is not None else
+            min(config.LANE_OFFSET_DEFAULT_M,
+                config.kerb_offset_m(_min_width(network, route_seg_idx))))
     if total < 4.0 or len(P) < 5:
         N, _ = _normals_and_curvature(P, ds)
         return P, N, [base] * len(P), S
@@ -400,7 +430,7 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M):
     props = _station_segments(network, route_seg_idx, P)
     junction = _junction_node_per_station(network, P)
     lo, hi = legal_corridor(network, P, N, props, junction)
-    o = min_curvature_offsets(K, lo, hi, ds)
+    o = min_curvature_offsets(K, lo, hi, ds, base=base)
     return P, N, o, S
 
 

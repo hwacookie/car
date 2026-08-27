@@ -42,11 +42,13 @@ class RoadNetwork:
     node_connections: dict = field(default_factory=dict)  # node_id -> [segment_indices]
     node_degree: dict = field(default_factory=dict)       # node_id -> connection count
     node_max_width: dict = field(default_factory=dict)    # node_id -> (half_width_px, highway)
-    start_points: dict = field(default_factory=dict)      # name -> (x, y, heading, seg_idx, forward)
+    start_points: dict = field(default_factory=dict)      # name -> (x, y, heading, seg_idx, forward, lateral_offset_m)
 
-    def get_start_point(self, name: str) -> tuple[float, float, float, int, bool]:
+    def get_start_point(self, name: str) -> tuple[float, float, float, int, bool, float]:
         """Look up a named, deterministic start point (defined by synthetic
-        test maps). Returns (x, y, heading, seg_idx, forward)."""
+        test maps). Returns (x, y, heading, seg_idx, forward,
+        lateral_offset_m) - the offset shifts the spawn laterally from the
+        normal driving position (positive = toward the right kerb)."""
         if name not in self.start_points:
             available = ", ".join(sorted(self.start_points.keys())) or "(none defined)"
             raise KeyError(f"No start point named '{name}'. Available: {available}")
@@ -381,6 +383,60 @@ class RoadNetwork:
             self._paved_polygon_cache = unary_union(polys) if polys else Polygon()
         return self._paved_polygon_cache
 
+    def spawn_path_point(self, seg_idx: int, node_xy: tuple[float, float],
+                         distance_m: float):
+        """Point + heading at `distance_m` along the ACTUAL road path from
+        a degree-1 node (a scenario's entry point).
+
+        Spawn placement must follow the corner-rounded merged centreline
+        the pavement is built from - not the segment's chord. At a sharp
+        U-turn the two diverge by tens of metres: the fillet tangent
+        distance is R/tan(gap/2), and for a 166-degree hairpin with the
+        6 m curb radius that is ~49 m, so a chord-based spawn at 80% of
+        the segment sits up to ~30 m off the real road (measured: off-
+        pavement on hairpin_entry, wrong-side crash on hairpin_exit).
+
+        A degree-1 node is an endpoint of exactly one merged line, so we
+        simply walk that line from the node. Returns (x_px, y_px,
+        heading_deg) or None if no merged line ends within 30 m of the
+        node - callers fall back to the plain chord.
+        """
+        groups = _merge_and_round_lines(self)
+        nx, ny = node_xy
+        best_line: list | None = None
+        best_d2 = float("inf")
+        for lines in groups.values():
+            for coords in lines:
+                if len(coords) < 2:
+                    continue
+                for end in (coords[0], coords[-1]):
+                    d2 = (end[0] - nx) ** 2 + (end[1] - ny) ** 2
+                    if d2 < best_d2:
+                        best_d2, best_line = d2, list(coords)
+        if best_line is None or \
+                best_d2 > (30.0 * config.PIXELS_PER_METER) ** 2:
+            return None
+        if best_line[0][0] != nx or best_line[0][1] != ny:
+            best_line.reverse()   # walk from the end at the node INTO the road
+        target = max(0.0, distance_m) * config.PIXELS_PER_METER
+        x, y = best_line[0]
+        heading = 0.0
+        remaining = target
+        for i in range(len(best_line) - 1):
+            x0, y0 = best_line[i]
+            x1, y1 = best_line[i + 1]
+            seg_len = math.hypot(x1 - x0, y1 - y0)
+            if seg_len < 1e-9:
+                continue
+            if remaining <= seg_len or i == len(best_line) - 2:
+                t = min(1.0, remaining / seg_len)
+                x = x0 + (x1 - x0) * t
+                y = y0 + (y1 - y0) * t
+                heading = math.degrees(math.atan2(x1 - x0, y1 - y0))
+                break
+            remaining -= seg_len
+        return x, y, heading
+
     def get_centerlines(self):
         """Merged, corner-rounded road CENTERLINES (no buffering), ALL
         two-way roads. Used by the LaneGuard (wrong-side check); the
@@ -429,6 +485,18 @@ class RoadNetwork:
         if getattr(self, "_lane_markings_cache", None) is None:
             self._lane_markings_cache = _build_lane_markings(self)
         return self._lane_markings_cache
+
+    def get_oneway_arrows(self):
+        """Painted direction arrows for one-way roads: a small white arrow
+        in EACH lane, every 100 m (starting 50 m in), pointing along the
+        legal direction of travel. Makes the allowed direction visible at a
+        glance while watching e2e runs.
+
+        Returns a list of polygons [(x, y), ...] in world pixels.
+        Cached - the road network never changes at runtime."""
+        if getattr(self, "_oneway_arrows_cache", None) is None:
+            self._oneway_arrows_cache = _build_oneway_arrows(self)
+        return self._oneway_arrows_cache
 
     def random_road_point(self) -> tuple[float, float, float, int, str]:
         """Return a random (x, y, heading, seg_idx, node_id) on any road segment.
@@ -626,6 +694,57 @@ def _build_lane_markings(network: "RoadNetwork"):
                     for c in offset_of(a, s * (W / 2)):
                         markings.append(("guardrail", c, 0.15))
     return markings
+
+
+def _build_oneway_arrows(network: "RoadNetwork"):
+    """Painted direction arrows for one-way roads (see get_oneway_arrows).
+
+    One arrow per lane every 100 m (50 + k*100, kept >= 20 m short of the
+    far end), centred on the lane: lane i (0 = rightmost) sits
+    W/2 - lane_w*(i+0.5) to the RIGHT of the centreline. Segments shorter
+    than ~70 m get no arrow (there is no room for one away from both ends).
+    """
+    pppm = config.PIXELS_PER_METER
+    arrows = []
+    for seg in network.segments:
+        if not seg.oneway:
+            continue
+        dx, dy = seg.x2 - seg.x1, seg.y2 - seg.y1
+        length_px = math.hypot(dx, dy)
+        if length_px < 1e-6:
+            continue
+        fx, fy = dx / length_px, dy / length_px   # unit direction of travel
+        rx, ry = fy, -fx                          # right-hand side of it
+        n_lanes = max(1, seg.lanes or 1)
+        lane_w = seg.width / n_lanes              # metres
+        for i in range(n_lanes):
+            off_m = seg.width / 2.0 - lane_w * (i + 0.5)   # right of centreline
+            s = 50.0
+            while s <= seg.length - 20.0:
+                cx = seg.x1 + fx * s * pppm + rx * off_m * pppm
+                cy = seg.y1 + fy * s * pppm + ry * off_m * pppm
+                arrows.append(_arrow_polygon(cx, cy, fx, fy, rx, ry, pppm))
+                s += 100.0
+    return arrows
+
+
+def _arrow_polygon(cx: float, cy: float, fx: float, fy: float,
+                   rx: float, ry: float, pppm: float) -> list:
+    """A small painted direction arrow (3 m long, pointing along f): a 1.8 m
+    shaft (0.6 m wide) with a 1.2 m head (1.4 m wide), centred on (cx, cy).
+    (s_m, off_m) offsets are metres along / right of the arrow axis."""
+    def pt(s_m: float, off_m: float) -> tuple[float, float]:
+        return (cx + fx * s_m * pppm + rx * off_m * pppm,
+                cy + fy * s_m * pppm + ry * off_m * pppm)
+    return [
+        pt(-1.5, -0.3),   # tail, left
+        pt(0.3, -0.3),    # shaft -> head, left
+        pt(0.3, -0.7),    # head wing, left
+        pt(1.5, 0.0),     # tip
+        pt(0.3, 0.7),     # head wing, right
+        pt(0.3, 0.3),     # shaft -> head, right
+        pt(-1.5, 0.3),    # tail, right
+    ]
 
 
 def _midpoint(coords: list) -> tuple[float, float]:

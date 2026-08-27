@@ -68,12 +68,19 @@ python tests/test_turning.py
 This is the main test script. It:
 1. Confirms the API is reachable (`GET /health`).
 2. Fetches the map's named start points (`GET /start_points`).
-3. For each test scenario: teleports the car to a known start point
-   (`POST /teleport {"start_point": ...}`), arms a turn signal or none
-   (`POST /control {"blinker_left"/"blinker_right": true}`), holds the
-   accelerator down (`POST /control {"accelerate": true}`), and then
-   polls `GET /state` every ~50ms for up to 15s, watching for:
+3. For each test scenario: teleports a fresh car to a known start point
+   (`POST /teleport {"start_point": ..., "progress": 0.8, "speed": ...}`)
+   - in the LAST 20% of the start segment, laterally in the middle of the
+   rightmost lane, already rolling at 50 km/h (the running turn-test
+   protocol, see §3) - arms a turn signal or none (`POST /control
+   {"blinker_left"/"blinker_right": true}`), holds the accelerator down
+   (`POST /control {"accelerate": true}`), and then polls `GET /state`
+   every ~50ms until the car crosses the red end flag (first 20% of the
+   expected end segment) or the monitor window expires, watching for:
    - **off-road violations** (`state['on_road'] == False`)
+   - **wrong-side driving** (`state['wrong_side'] == True` - the car is on
+     the oncoming half of a two-way road; fails the scenario immediately,
+     see §3)
    - **instant heading snaps** (>30° heading change in one frame - a
      physics bug, not a real turn)
    - whether the car actually changed to the expected next road segment
@@ -118,12 +125,15 @@ see the speed profile in `src/bicycle_nav.py`, which derives cornering
 speed from the curvature of the driving line); it does not force a
 specific cruising or cornering speed.
 
-The optional `[end_segment]` sets the red end flag at that segment's 50%
-point, exactly like the full suite - making it the nav's destination and
-therefore activating the parking plan (including reverse-in parking where
-the geometry calls for it). Without it the nav has no destination and no
-parking plan: the car just drives through. This is the fast way to watch
-one parking maneuver live in the window.
+The optional `[end_segment]` sets the red end flag at that segment's FIRST
+20% point as a VISUAL-ONLY marker (`red_nav: false`) - the car drives
+through it and the run ends on the crossing, exactly like the full
+suite's running turn tests. Without it the nav has no destination at all:
+the car just drives through. To watch a parking maneuver live in the
+window, run one of the parking-offset scenarios from the suite instead
+(`python tests/test_turning.py --tests park_2lane_right_lane`): only those
+set the flag as the nav's destination and trigger the full parking
+approach (including reverse-in where the geometry calls for it).
 
 ### Cockpit controller (`tools/controller.py`)
 
@@ -169,18 +179,43 @@ broader smoke test once the deterministic suite passes.
 ## 3. Pass criteria (deterministic scenarios)
 
 A deterministic scenario is a tuple `(start_point, direction, target_speed,
-expected_end_segment, duration)` from `DETERMINISTIC_TESTS`. The runner
-teleports a fresh car to the MID point of the start segment, accelerates it
-to speed, signals the turn at the junction, then monitors the drive. A
-scenario **passes** only if ALL of these hold:
+expected_end_segment, duration)` from `DETERMINISTIC_TESTS`. There are two
+protocols:
 
-1. **Arrival = stop AT the flag.** The car reaches the 50% point of
-   `expected_end_segment` (the red end flag) and comes to REST there: either
-   it stops within `STOP_AT_FLAG_TOLERANCE_M` (8 m) before the flag, or it
-   crosses the flag at crawl speed (≤ `FLAG_CRAWL_KMH`, 5 km/h) and then
-   stops. Driving PAST the flag while moving is a FAILURE ("drove past the
-   end flag") - parking at the destination is part of this test, not an
-   afterthought.
+**Running turn tests** (every scenario except the parking-offset ones):
+the intent is to see whether the car does the TURN correctly - nothing
+else. The runner teleports a fresh car into the LAST 20% of the start
+segment (progress `TURN_SPAWN_PROGRESS` = 0.8), laterally in the middle of
+the rightmost lane, already ROLLING at `RUNNING_START_KMH` (50 km/h) - no
+standstill-to-cruise phase. The red end flag marks the FIRST 20% of
+`expected_end_segment` (`END_FLAG_PROGRESS`) and is VISUAL ONLY: the
+`POST /flags` payload carries `red_nav: false`, so the flag does NOT become
+the nav's destination - no parking plan, no stop. The test ends when the
+car crosses the flag; "passed" means it did the turn without leaving the
+road (criteria below). Decision 2026-08-27: tests must be fast, and
+parking is covered by the dedicated parking scenarios - not bolted onto
+every turn.
+
+**Parking-offset scenarios** (`kerb_check` = true, tests 16-20,
+DRIVING_MANEUVERS.md §1 variant): the only scenarios that still park. The
+runner spawns the car at 15% of the segment in one of five lateral start
+positions (baked into the named start points, from ~0.2 m at the right kerb
+to ~0.2 m at the left kerb), and the red flag at 50% is the nav's
+DESTINATION (`red_nav: true`): the car must execute the full parking
+approach (parking ramp + kerb drift, plus reverse-in where the geometry
+calls for it) and end with BOTH right-hand wheels within `KERB_PASS_MAX_M`
+(30 cm) of the right kerb.
+
+A scenario **passes** only if ALL of these hold:
+
+1. **Arrival.** Running tests: the car crosses the end flag (first 20% of
+   `expected_end_segment`) - at any speed, no stop required. Parking
+   tests: the car comes to REST AT the flag (50% point): either it stops
+   within `STOP_AT_FLAG_TOLERANCE_M` (8 m) before the flag, or it crosses
+   the flag at crawl speed (≤ `FLAG_CRAWL_KMH`, 5 km/h) and then stops.
+   Driving PAST the flag while moving is a FAILURE for parking tests
+   ("drove past the end flag") - parking at the destination is part of that
+   test, not an afterthought.
 
    **Reverse-in exception.** When the nav plans a back-in park (`/state`
    reports `parking.style == "reverse"`), the car deliberately drives PAST
@@ -195,15 +230,27 @@ scenario **passes** only if ALL of these hold:
    not the driver, which does not carry these attributes.
 2. **Correct route.** The car ends on exactly `expected_end_segment` (a left
    turn that actually went right fails even if it "arrives" somewhere).
-3. **No off-road.** No validator violations (the car must stay on the
-   carriageway). Wrong-side driving (crossing the centerline into the
-   oncoming lane) is REPORTED but deliberately NOT a failure condition:
-   some maneuvers inherently cross the centerline - an on-site U-turn has
-   to, by definition (DRIVING_MANEUVERS.md §5: crossing the Mittellinie is
-   "erlaubt und erwartet", LaneGuard is suppressed for such maneuvers).
-   A blanket wrong-side failure rule would make those scenarios unpassable.
-   If a specific scenario should treat wrong-side as fatal, that must be an
-   explicit per-scenario flag - not the default.
+3. **No off-road / no wrong-side.** No validator violations (the car must
+   stay on the carriageway), and no crossing of the centerline into the
+   oncoming lane. The game only WARNS on a wrong-side hit (once per
+   crossing) and reports it via `GET /state` (`wrong_side` true on every
+   affected frame + cumulative `lane_guard_stats`); failing the run is the
+   suite's job: it fails the scenario immediately when a poll sees
+   `wrong_side`, with the lane-guard frame counter (delta over the
+   scenario) as backstop for hits between polls. The guard itself stays
+   silent where crossing the centerline is INTENDED by the maneuver:
+   active turn blend zones and on-site U-turns (DRIVING_MANEUVERS.md §5:
+   crossing the Mittellinie is "erlaubt und erwartet"). A scenario that
+   must cross for a reason (e.g. passing a parked car on a narrow road)
+   needs an explicit per-scenario opt-out - not the default.
+
+   **Negative detector test.** The last scenario in `DETERMINISTIC_TESTS`
+   is a negative test: it replays the old 80%-spawn `hairpin_exit` config,
+   where the car provably slides into the oncoming lane at the tip of the
+   V (too close + too fast to make the ~166° turn). It PASSES when the
+   wrong-side detection fires and FAILS if the car stays in its own lane -
+   it proves the detector works. It runs last so a full run always ends
+   with every real driving scenario tested first.
 4. **No instant heading snaps.** ≤ 30° per frame (physically impossible
    rotation).
 5. **No teleport/jump.** Movement between polls is physically plausible:
@@ -217,14 +264,15 @@ scenario **passes** only if ALL of these hold:
 User-aborted runs (cockpit jump) are neither pass nor fail: they are
 reported separately and not persisted to `tests/turning_results.json`.
 
-Criterion 1 is strict on purpose, and it is satisfied by the CAR itself: the
-red flag is the nav's destination (`BicycleNav.set_destination`), so the car
-parks at the flag with the documented parking approach (parking ramp + kerb
-drift + stop). The runner's anticipatory brake latch is only a safety net
-for when that approach fails. If the car crosses the flag anyway, that is a
-real driving defect - e.g. the nav ignoring the hard brake while in pull-over
-mode (this is exactly what used to happen on `s_curve`, which parked at the
-dead end beyond the flag) - not a test artifact.
+For parking tests, criterion 1 is strict on purpose, and it is satisfied by
+the CAR itself: the red flag is the nav's destination
+(`BicycleNav.set_destination`), so the car parks at the flag with the
+documented parking approach (parking ramp + kerb drift + stop). The
+runner's anticipatory brake latch is only a safety net for when that
+approach fails. If the car crosses the flag anyway, that is a real driving
+defect - e.g. the nav ignoring the hard brake while in pull-over mode (this
+is exactly what used to happen on `s_curve`, which parked at the dead end
+beyond the flag) - not a test artifact.
 
 ## 4. The test map (`src/test_maps.py`)
 

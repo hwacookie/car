@@ -751,7 +751,12 @@ class BicycleNav:
         self._route_seg_set: set[int] = set()
         self._profile: list[float] = []
         self._s = 0.0
-        self._pull_out_frames = 120  # ~2 seconds at 60fps, then done
+        # No pull-out on spawn: the car is placed in the normal driving
+        # position (right-lane centre) by the spawner, not parked at the
+        # kerb - the old curb-spawn + 2 s pull-out slowed every e2e test
+        # down (decision 2026-08-27). The pull-out machinery below stays,
+        # but is no longer triggered.
+        self._pull_out_frames = 0
         # U-turn state (see _start_uturn / _update_uturn)
         self._uturn_active = False
         self._uturn_profile: list[float] = []   # SIGNED v_max per metre
@@ -850,6 +855,22 @@ class BicycleNav:
             return None
         return max(0.0, self._ref.total - self._park_s())
 
+    def _lane_base_offset(self, max_offset: float) -> float:
+        """Nominal lane offset for this run (m right of the centreline).
+
+        Normally the right-lane centre. If the car was SPAWNED with a
+        lateral offset (named start points with lateral_offset_m - the
+        parking-offset scenarios, docs §1 variant), that position is the
+        nominal one: the car holds its initial line up to the flag and
+        parks from it, instead of re-centering first (explicit decision
+        2026-08-27). Clamped to what the road allows.
+        """
+        base = min(self.LANE_OFFSET_M, max_offset)
+        ovr = getattr(self.car, 'lane_offset_override_m', None)
+        if ovr is not None:
+            base = max(0.0, min(ovr, max_offset))
+        return base
+
     def _decide_park_style(self):
         """Forwards, or forwards-then-reverse (docs §1b)? Decided ONCE per
         approach, before the plan engages, because the answer changes the
@@ -898,7 +919,9 @@ class BicycleNav:
         # section for a spot on a 9 m one - a swing that would have put the
         # nose deep into the oncoming lane.
         width = self._dest_segment_width()
-        o_lane = min(self.LANE_OFFSET_M, config.kerb_offset_m(width))
+        # The forward position the tuck is planned FROM is where this car
+        # actually drives (its nominal line - possibly a spawn offset).
+        o_lane = self._lane_base_offset(config.kerb_offset_m(width))
         # Reverse-ONLY parking: the forward phase does NOT pull over. The
         # car drives straight past the spot in its lane and stops there;
         # the reverse covers the FULL lateral distance from lane to kerb -
@@ -1268,7 +1291,7 @@ class BicycleNav:
             default=7.0,
         )
         max_offset = config.kerb_offset_m(min_width)
-        base_offset = min(self.LANE_OFFSET_M, max_offset)
+        base_offset = self._lane_base_offset(max_offset)
         # The driving line is the FASTEST LEGAL line, not a fixed lane
         # offset: minimum curvature inside the corridor bounded by the
         # pavement (never off-road) and the centreline (never on the
@@ -1278,7 +1301,8 @@ class BicycleNav:
         # turns, and had to be blended in and out, which is what made the
         # car S-wobble through bends.
         P, N, offsets, cum = raceline.solve_line(
-            self.network, rounded, self._route_segments())
+            self.network, rounded, self._route_segments(),
+            base_offset=base_offset)
         lane = self._apply_end_blends(P, N, offsets, cum,
                                       edge_offset=max_offset,
                                       pulling_over=pulling_over,
@@ -1347,7 +1371,8 @@ class BicycleNav:
             default=7.0,
         )
         P, N, offsets, cum = raceline.solve_line(
-            self.network, rounded, self._route_segments())
+            self.network, rounded, self._route_segments(),
+            base_offset=self._lane_base_offset(config.kerb_offset_m(min_width)))
         lane = self._apply_end_blends(P, N, offsets, cum,
                                       edge_offset=config.kerb_offset_m(min_width),
                                       pulling_over=pulling_over,
@@ -3000,7 +3025,19 @@ class BicycleNav:
                 # coming to a stop is not on the gas.
                 accel = False
         else:
-            v_target = self._target_speed(self._s)
+            # No active plan. Pedal held (suite protocol / human on W):
+            # cruise at the profile speed - including keeping hard after
+            # a target while off line, which is the recovery behaviour we
+            # want DURING a scenario. Pedal released (after reset_controls()
+            # once the test is finished): no throttle - ease down to a stop
+            # at the comfort rate (engine braking + rolling resistance),
+            # like a real car left in gear with the foot off the gas, so a
+            # leftover test car comes to rest instead of rolling forever.
+            if accel:
+                v_target = self._target_speed(self._s)
+            else:
+                v_target = 0.0
+                brake_rate = min(brake_rate, self.A_PARK)
         if brake:
             # External brake (keyboard S / API safety net) always wins.
             v_target = 0.0
@@ -3123,7 +3160,7 @@ class BicycleNav:
         self._route_key = None
         self._profile = []
         self._s = 0.0
-        self._pull_out_frames = 120
+        self._pull_out_frames = 0   # spawn is in the driving position (see __init__)
         self._uturn_active = False
         self._uturn_profile = []
         self._uturn_stops = []

@@ -83,15 +83,20 @@ class MapBuilder:
         ))
         self._next_seg_id += 1
 
-    def start(self, name: str, node_id: str) -> None:
+    def start(self, name: str, node_id: str, lateral_offset_m: float = 0.0) -> None:
         """Register a named, deterministic start point at a node.
 
         The node must have exactly one connected segment (a scenario's
         entry point) so the car's initial heading and direction of travel
         are unambiguous. Use this to give tests a reproducible spawn
         location + heading approaching a specific junction.
+
+        lateral_offset_m shifts the spawn laterally from the NORMAL
+        DRIVING POSITION (right-lane centre): positive = toward the right
+        kerb, negative = toward the left side of the road. Used by the
+        parking-offset scenarios on the two-lane one-way tile.
         """
-        self._start_points[name] = node_id
+        self._start_points[name] = (node_id, lateral_offset_m)
 
     def build(self, margin_m: float = 50.0) -> RoadNetwork:
         """Finalize and return the RoadNetwork."""
@@ -148,8 +153,8 @@ class MapBuilder:
         # Resolve named start points: (x, y, heading, seg_idx, forward)
         # The named node must have exactly one connected segment so the
         # direction of travel (heading, forward flag) is unambiguous.
-        start_points: dict[str, tuple[float, float, float, int, bool]] = {}
-        for name, node_id in self._start_points.items():
+        start_points: dict[str, tuple[float, float, float, int, bool, float]] = {}
+        for name, (node_id, lateral_offset_m) in self._start_points.items():
             connected = node_connections.get(node_id, [])
             if len(connected) != 1:
                 raise ValueError(
@@ -163,7 +168,8 @@ class MapBuilder:
             dx = seg.x2 - seg.x1 if forward else seg.x1 - seg.x2
             dy = seg.y2 - seg.y1 if forward else seg.y1 - seg.y2
             heading = math.degrees(math.atan2(dx, dy))
-            start_points[name] = (x, y, heading, seg_idx, forward)
+            start_points[name] = (x, y, heading, seg_idx, forward,
+                                  lateral_offset_m)
 
         return RoadNetwork(
             nodes=nodes,
@@ -204,6 +210,12 @@ def build_basic_test_map() -> RoadNetwork:
                     sections of decreasing width: 13 m, 9 m, 7 m, 4 m.
                     Used for U-turn tests at different road widths
                     (single swing on 13 m, three-point on 9/7 m, ...).
+        Tile (4,1): Two-lane one-way straight - 300 m, 7 m wide
+                    (2 x 3.5 m lanes), single driving direction (south).
+                    Target of the "reverse park from different lateral
+                    start positions" scenarios (docs/DRIVING_MANEUVERS.md
+                    §1 variant): five named starts at five lateral
+                    positions on the same road, same destination flag.
     """
     b = MapBuilder()
     TILE = 500.0  # pitch between tiles, meters
@@ -457,6 +469,30 @@ def build_basic_test_map() -> RoadNetwork:
     b.road("www_e", "www_f")
     b.start("www_entry", "www_a")
     b.start("www_exit", "www_f")
+
+    # --- Tile (4,1): Two-lane one-way straight (parking from lateral offsets) ---
+    # 300 m straight one-way street, 7 m wide = two 3.5 m lanes in the
+    # driving direction (south). Target of the "reverse park from
+    # different lateral start positions" scenarios
+    # (docs/DRIVING_MANEUVERS.md §1 variant): same route and destination
+    # flag for all five, only the lateral spawn position differs. The
+    # offsets are relative to the normal driving position (right-lane
+    # centre, 1.75 m right of the centreline), positive = toward the
+    # right kerb:
+    #   +0.65  -> right flank ~0.2 m at the kerb ("fast am rechten Rand")
+    #     0.0  -> middle of the right lane (normal position)
+    #   -1.75  -> middle of the street (on the centreline)
+    #   -3.5   -> middle of the left lane
+    #   -4.15  -> left flank ~0.2 m at the left kerb ("ganz links")
+    ox, oy = origin(4, 1)
+    b.node("tl_ow_n", ox + 100, oy + 350)
+    b.node("tl_ow_s", ox + 100, oy + 50)
+    b.road("tl_ow_n", "tl_ow_s", oneway=True, lanes=2, width=7.0)
+    b.start("park_2lane_kerb",       "tl_ow_n", lateral_offset_m=+0.65)
+    b.start("park_2lane_right_lane", "tl_ow_n")
+    b.start("park_2lane_centre",     "tl_ow_n", lateral_offset_m=-1.75)
+    b.start("park_2lane_left_lane",  "tl_ow_n", lateral_offset_m=-3.50)
+    b.start("park_2lane_far_left",   "tl_ow_n", lateral_offset_m=-4.15)
 
     return b.build()
 

@@ -40,6 +40,10 @@ class Renderer:
         self.flag_green: list | None = None
         self.flag_red: list | None = None
         self.flag_red_pending: tuple | None = None
+        # True (default): the red flag is the car's NAVIGATION destination
+        # (park at it). False: visual-only marker - running turn tests end
+        # when the car PASSES the flag, no parking involved (docs/TESTING.md).
+        self.flag_red_nav: bool = True
         # Debug overlay (G key / POST /toggle paved_edge): white outline of
         # the exact paved-area polygon that defines off-road checks. The
         # state persists across restarts (data/debug_overlays.json) so a
@@ -422,10 +426,14 @@ class Renderer:
         a_c = dash_alpha(c_dash_px)
         lane_marks = self.network.get_lane_markings()
         a_l = dash_alpha(l_dash_px) if lane_marks else 0
-        if a_c > 0 or a_l > 0:
+        # One-way direction arrows fade with the same zoom rule as the
+        # other markings (their ~3 m length sets the on-screen size).
+        a_a = dash_alpha(3.0 * pppm)
+        if a_c > 0 or a_l > 0 or a_a > 0:
             # Any alpha < 255 needs a per-pixel-alpha overlay; full
             # opacity can draw straight onto the screen surface.
-            need_overlay = (0 < a_c < 255) or (0 < a_l < 255)
+            need_overlay = (0 < a_c < 255) or (0 < a_l < 255) \
+                or (0 < a_a < 255)
             target = surface if not need_overlay else pygame.Surface((w, h), pygame.SRCALPHA)
             if a_c > 0:
                 # Width-filtered set (>= CENTERLINE_MIN_WIDTH_M) - the
@@ -450,6 +458,14 @@ class Renderer:
                         self._draw_solid_polyline(
                             target, coords, w, h, a_l, 0.15, (183, 189, 186),
                             xform=xform)
+            if a_a > 0:
+                # Painted direction arrows on one-way roads: one per lane,
+                # every 100 m, pointing along the legal direction.
+                col = ((255, 255, 255, a_a) if need_overlay
+                       else (255, 255, 255))
+                for poly in self.network.get_oneway_arrows():
+                    pygame.draw.polygon(target, col,
+                                        [xform(*p) for p in poly])
             if target is not surface:
                 surface.blit(target, (0, 0))
 

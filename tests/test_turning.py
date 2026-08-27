@@ -4,6 +4,7 @@ Comprehensive Turn Testing via REST API
 Tests both left and right turns with detailed monitoring
 """
 
+import math
 import os
 import requests
 import time
@@ -16,7 +17,9 @@ from pathlib import Path
 # The braking-distance math below must use the game's actual deceleration,
 # so it is imported from the shared config instead of duplicated here.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.config import CAR_BRAKING  # m/s² (the game's ABS braking)
+from src.config import (CAR_BRAKING,        # m/s² (the game's ABS braking)
+                        CAR_WIDTH,          # m
+                        SPRITE_WHEELBASE_M)  # m
 
 
 API_URL = os.environ.get("CAR_API_URL", "http://127.0.0.1:5000")  # explicit IPv4: 'localhost' may resolve to ::1, where macOS ControlCenter squats on :5000
@@ -49,6 +52,29 @@ STOP_AT_FLAG_TOLERANCE_M = 8.0
 # a destination often rolls over the line at a few km/h before coming to
 # rest, which is indistinguishable from stopping right at it.
 FLAG_CRAWL_KMH = 5.0
+
+# Parking-offset scenarios (docs/DRIVING_MANEUVERS.md §1 variant): the
+# arrival at the flag is not enough - the car must also have PARKED, i.e.
+# BOTH right-hand wheels end within this distance of the right kerb.
+# Measured at the body flank (CAR_WIDTH/2) at both wheel stations: a
+# perfectly parked car sits PARK_KERB_CLEARANCE_M (0.16 m) out, so 30 cm
+# means "parked properly", not "touched the kerb".
+KERB_PASS_MAX_M = 0.30
+# Width of the two-lane one-way tile in src/test_maps.py (tile (4,1)) -
+# the right-kerb line for the check above is derived from it.
+PARK_2LANE_WIDTH_M = 7.0
+
+# Running turn tests (docs/TESTING.md): the scenario drives THROUGH the
+# corner - no stopping, no parking (parking is covered by the dedicated
+# parking-offset scenarios). The car spawns in the LAST 20% of the start
+# segment (progress TURN_SPAWN_PROGRESS), already rolling at
+# RUNNING_START_KMH, and the test ends when it crosses the red end flag,
+# which marks the FIRST 20% of the expected end segment. Pass criterion:
+# the turn was executed correctly - stayed on the road and did not drive
+# into the oncoming lane (lane guard).
+TURN_SPAWN_PROGRESS = 0.8
+END_FLAG_PROGRESS = 0.2
+RUNNING_START_KMH = 50.0
 
 
 # --- Colored console output (auto-disabled when stdout is not a TTY) ---
@@ -215,6 +241,11 @@ def describe_failure(result: dict) -> str | None:
         return "teleported / unexpected jump detected"
     if result.get("instant_snap_detected"):
         return "instant heading snap (unrealistic rotation)"
+    if result.get("expect_wrong_side") and not result.get("wrong_side_detected"):
+        return ("expected wrong-side driving but none occurred - the car "
+                "stayed in its own lane (negative detector test did not fire)")
+    if result.get("wrong_side_detected") and not result.get("expect_wrong_side"):
+        return "drove into the oncoming lane (wrong side of the centreline)"
     # off_road_detected already accounts for the validator log, measured as
     # a DELTA over the scenario. Re-testing the cumulative count here would
     # reintroduce the same latch.
@@ -228,16 +259,25 @@ def describe_failure(result: dict) -> str | None:
         final = result.get("final_segment")
         expected = result.get("expected_end_segment")
         if final == expected:
-            # On the right segment but the 50% end flag was never reached -
+            # On the right segment but the end flag was never reached -
             # calling that "the wrong route" is a lie (it cost real debugging
             # time to decode). Usually: approach too slow for the window, or
             # the stop landed just short of the flag tolerance.
+            target_pct = 50 if result.get("kerb_check") \
+                else result.get("end_flag_progress", END_FLAG_PROGRESS) * 100
             return (f"timed out on the correct segment {final} before "
-                    f"reaching the end flag (50% point)")
+                    f"reaching the end flag ({target_pct:.0f}% point)")
         return (f"took the wrong route (ended on segment {final}, "
                 f"expected {expected})")
     if result.get("reached_expected_segment") and not result.get("stopped_at_end"):
         return "reached the destination but never came to a clean stop"
+    if result.get("kerb_check") and result.get("reached_expected_segment") \
+            and result.get("stopped_at_end"):
+        gaps = result.get("kerb_gaps_m")
+        if gaps is not None:
+            return (f"parked too far from the kerb: right flank "
+                    f"{gaps[1] * 100:.0f} cm front / {gaps[0] * 100:.0f} cm rear "
+                    f"(limit {KERB_PASS_MAX_M * 100:.0f} cm)")
     return (f"timed out: never reached expected segment "
             f"{result.get('expected_end_segment')}")
 
@@ -297,6 +337,8 @@ START_POINT_NUMBER = {
     'corner_left_entry': 11, 'corner_left_exit': 11,
     'tjunction_from_top': 12, 'tjunction_from_west': 12, 'tjunction_from_east': 12,
     'sliver_approach': 13, 'sliver_from_west': 13, 'sliver_from_east': 13,
+    'park_2lane_kerb': 14, 'park_2lane_right_lane': 14, 'park_2lane_centre': 14,
+    'park_2lane_left_lane': 14, 'park_2lane_far_left': 14,
 }
 
 
@@ -305,54 +347,55 @@ START_POINT_NUMBER = {
 # it to build its row of numbered test buttons without running the suite.
 # Default monitor window: 30 s. Passing tests exit ON ARRIVAL, so this only
 # bounds how long a FAILING run takes - but it must comfortably exceed the
-# slowest legitimate arrival. Since the red flag is the car's NAVIGATION
-# destination (BicycleNav.set_destination), arrivals use the documented
-# parking approach (parking ramp + kerb drift + stop at the flag) instead
-# of a hard brake, which is slower: measured arrivals (2026-08-25):
-# 13.9 s (crossroads straight) to ~34.5 s (roundabout: the ring's chord
-# segments delay the route horizon, so the park approach starts late, and
-# the 6 m exit fillet caps the spoke entry at ~12 km/h); the other slowest
-# land at 20.2-21.5 s. 30 s leaves >= 8.5 s of slack for those; s_curve
-# (arrives ~24 s) and roundabout get 40 s.
+# slowest legitimate arrival. Running turn tests end at the flag crossing
+# (first 20% of the end segment - no stop), so arrivals are quick except
+# on the roundabout: the ring's chord segments delay the route horizon and
+# the car has to circle most of the ring before reaching the west exit,
+# hence its longer window. The parking-offset scenarios keep the full
+# parking approach (parking ramp + kerb drift + back-in + stop at the
+# flag), which is slower - 45 s covers them.
 DETERMINISTIC_TESTS = [
     # 90-degree corners (the classic reported bug)
-    ('corner_right_entry', 'right', 80, 6, 60.0,
+    ('corner_right_entry', 'right', 50, 6, 60.0,
      "Taking a sharp 90° right corner"),
-    ('corner_left_entry', 'left', 80, 8, 60.0,
+    ('corner_left_entry', 'left', 50, 8, 60.0,
      "Taking a sharp 90° left corner"),
     # T-junction (perpendicular 3-way)
-    ('tjunction_from_top', 'left', 80, 11, 60.0,
+    ('tjunction_from_top', 'left', 50, 11, 60.0,
      "T-junction: turning left off the stem"),
-    ('tjunction_from_top', 'right', 80, 10, 60.0,
+    ('tjunction_from_top', 'right', 50, 10, 60.0,
      "T-junction: turning right off the stem"),
     # Y-intersection (shallow ~40 degree diverging angles)
-    ('y_from_stem', 'left', 80, 14, 60.0,
+    ('y_from_stem', 'left', 50, 14, 60.0,
      "Y-intersection: taking the left fork"),
-    ('y_from_stem', 'right', 80, 13, 60.0,
+    ('y_from_stem', 'right', 50, 13, 60.0,
      "Y-intersection: taking the right fork"),
     # 4-way crossroads
-    ('crossroads_from_north', 'left', 80, 18, 60.0,
+    ('crossroads_from_north', 'left', 50, 18, 60.0,
      "4-way crossroads: turning left"),
-    ('crossroads_from_north', 'right', 80, 17, 60.0,
+    ('crossroads_from_north', 'right', 50, 17, 60.0,
      "4-way crossroads: turning right"),
-    ('crossroads_from_north', 'straight', 80, 16, 60.0,
+    ('crossroads_from_north', 'straight', 50, 16, 60.0,
      "4-way crossroads: going straight through"),
     # One-way street (legal direction)
-    ('oneway_entry', 'straight', 80, 20, 60.0,
+    ('oneway_entry', 'straight', 50, 20, 60.0,
      "Entering a one-way street in the legal direction"),
-    # Simple curves (degree-2 nodes, no blinker needed). The S-curve
-    # is ~470 m long, so at cruise (~58 km/h) the car needs ~30 s to
-    # traverse it - longer than the default 15 s monitor window, hence
-    # the duration override.
-    ('s_curve', 'straight', 80, 26, 60.0,
+    # Simple curves (degree-2 nodes, no blinker needed). Under the running
+    # protocol only the corner ENTRY is covered (last 20% of the approach
+    # + first 20% of the target segment) - the long S-curve traversal the
+    # old stop-at-50% protocol measured is out of scope now.
+    ('s_curve', 'straight', 50, 26, 60.0,
      "Following a zig-zag S-curve road"),
-    ('hairpin_entry', 'straight', 80, 29, 60.0,
-     "Driving a hairpin bend (entry side)"),
-    ('sweeping_curve', 'straight', 80, 31, 60.0,
+    # Test 12 overrides: spawn at 50% of the approach segment AND finish
+    # at the 50% point of the end segment (tuple fields:
+    # start_progress=0.5, kerb_check=False, end_flag_progress=0.5).
+    ('hairpin_entry', 'straight', 50, 29, 60.0,
+     "Driving a hairpin bend (entry side)", 0.5, False, 0.5),
+    ('sweeping_curve', 'straight', 50, 31, 60.0,
      "Following a wide, sweeping curve"),
     # Hairpin, entered from the opposite end (reverse direction)
-    ('hairpin_exit', 'straight', 80, 28, 60.0,
-     "Driving a hairpin bend (exit side)"),
+    ('hairpin_exit', 'straight', 50, 28, 60.0,
+     "Driving a hairpin bend (exit side)", 0.5, False, 0.5),
     # Roundabout (one-way ring, 4 two-way spokes). 'straight'
     # (or 'left') at the entry just merges onto the ring and then
     # keeps circling it FOREVER - a one-way loop has no "next
@@ -387,6 +430,38 @@ DETERMINISTIC_TESTS = [
     #  "Sliver junction: turning right off the tiny approach stub"),
     # ('sliver_approach', 'left', 80, 103, 15.0,
     #  "Sliver junction: turning left off the tiny approach stub"),
+    # Reverse park from different lateral start positions (docs/
+    # DRIVING_MANEUVERS.md §1 variant). Straight two-lane one-way street
+    # (tile (4,1), 7 m = 2 x 3.5 m lanes, segment index 109 - NOTE: the
+    # game's state/flag API uses 0-based indices, NOT the 1-based RoadSegment
+    # id 110); the car starts at 15% of the segment and must back into the
+    # flag at 50% with BOTH right-hand wheels within 30 cm of the right
+    # kerb (the extra tuple fields: start_progress, kerb_check). Only the
+    # lateral spawn position varies between the five - it is baked into the
+    # named start points.
+    ('park_2lane_kerb', 'straight', 80, 109, 45.0,
+     "Back-in park from ~0.2 m at the right kerb", 0.15, True),
+    ('park_2lane_right_lane', 'straight', 80, 109, 45.0,
+     "Back-in park from the middle of the right lane (normal position)", 0.15, True),
+    ('park_2lane_centre', 'straight', 80, 109, 45.0,
+     "Back-in park from the middle of the street", 0.15, True),
+    ('park_2lane_left_lane', 'straight', 80, 109, 45.0,
+     "Back-in park from the middle of the left lane", 0.15, True),
+    ('park_2lane_far_left', 'straight', 80, 109, 45.0,
+     "Back-in park from ~0.2 m at the left kerb", 0.15, True),
+    # NEGATIVE TEST (wrong-side detector) - runs LAST on purpose: the old
+    # test-14 config. Spawn at 80% of segment 29, i.e. right at the
+    # hairpin fillet, already rolling at 50 km/h. The car cannot make the
+    # ~166-degree turn in time and slides across the centreline into the
+    # oncoming lane at the tip of the V. This scenario is EXPECTED to
+    # drive wrong-side: it PASSES when the suite detects the violation
+    # (live 'wrong_side' state or the lane-guard frame counter) and FAILS
+    # if the car somehow stays in its own lane - it proves the detection
+    # works instead of testing driving quality.
+    ('hairpin_exit', 'straight', 50, 28, 60.0,
+     "NEGATIVE: spawn too close to the hairpin corner at 50 km/h - must "
+     "slide into the oncoming lane and trigger the wrong-side detection",
+     0.8, False, 0.5, True),
 ]
 
 
@@ -460,19 +535,24 @@ class TurnTester:
         requests.post(f"{API_URL}/teleport", json={'random': True})
         self._wait_for_new_car(old_uid)
 
-    def create_car_at_start_point(self, name: str, progress: float = 0.5):
+    def create_car_at_start_point(self, name: str, progress: float = 0.5,
+                                  speed_mps: float | None = None):
         """Replace car with a fresh one at named start point.
 
         progress: fraction along the start segment (from the node). The
-        suite standard is 0.5 - every scenario starts MID-segment, not on
-        the junction node (see AGENTS.md e2e rules).
+        suite standard is TURN_SPAWN_PROGRESS - running turn tests use
+        only the LAST 20% of the start segment (see docs/TESTING.md).
+        speed_mps: optional rolling start in m/s (running turn tests spawn
+        already moving; parking tests start from rest).
         """
         try:
             old_uid = self.get_state().get('car_uid')
         except requests.exceptions.RequestException:
             old_uid = None
-        requests.post(f"{API_URL}/teleport",
-                      json={'start_point': name, 'progress': progress})
+        payload = {'start_point': name, 'progress': progress}
+        if speed_mps is not None:
+            payload['speed'] = speed_mps
+        requests.post(f"{API_URL}/teleport", json=payload)
         # Wait until the game loop has actually processed the teleport and
         # the state reflects the NEW car (see _wait_for_new_car).
         self._wait_for_new_car(old_uid)
@@ -481,6 +561,41 @@ class TurnTester:
         """Show (or clear) a short text label in the game's HUD."""
         requests.post(f"{API_URL}/label", json={'text': text})
     
+    def _right_side_kerb_gaps_m(self, state: dict, start_point: str):
+        """Gap (m) between the car's RIGHT FLANK at both wheel stations and
+        the right kerb line of the scenario's road; positive = on the road.
+
+        The basic map is deterministic, so the kerb line comes from the
+        start point's centreline position + heading (GET /start_points):
+        a straight line PARK_2LANE_WIDTH_M/2 to the right of the legal
+        direction of travel. The car pose is its rear axle (state x/y) +
+        heading; the wheel stations are the rear axle and the front axle
+        (SPRITE_WHEELBASE_M ahead), measured at the body flank
+        (CAR_WIDTH/2 outboard).
+        """
+        sp = self.get_start_points().get(start_point)
+        if sp is None:
+            return None
+        pppm = 2.0  # config.PIXELS_PER_METER
+        h = math.radians(sp['heading'])
+        fx, fy = math.sin(h), math.cos(h)          # direction of travel
+        rx, ry = fy, -fx                           # right-hand side of it
+        half_w_px = (PARK_2LANE_WIDTH_M / 2.0) * pppm
+        cx, cy = sp['x'] + rx * half_w_px, sp['y'] + ry * half_w_px  # kerb line
+        hd = math.radians(state['heading'])
+        fcx, fcy = math.sin(hd), math.cos(hd)      # car forward
+        rcx, rcy = fcy, -fcx                       # car right side
+        x, y = state['x'], state['y']              # rear axle (world px)
+        wb_px = SPRITE_WHEELBASE_M * pppm
+        flank_px = (CAR_WIDTH / 2.0) * pppm
+        gaps = []
+        for wx, wy in ((x + rcx * flank_px, y + rcy * flank_px),          # rear right
+                       (x + fcx * wb_px + rcx * flank_px,
+                        y + fcy * wb_px + rcy * flank_px)):               # front right
+            # signed distance from the kerb line into the road (n = -r)
+            gaps.append(((wx - cx) * (-rx) + (wy - cy) * (-ry)) / pppm)
+        return gaps
+
     def get_start_points(self) -> dict:
         """List available deterministic start points from the loaded map."""
         response = requests.get(f"{API_URL}/start_points")
@@ -706,7 +821,10 @@ class TurnTester:
                       start_point: str | None = None, expected_end_segment: int | None = None,
                       description: str | None = None, results: dict | None = None,
                       abort_check: "callable | None" = None,
-                      label: str | None = None) -> dict:
+                      label: str | None = None, start_progress: float = 0.5,
+                      kerb_check: bool = False,
+                      end_flag_progress: float = END_FLAG_PROGRESS,
+                      expect_wrong_side: bool = False) -> dict:
         """Monitor a turn for violations.
         
         Args:
@@ -730,6 +848,19 @@ class TurnTester:
                 for the legacy random-location suite, where there's no way
                 to know the correct answer in advance), falls back to the
                 old "any change + drive to the far end and stop" behavior.
+            start_progress: Where along the start segment to spawn (0..1
+                from the named node). The suite standard is 0.5; the
+                parking-offset scenarios use 0.15 so there is ~100 m of
+                approach between spawn and the flag at 50%.
+            kerb_check: Parking-offset scenarios only (docs/
+                DRIVING_MANEUVERS.md §1 variant). The arrival at the flag
+                is not enough - BOTH right-hand wheels must end within
+                KERB_PASS_MAX_M of the right kerb or the scenario fails.
+            end_flag_progress: Where along the expected end segment the
+                red end flag sits (0..1 from the segment's first node).
+                Suite standard is END_FLAG_PROGRESS (first 20%); a
+                scenario may override it (e.g. test 12 finishes at the
+                50% point of the end segment).
             abort_check: Optional zero-arg callable, polled throughout setup
                 and monitoring. If it returns truthy, the scenario is
                 ABORTED right away (the cockpit controller sets this when
@@ -772,8 +903,13 @@ class TurnTester:
         # Deterministic scenarios start MID-segment (50%) so the maneuver
         # begins on open road, not hugging the junction node.
         if start_point:
-            print(f"📍 Creating new car at '{start_point}' (50% of segment)...")
-            self.create_car_at_start_point(start_point, progress=0.5)
+            print(f"📍 Creating new car at '{start_point}' "
+                  f"({start_progress * 100:.0f}% of segment)...")
+            # Running turn tests spawn ALREADY MOVING (rolling start, no
+            # standstill-to-cruise phase); parking tests start from rest.
+            rolling = None if kerb_check else RUNNING_START_KMH / 3.6
+            self.create_car_at_start_point(start_point, progress=start_progress,
+                                           speed_mps=rolling)
             # Label under the minimap: the current test number ("10/15")
             # when running as part of a suite; standalone runs fall back
             # to the track number / start-point name.
@@ -793,11 +929,21 @@ class TurnTester:
         # scenario and skip straight to the summary instead of raising.
         setup_crashed = False
         setup_aborted = False
+        # Baseline for the cumulative validator log - taken IMMEDIATELY
+        # after the teleport, BEFORE the accelerate phase: a spawn that
+        # sits off the pavement (e.g. chord vs corner-rounded road) would
+        # otherwise log its violations during setup and be baked into the
+        # baseline, making them invisible to the monitor's delta check.
+        violations_at_start = 0
+        ws_frames_at_start = 0
         try:
             state = self.get_state()
             initial_segment = state['segment']
             initial_pos = (state['x'], state['y'])
             initial_heading = state['heading']
+            violations_at_start = state.get('validator_violations', 0)
+            ws_frames_at_start = (state.get('lane_guard_stats') or {}) \
+                .get('wrong_side_frames', 0)
             print(f"   Starting at segment {initial_segment}")
             print(f"   Position: ({state['x']:.0f}, {state['y']:.0f})")
             print(f"   Heading: {state['heading']:.1f}°")
@@ -811,10 +957,19 @@ class TurnTester:
             # also replaces any stale end flag from a previous scenario;
             # random-location runs have no known destination.
             try:
+                # Parking tests: the flag (50% of the end segment) is the
+                # car's NAVIGATION destination - it parks at it. Running
+                # turn tests: visual-only marker at end_flag_progress of
+                # the end segment (suite standard: FIRST 20%) - crossing
+                # it ends the test, no parking.
+                red_flag = None
+                if expected_end_segment is not None:
+                    red_flag = [expected_end_segment,
+                                0.5 if kerb_check else end_flag_progress]
                 requests.post(f"{API_URL}/flags", json={
                     'green': [state['x'], state['y'], state['heading']],
-                    'red': ([expected_end_segment, 0.5]
-                            if expected_end_segment is not None else None),
+                    'red': red_flag,
+                    'red_nav': bool(kerb_check),
                 }, timeout=2)
             except requests.exceptions.RequestException:
                 pass
@@ -891,16 +1046,13 @@ class TurnTester:
         instant_snap_detected = False
         teleport_detected = False
         game_crashed = False
+        wrong_side_detected = False
         stopped_ok = False
         braking_for_end = False
         violation_details = None
         positions = []
-        # Baseline for the cumulative validator log (see the check below).
-        try:
-            violations_at_start = requests.get(
-                f"{API_URL}/state", timeout=2).json().get('validator_violations', 0)
-        except Exception:
-            violations_at_start = 0
+        # (violations_at_start was captured right after the teleport -
+        # see the setup block above.)
         final_pos = initial_pos
         last_heading = initial_heading
         max_heading_change_per_frame = 0.0
@@ -1070,6 +1222,37 @@ class TurnTester:
                 
                 break
             
+            # Wrong-side driving (oncoming lane): the game only WARNS on a
+            # violation (state flag + cumulative lane-guard stats); failing
+            # the run is the suite's job (docs/TESTING.md §3). /state
+            # reports 'wrong_side' on every frame the car sits on the wrong
+            # side, so this poll catches it live; the cumulative counter
+            # below is the backstop for hits between polls.
+            if state.get('wrong_side'):
+                wrong_side_detected = True
+                violation_details = {
+                    'type': 'wrong_side',
+                    'time': time.time() - start_time,
+                    'position': (state['x'], state['y']),
+                    'heading': state['heading'],
+                    'speed_kmh': state['speed_kmh'],
+                    'segment': state['segment'],
+                    'frame': frames_checked
+                }
+                
+                print(f"\n   ❌ WRONG-SIDE DRIVING DETECTED!")
+                print(f"      Time: {violation_details['time']:.2f}s")
+                print(f"      Position: ({state['x']:.0f}, {state['y']:.0f})")
+                print(f"      Heading: {state['heading']:.1f}°")
+                print(f"      Speed: {state['speed_kmh']:.0f} km/h")
+                print(f"      Segment: {state['segment']}")
+                
+                # Save screenshot
+                screenshot = self.save_violation_screenshot(f"{direction}_wrongside", state)
+                violation_details['screenshot'] = screenshot
+                
+                break
+            
             # Check if segment changed. If we have a SPECIFIC expected
             # end segment, only that counts as arrival - a mere change to
             # some OTHER segment (e.g. a wrong turn) is noted but keeps
@@ -1078,13 +1261,18 @@ class TurnTester:
             # only the last of those is "done"). Without an expected
             # segment (legacy random-location mode only), any change at
             # all is accepted, same as before.
-            if state['segment'] != initial_segment:
-                if not segment_changed:
+            # The parking-offset scenarios START and END on the same
+            # segment (the car parks where it was driving), so "segment
+            # changed" can never be their arrival trigger - being ON the
+            # expected segment is enough.
+            on_target_segment = (expected_end_segment is not None
+                                 and state['segment'] == expected_end_segment)
+            if state['segment'] != initial_segment or on_target_segment:
+                if state['segment'] != initial_segment and not segment_changed:
                     segment_changed = True
                     print(f"\n   ℹ️  Segment changed: {initial_segment} → {state['segment']} "
                           f"(t={time.time() - start_time:.2f}s)")
-                if expected_end_segment is not None and \
-                        state['segment'] == expected_end_segment:
+                if on_target_segment:
                     # Deterministic scenarios END at the 50% point of the
                     # target segment (mid-segment, mirroring the start) -
                     # the car does NOT drive on to the far end / dead end,
@@ -1094,6 +1282,29 @@ class TurnTester:
                         end_entry_progress = state.get('progress')
                     prog = state.get('progress')
                     entry = end_entry_progress
+                    if not kerb_check:
+                        # RUNNING TURN TEST (docs/TESTING.md): the test ends
+                        # the moment the car reaches the end flag - the
+                        # FIRST 20% of the expected end segment. No stop,
+                        # no parking: "did the turn correctly" = stayed on
+                        # the road + lane guard (no oncoming-lane driving).
+                        if prog is not None and prog >= end_flag_progress:
+                            reached_expected_segment = True
+                            print(f"\n   ✅ Crossed the end flag at {prog * 100:.0f}% "
+                                  f"of segment {state['segment']} "
+                                  f"(target: {end_flag_progress * 100:.0f}%)")
+                            print(f"      Time: {time.time() - start_time:.2f}s")
+                            print(f"      Max heading change per frame: {max_heading_change_per_frame:.1f}°")
+                            final_pos = (state['x'], state['y'])
+                            stopped_ok = True   # running test: no stop required
+                            print(f"      Start: ({initial_pos[0]:.0f}, {initial_pos[1]:.0f}) seg {initial_segment} "
+                                  f"→ End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}")
+                            print(f"      Distance traveled: {((final_pos[0] - initial_pos[0])**2 + (final_pos[1] - initial_pos[1])**2)**0.5:.0f} pixels")
+                            try:
+                                self.reset_controls()   # release the throttle latch
+                            except requests.exceptions.RequestException:
+                                pass
+                            break
                     crossed_now = (prog is not None and entry is not None and (
                         (entry < 0.5 and prog >= 0.5)
                         or (entry > 0.5 and prog <= 0.5)))
@@ -1241,19 +1452,54 @@ class TurnTester:
         except requests.exceptions.RequestException:
             pass
         
+        # Parking-offset scenarios (kerb_check): the arrival above only
+        # proves the car stopped AT the flag - the pass criterion is how
+        # CLOSE to the right kerb it parked: both right-hand wheels within
+        # KERB_PASS_MAX_M. Measured on a fresh state after the final stop.
+        kerb_gaps = None
+        if kerb_check and reached_expected_segment and stopped_ok:
+            try:
+                kerb_gaps = self._right_side_kerb_gaps_m(
+                    self.get_state(), start_point)
+            except requests.exceptions.RequestException:
+                kerb_gaps = None
+        kerb_failed = (kerb_gaps is not None
+                       and (max(kerb_gaps) > KERB_PASS_MAX_M
+                            or min(kerb_gaps) <= 0.0))
+
+        # Backstop for wrong-side hits that fell BETWEEN API polls: the
+        # lane guard's frame counter is cumulative for the whole game
+        # process, so compare it against its value when this scenario
+        # started (same delta logic as validator_violations).
+        if not wrong_side_detected:
+            ws_now = (state.get('lane_guard_stats') or {}) \
+                .get('wrong_side_frames', 0)
+            if ws_now > ws_frames_at_start:
+                wrong_side_detected = True
+                print(f"\n   ❌ WRONG-SIDE DRIVING DETECTED (between polls: "
+                      f"{ws_now - ws_frames_at_start} frame(s) on the wrong "
+                      f"side per lane-guard stats)")
+        
         # A scenario only passes if it ENDS with the car stopped at its
         # destination - the end flag for deterministic scenarios, the far
         # end of the target segment in legacy random mode. Driving on past
         # the destination is a different maneuver, not this test.
-        passed = (
-            reached_expected_segment
-            and stopped_ok
-            and not passed_flag
-            and not off_road_detected
-            and not instant_snap_detected
-            and not teleport_detected
-            and not game_crashed
-        )
+        # EXCEPTION: negative detector tests (expect_wrong_side) PASS when
+        # the violation fires - they exist to prove the detection works.
+        if expect_wrong_side:
+            passed = wrong_side_detected
+        else:
+            passed = (
+                reached_expected_segment
+                and stopped_ok
+                and not passed_flag
+                and not off_road_detected
+                and not instant_snap_detected
+                and not teleport_detected
+                and not game_crashed
+                and not kerb_failed
+                and not wrong_side_detected
+            )
         
         # Prepare results
         result = {
@@ -1276,6 +1522,11 @@ class TurnTester:
             'instant_snap_detected': instant_snap_detected,
             'teleport_detected': teleport_detected,
             'game_crashed': game_crashed,
+            'wrong_side_detected': wrong_side_detected,
+            'expect_wrong_side': expect_wrong_side,
+            'kerb_check': kerb_check,
+            'end_flag_progress': end_flag_progress,
+            'kerb_gaps_m': kerb_gaps,
             'max_heading_change_per_frame': max_heading_change_per_frame,
             'violation_details': violation_details,
             'positions': positions,
@@ -1307,11 +1558,21 @@ class TurnTester:
         else:
             print(green("   ✅ Lane guard: no wrong-side driving detected"))
 
+        if kerb_gaps is not None:
+            ok = not kerb_failed
+            txt = (f"   Kerb check: right flank {kerb_gaps[1] * 100:.0f} cm "
+                   f"(front) / {kerb_gaps[0] * 100:.0f} cm (rear) from the "
+                   f"kerb (limit {KERB_PASS_MAX_M * 100:.0f} cm)")
+            print(green(f"   ✅ {txt}") if ok else red(f"   ❌ {txt}"))
+
         # Colored one-line verdict: green "passed" or red "fail: <reason>".
         reason = describe_failure(result)
         if reason is None:
             print(green("   ✅ PASSED"))
-            if result.get('expected_end_segment') is None:
+            if result.get('expect_wrong_side'):
+                print(dim("      Wrong-side driving occurred and was detected - "
+                          "exactly what this negative detector test expects"))
+            elif result.get('expected_end_segment') is None:
                 print(dim("      Reached designated end segment, drove to its end and "
                           "stopped there, stayed on road, no violations"))
             else:
@@ -1464,6 +1725,11 @@ class TurnTester:
             start_point, direction, speed, expected_end_segment = test[0], test[1], test[2], test[3]
             duration = test[4] if len(test) > 4 else 15.0
             description = test[5] if len(test) > 5 else None
+            start_progress = (test[6] if len(test) > 6
+                              else TURN_SPAWN_PROGRESS)
+            kerb_check = bool(test[7]) if len(test) > 7 else False
+            end_flag_progress = test[8] if len(test) > 8 else END_FLAG_PROGRESS
+            expect_wrong_side = bool(test[9]) if len(test) > 9 else False
             print(f"\n\n{'#'*60}")
             print(f"# TEST {i}/{len(tests)}: '{start_point}' -> {direction.upper()} @ {speed} km/h")
             print(f"{'#'*60}")
@@ -1476,7 +1742,11 @@ class TurnTester:
                                        expected_end_segment=expected_end_segment,
                                        description=description, results=results,
                                        abort_check=abort_check,
-                                       label=f"{i}/{len(tests)}")
+                                       label=f"{i}/{len(tests)}",
+                                       start_progress=start_progress,
+                                       kerb_check=kerb_check,
+                                       end_flag_progress=end_flag_progress,
+                                       expect_wrong_side=expect_wrong_side)
 
             _emit({'type': 'done', 'index': i, 'passed': result['passed'],
                    'aborted': bool(result.get('aborted'))})
@@ -1512,6 +1782,9 @@ class TurnTester:
         failed_snap = sum(1 for r in runnable if r['instant_snap_detected'])
         failed_teleport = sum(1 for r in runnable if r.get('teleport_detected'))
         failed_crashed = sum(1 for r in runnable if r.get('game_crashed'))
+        failed_wrongside = sum(1 for r in runnable
+                               if r.get('wrong_side_detected')
+                               and not r.get('expect_wrong_side'))
         failed_passed_flag = sum(1 for r in runnable if r.get('passed_flag'))
         failed_wrong_route = sum(
             1 for r in runnable
@@ -1520,6 +1793,7 @@ class TurnTester:
             and not r['off_road_detected'] and not r['instant_snap_detected']
             and not r.get('teleport_detected') and not r.get('game_crashed')
             and not r.get('passed_flag')
+            and not r.get('expect_wrong_side')
         )
         # Timeouts include "timed out ON the correct segment before reaching
         # the flag" - that is an arrival problem, not a routing error.
@@ -1530,6 +1804,7 @@ class TurnTester:
             and not r.get('game_crashed') and not r.get('passed_flag')
             and (not r['segment_changed']
                  or r.get('final_segment') == r.get('expected_end_segment'))
+            and not r.get('expect_wrong_side')
         )
         
         def line(count, fail_label, pass_label):
@@ -1544,6 +1819,7 @@ class TurnTester:
         print(line(failed_snap, "instant snap", "instant snaps"))
         print(line(failed_teleport, "teleport/jump", "teleport/jump"))
         print(line(failed_crashed, "game crashed", "game crashes"))
+        print(line(failed_wrongside, "wrong-side driving", "wrong-side driving"))
         print(line(failed_passed_flag, "drove past the end flag",
                    "runs past the end flag"))
         print(line(failed_wrong_route, "wrong end segment", "wrong end segments"))
@@ -1611,9 +1887,10 @@ def main():
 
         python tests/test_turning.py --only corner_right_entry right 120 6
 
-    With end_segment, the red end flag is set at its 50% point exactly like
-    in the full suite - without it the nav has no destination and therefore
-    no parking plan (no reverse-in).
+    With end_segment, the red end flag is set at that segment's first 20%
+    point as a VISUAL-ONLY marker (the running turn-test protocol, exactly
+    like the full suite) - without it the nav has no destination and
+    therefore no parking plan (no reverse-in).
     """
     # Ctrl-C handling: the SIGINT handler just sets a flag and tells the user
     # we're wrapping up; the suite loop then stops scheduling new tests, saves

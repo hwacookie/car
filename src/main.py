@@ -130,27 +130,48 @@ def main(smoke_test_frames: int = 0):
 
     def _spawn_position(start_point, progress=None):
         """World position/heading where a car spawned at `start_point` will
-        sit: right-kerb offset plus `progress` (0..1) along the start
+        sit: normal driving position (right-lane centre) plus the start
+        point's lateral offset plus `progress` (0..1) along the start
         segment from the named node. Shared by _create_car and the --start
         camera focus so both agree on exactly where the car will be."""
-        rx, ry, rh, seg_idx, fwd = network.get_start_point(start_point)
+        rx, ry, rh, seg_idx, fwd, lat_off = network.get_start_point(start_point)
+        node_x, node_y = rx, ry   # the named (degree-1) node itself
         _seg = network.segments[seg_idx]
         rad = math.radians(rh)
 
-        # Sit at the kerb. Shared with BicycleNav's pull-over / pull-out
-        # target via config.kerb_offset_m() so the two cannot drift apart.
-        # (The lateral offset is the same for every point on the car's
-        # centreline, so offsetting the rear axle offsets the whole flank.)
-        offset_m = kerb_offset_m(_seg.width)
+        # Sit in the NORMAL DRIVING POSITION (right-lane centre), not at
+        # the kerb: e2e scenarios start in traffic, not parked - a curb
+        # spawn cost every test a ~2 s pull-out before it could even
+        # accelerate (decision 2026-08-27: run the tests faster). The
+        # start point's lateral_offset_m shifts it toward the right kerb
+        # (+) / the left side of the road (-). The offset is returned so
+        # _create_car can hand it to the nav (the car must HOLD this line,
+        # not re-center onto the nominal lane).
+        offset_m = min(LANE_OFFSET_DEFAULT_M, kerb_offset_m(_seg.width)) + lat_off
         rx += math.cos(rad) * offset_m * PIXELS_PER_METER
         ry -= math.sin(rad) * offset_m * PIXELS_PER_METER
 
         # Advance a fraction of the way in, so short segments work too.
         progress0 = progress if progress is not None else SPAWN_PROGRESS
         advance_m = progress0 * _seg.length
-        rx += math.sin(rad) * advance_m * PIXELS_PER_METER
-        ry += math.cos(rad) * advance_m * PIXELS_PER_METER
-        return rx, ry, rh, seg_idx, fwd
+        # The chord above is only the segment's LOGICAL connection. Where
+        # the road actually runs - the corner-rounded centreline the
+        # pavement is built from - can diverge from it by tens of metres
+        # near sharp corners (a 166-deg hairpin with the 6 m curb radius
+        # starts curving ~49 m before the node), and a chord-based spawn
+        # there sits off the pavement. Place on the real path instead -
+        # walking it from the entry node, then offsetting into the lane;
+        # on straight segments the two agree exactly.
+        rounded = network.spawn_path_point(seg_idx, (node_x, node_y), advance_m)
+        if rounded is not None:
+            rx, ry, rh = rounded
+            rad = math.radians(rh)   # local tangent, not the chord heading
+            rx += math.cos(rad) * offset_m * PIXELS_PER_METER
+            ry -= math.sin(rad) * offset_m * PIXELS_PER_METER
+        else:
+            rx += math.sin(rad) * advance_m * PIXELS_PER_METER
+            ry += math.cos(rad) * advance_m * PIXELS_PER_METER
+        return rx, ry, rh, seg_idx, fwd, offset_m
 
     def _create_car(start_point=None, progress=None):
         """Create a fresh Car at a random road point or named start.
@@ -165,9 +186,11 @@ def main(smoke_test_frames: int = 0):
         geometry is ambiguous and the reference line is still curving.
         """
         if start_point:
-            rx, ry, rh, seg_idx, fwd = _spawn_position(start_point, progress)
+            rx, ry, rh, seg_idx, fwd, spawn_offset_m = \
+                _spawn_position(start_point, progress)
         else:
             rx, ry, rh, seg_idx, _ = network.random_road_point()
+            spawn_offset_m = None
 
         car = Car(rx, ry, rh, seg_idx, BicycleDriver())
         # progress runs start_node -> end_node, so a car travelling
@@ -176,6 +199,10 @@ def main(smoke_test_frames: int = 0):
             progress0 = progress if progress is not None else SPAWN_PROGRESS
             car.progress = progress0 if fwd else 1.0 - progress0
             car.forward = fwd
+            # The nav's nominal lane offset follows the SPAWN position, so
+            # the car holds its initial lateral line up to the flag and
+            # parks from it (docs §1 variant) instead of re-centering.
+            car.lane_offset_override_m = spawn_offset_m
         else:
             car.progress = 0.5
         if not start_point:
@@ -230,8 +257,8 @@ def main(smoke_test_frames: int = 0):
     
     # --- Lane guard (wrong-side detection, softer than validator) ---
     lane_guard = LaneGuard(enabled=True)
-    lenient = "--lenient" in sys.argv
-    print(f"Lane guard: ENABLED{' (lenient - wrong-side warns, does not stop)' if lenient else ''}")
+    print("Lane guard: ENABLED (wrong-side is a warning here - the e2e "
+          "suite turns it into a test failure)")
     
     # --- REST API (optional, enable with --api flag) ---
     api = None
@@ -245,8 +272,9 @@ def main(smoke_test_frames: int = 0):
         # Publish named start points (synthetic test maps only; empty for OSM data)
         api.update_state({
             'start_points': {
-                name: {'x': x, 'y': y, 'heading': h, 'segment': seg, 'forward': fwd}
-                for name, (x, y, h, seg, fwd) in network.start_points.items()
+                name: {'x': x, 'y': y, 'heading': h, 'segment': seg,
+                       'forward': fwd, 'lateral_offset_m': off}
+                for name, (x, y, h, seg, fwd, off) in network.start_points.items()
             }
         })
     elif not smoke_test_frames:
@@ -275,6 +303,10 @@ def main(smoke_test_frames: int = 0):
     obstacle_ui = ObstaclePalette(obstacle_mgr, network, camera, renderer)
 
     # --- Game loop ---
+    # Quit button (top-left, drawn topmost): an orderly way to end the game
+    # so a closed window is never mistaken for a crash by the e2e suite -
+    # every deliberate exit prints "orderly shutdown" to the log.
+    _quit_rect = pygame.Rect(10, 10, 64, 28)
     frame = 0
     running = True
     frozen = False
@@ -299,6 +331,7 @@ def main(smoke_test_frames: int = 0):
         # Events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                print("\n👋 Window closed - orderly shutdown (NOT a crash).")
                 running = False
             elif event.type == pygame.VIDEORESIZE:
                 # Resizable window: rebuild the surface and tell the camera
@@ -310,10 +343,14 @@ def main(smoke_test_frames: int = 0):
             elif event.type == pygame.MOUSEWHEEL:
                 camera.handle_zoom(event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                # Left mouse is shared: the obstacle palette gets first claim
-                # (slots, world obstacles); what it declines - empty map area -
-                # starts a camera pan drag.
-                if not obstacle_ui.handle_event(event):
+                # The Quit button gets first claim; then the obstacle palette
+                # (slots, world obstacles); what both decline - empty map area
+                # - starts a camera pan drag.
+                if event.button == 1 and _quit_rect.collidepoint(event.pos):
+                    print("\n👋 Quit button pressed - orderly shutdown "
+                          "(NOT a crash).")
+                    running = False
+                elif not obstacle_ui.handle_event(event):
                     camera.handle_mouse_down(event.button, event.pos)
             elif event.type == pygame.MOUSEBUTTONUP:
                 if not obstacle_ui.handle_event(event):
@@ -456,9 +493,14 @@ def main(smoke_test_frames: int = 0):
                 tp = commands['teleport']
                 start_point = tp.get('start_point') or None
                 car = _create_car(start_point, progress=tp.get('progress'))
+                # Optional rolling start (m/s): the running turn tests spawn
+                # already moving instead of accelerating from a standstill.
+                if tp.get('speed') is not None:
+                    car.speed = float(tp['speed'])
                 camera.snap_to(car.x, car.y, network.world_width, network.world_height)
                 print(f"\n🔄 New car at segment {car.seg_idx}, "
-                      f"heading {car.heading:.1f}°\n")
+                      f"heading {car.heading:.1f}°"
+                      f"{' (rolling start)' if tp.get('speed') is not None else ''}\n")
             
             # Toggle command
             if 'toggle' in commands:
@@ -510,6 +552,11 @@ def main(smoke_test_frames: int = 0):
                         seg_idx, prog = fl['red'][0], fl['red'][1]
                         renderer.flag_red = None
                         renderer.flag_red_pending = (seg_idx, prog)
+                        # red_nav (default True): the flag becomes the car's
+                        # navigation destination (park at it). Running turn
+                        # tests send red_nav=False - the flag is a visual
+                        # end-of-test marker only (docs/TESTING.md).
+                        renderer.flag_red_nav = bool(fl.get('red_nav', True))
 
             # Hazard lights (Warnblinkanlage): explicit on/off command.
             if 'hazard' in commands and car is not None \
@@ -608,20 +655,12 @@ def main(smoke_test_frames: int = 0):
                             getattr(car.bicycle_nav, 'uturn_active', False)
                 on_wrong_side = False
                 if not in_turn and not uturn_now:
+                    # Warning only - NEVER fatal here (no crash, no freeze):
+                    # the guard prints once per crossing and /state reports
+                    # 'wrong_side' + cumulative lane-guard stats; FAILING a
+                    # run is the e2e suite's job (docs/TESTING.md §3). In
+                    # FREE mode the same flag drives the red LED + label.
                     on_wrong_side = lane_guard.check(car, dt_fixed, network)
-                    free_mode = car.driver.get_name() == "FREE"
-                    if on_wrong_side and not lenient and not free_mode:
-                        # Fatal for the AUTOPILOT (BICYCLE) by default so
-                        # the test suite cannot silently pass a run that
-                        # broke rule 2. Pass --lenient to soften even that.
-                        # In FREE mode it is never fatal - this is human
-                        # exploration, and crossing into the oncoming lane
-                        # must warn (red LED + label), not kill the
-                        # process: a real driver can steer back.
-                        raise RuntimeError(
-                            f"WRONG-SIDE DRIVING! Car at ({car.x:.1f}, {car.y:.1f}), "
-                            f"heading {car.heading:.1f}°, segment {car.seg_idx}"
-                        )
                 # Off-road check (FREE mode only): stop the car + warning
                 free_off_road = False
                 if car.driver.get_name() == "FREE":
@@ -677,15 +716,22 @@ def main(smoke_test_frames: int = 0):
                 _pos = _flag_position_on_route(network, car.bicycle_nav,
                                                _fseg, _fprog)
                 if _pos:
-                    # The RED flag is the car's DESTINATION: truncate its
-                    # reference line at the centreline point so it parks AT
-                    # the flag (parking ramp + kerb drift + stop), not at
-                    # whatever dead end the route happens to reach beyond
-                    # it.
                     _fx, _fy, _fh = _pos
-                    print(f"[FLAGDBG] dest set seg={_fseg} prog={_fprog} "
-                          f"px=({_fx:.0f},{_fy:.0f})")
-                    car.bicycle_nav.set_destination(_fx, _fy)
+                    # The RED flag is the car's DESTINATION unless this is a
+                    # running turn test (flag_red_nav=False): then it is a
+                    # visual end-of-test marker only - the car drives THROUGH
+                    # it and the harness ends the test on the crossing.
+                    if renderer.flag_red_nav:
+                        # Truncate the reference line at the centreline
+                        # point so the car parks AT the flag (parking ramp +
+                        # kerb drift + stop), not at whatever dead end the
+                        # route happens to reach beyond it.
+                        print(f"[FLAGDBG] dest set seg={_fseg} prog={_fprog} "
+                              f"px=({_fx:.0f},{_fy:.0f})")
+                        car.bicycle_nav.set_destination(_fx, _fy)
+                    else:
+                        print(f"[FLAGDBG] visual-only flag seg={_fseg} "
+                              f"prog={_fprog} px=({_fx:.0f},{_fy:.0f})")
                     # The route point sits on the segment CENTRELINE; shift
                     # it onto the right kerb (the same offset the car uses)
                     # so _draw_flag's 3 m grass offset lands the pennant
@@ -746,6 +792,15 @@ def main(smoke_test_frames: int = 0):
         # minimap; must stay visible above the frozen overlay so layouts can
         # be edited while the simulation is paused).
         obstacle_ui.draw_panel(screen)
+
+        # Quit button (top-left, topmost layer): click for an orderly
+        # shutdown - see _quit_rect above.
+        pygame.draw.rect(screen, (178, 58, 58), _quit_rect, border_radius=6)
+        pygame.draw.rect(screen, (235, 235, 235), _quit_rect,
+                         width=1, border_radius=6)
+        _qt = renderer._hud_text("quit_btn", "Quit", 18, (255, 255, 255))
+        screen.blit(_qt, (_quit_rect.centerx - _qt.get_width() // 2,
+                          _quit_rect.centery - _qt.get_height() // 2))
 
         # HUD: wrong-side warning LED (blinks red when on opposing lane).
         # In FREE mode this is the ONLY consequence - the process survives.
