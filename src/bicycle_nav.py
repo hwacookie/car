@@ -1466,6 +1466,11 @@ class BicycleNav:
         )
         max_offset = config.kerb_offset_m(min_width)
         base_offset = self._lane_base_offset(max_offset)
+        # Normal driving settles each station at its OWN road's nominal
+        # lane position, eased across road changes (raceline.auto_base).
+        # A spawn lateral override pins the scalar line instead - the
+        # parking scenarios must hold their initial line exactly.
+        auto_base = getattr(self.car, 'lane_offset_override_m', None) is None
         # The driving line is the FASTEST LEGAL line, not a fixed lane
         # offset: minimum curvature inside the corridor bounded by the
         # pavement (never off-road) and the centreline (never on the
@@ -1481,7 +1486,8 @@ class BicycleNav:
         # "entry speed" and stretched the change to the 90 m cap.
         P, N, offsets, cum = raceline.solve_line(
             self.network, rounded, self._route_segments(),
-            base_offset=base_offset)
+            base_offset=None if auto_base else base_offset,
+            auto_base=auto_base)
         lane = self._apply_end_blends(P, N, offsets, cum,
                                       edge_offset=max_offset,
                                       pulling_over=pulling_over,
@@ -1507,7 +1513,8 @@ class BicycleNav:
         if merge is not None:
             P, N, offsets, cum = raceline.solve_line(
                 self.network, rounded, self._route_segments(),
-                base_offset=base_offset, **self._merge_kwargs(merge))
+                base_offset=None if auto_base else base_offset,
+                auto_base=auto_base, **self._merge_kwargs(merge))
             lane = self._apply_end_blends(P, N, offsets, cum,
                                           edge_offset=max_offset,
                                           pulling_over=pulling_over,
@@ -1568,9 +1575,11 @@ class BicycleNav:
         )
         max_offset = config.kerb_offset_m(min_width)
         merge = self._merge_params(rounded, max_offset)
+        auto_base = getattr(self.car, 'lane_offset_override_m', None) is None
         P, N, offsets, cum = raceline.solve_line(
             self.network, rounded, self._route_segments(),
-            base_offset=self._lane_base_offset(max_offset),
+            base_offset=None if auto_base else self._lane_base_offset(max_offset),
+            auto_base=auto_base,
             **self._merge_kwargs(merge))
         lane = self._apply_end_blends(P, N, offsets, cum,
                                       edge_offset=config.kerb_offset_m(min_width),

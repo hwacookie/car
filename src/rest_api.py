@@ -53,6 +53,23 @@ class GameAPI:
             """Get current game state."""
             with self.lock:
                 return jsonify(self.game_state)
+
+        @self.app.route('/segment/<int:idx>', methods=['GET'])
+        def segment_geometry(idx):
+            """Geometry of one road segment (pixels, 0-based index).
+
+            Used by the e2e suite to place the red end flag on the NODE
+            SIDE of the exit arm - where the car actually enters it.
+            """
+            net = self.obstacle_network
+            if net is None or not (0 <= idx < len(net.segments)):
+                return jsonify({'error': 'unknown segment'}), 404
+            s = net.segments[idx]
+            return jsonify({
+                'idx': idx,
+                'x1': s.x1, 'y1': s.y1, 'x2': s.x2, 'y2': s.y2,
+                'length': s.length, 'width': s.width, 'oneway': s.oneway,
+            })
         
         @self.app.route('/control', methods=['POST'])
         def control():

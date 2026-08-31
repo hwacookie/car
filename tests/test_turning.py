@@ -75,6 +75,12 @@ PARK_AVENUE_WIDTH_M = 19.4
 # into the oncoming lane (lane guard).
 TURN_SPAWN_PROGRESS = 0.8
 END_FLAG_PROGRESS = 0.2
+# Radius within which the car's centre must pass the red end flag for the
+# scenario to count as "reached the flag". Must cover one polling step at
+# max test speed (50 km/h @ ~20 Hz ≈ 0.7 m) plus the largest lane offset
+# on a running-test road (kerb_offset of a 7 m road = 2.25 m), while
+# staying far below any real miss distance.
+FLAG_REACH_RADIUS_M = 3.0
 RUNNING_START_KMH = 50.0
 
 
@@ -512,6 +518,16 @@ class TurnTester:
         """Get current game state."""
         response = requests.get(f"{API_URL}/state")
         return response.json()
+    
+    def get_segment_geometry(self, idx: int) -> dict | None:
+        """One road segment's geometry from the game (pixels, 0-based)."""
+        try:
+            r = requests.get(f"{API_URL}/segment/{idx}", timeout=2)
+            if r.ok:
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
     
     def send_control(self, **kwargs):
         """Send control inputs."""
@@ -982,9 +998,35 @@ class TurnTester:
                 # the end segment (suite standard: FIRST 20%) - crossing
                 # it ends the test, no parking.
                 red_flag = None
+                flag_point = None   # world px of the red flag (reach check)
                 if expected_end_segment is not None:
-                    red_flag = [expected_end_segment,
-                                0.5 if kerb_check else end_flag_progress]
+                    prog_flag = 0.5 if kerb_check else end_flag_progress
+                    seg = self.get_segment_geometry(expected_end_segment)
+                    if seg is not None:
+                        # Running tests: measure the flag from the NODE SIDE
+                        # of the exit arm - where the car actually enters
+                        # it. Some arms are parameterised the other way
+                        # round (crossroads seg 17: a right-turning car
+                        # enters at its 100% end), and a raw-parameterisation
+                        # flag then sits where the car drives AWAY from -
+                        # the old 'prog >= threshold' latch fired on entry,
+                        # ending the test before the maneuver was even done
+                        # (tests 8 + 16: "passed" without reaching the flag).
+                        # Parking tests keep their explicit 50% destination.
+                        if not kerb_check:
+                            d0 = ((seg['x1'] - state['x']) ** 2
+                                  + (seg['y1'] - state['y']) ** 2)
+                            d1 = ((seg['x2'] - state['x']) ** 2
+                                  + (seg['y2'] - state['y']) ** 2)
+                            if d1 < d0:   # car enters at the far end
+                                prog_flag = 1.0 - prog_flag
+                        flag_point = (seg['x1'] + prog_flag * (seg['x2'] - seg['x1']),
+                                      seg['y1'] + prog_flag * (seg['y2'] - seg['y1']))
+                    else:
+                        print("   ⚠️  Could not resolve the end segment's "
+                              "geometry - the flag-reach check is disabled, "
+                              "this scenario will time out")
+                    red_flag = [expected_end_segment, prog_flag]
                 requests.post(f"{API_URL}/flags", json={
                     'green': [state['x'], state['y'], state['heading']],
                     'red': red_flag,
@@ -1272,6 +1314,39 @@ class TurnTester:
                 
                 break
             
+            # RUNNING TURN TEST arrival (docs/TESTING.md): the scenario is
+            # done when the car physically drives THROUGH the red end flag.
+            # Geometric, not 'prog >= threshold' - the old latch fired on
+            # the first poll for arms the car enters "from behind" (reverse-
+            # parameterised exits: crossroads right turn, hairpin exit),
+            # ending the test before the maneuver was even finished and
+            # never actually reaching the flag. Checked BEFORE the segment-
+            # change gate on purpose: near a node the reported segment can
+            # still be the approach arm while the car already passes the
+            # flag point (hairpin: its projection onto the exit arm is
+            # closer than the diagonal it really drives).
+            if not kerb_check and flag_point is not None:
+                fdx = state['x'] - flag_point[0]
+                fdy = state['y'] - flag_point[1]
+                if (fdx * fdx + fdy * fdy) ** 0.5 <= FLAG_REACH_RADIUS_M * 2.0:
+                    reached_expected_segment = True
+                    prog_pct = (state.get('progress') or 0.0) * 100
+                    print(f"\n   ✅ Crossed the end flag at {prog_pct:.0f}% "
+                          f"of segment {state['segment']} "
+                          f"(target: {end_flag_progress * 100:.0f}%, node side)")
+                    print(f"      Time: {time.time() - start_time:.2f}s")
+                    print(f"      Max heading change per frame: {max_heading_change_per_frame:.1f}°")
+                    final_pos = (state['x'], state['y'])
+                    stopped_ok = True   # running test: no stop required
+                    print(f"      Start: ({initial_pos[0]:.0f}, {initial_pos[1]:.0f}) seg {initial_segment} "
+                          f"→ End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}")
+                    print(f"      Distance traveled: {((final_pos[0] - initial_pos[0])**2 + (final_pos[1] - initial_pos[1])**2)**0.5:.0f} pixels")
+                    try:
+                        self.reset_controls()   # release the throttle latch
+                    except requests.exceptions.RequestException:
+                        pass
+                    break
+            
             # Check if segment changed. If we have a SPECIFIC expected
             # end segment, only that counts as arrival - a mere change to
             # some OTHER segment (e.g. a wrong turn) is noted but keeps
@@ -1302,28 +1377,13 @@ class TurnTester:
                     prog = state.get('progress')
                     entry = end_entry_progress
                     if not kerb_check:
-                        # RUNNING TURN TEST (docs/TESTING.md): the test ends
-                        # the moment the car reaches the end flag - the
-                        # FIRST 20% of the expected end segment. No stop,
-                        # no parking: "did the turn correctly" = stayed on
-                        # the road + lane guard (no oncoming-lane driving).
-                        if prog is not None and prog >= end_flag_progress:
-                            reached_expected_segment = True
-                            print(f"\n   ✅ Crossed the end flag at {prog * 100:.0f}% "
-                                  f"of segment {state['segment']} "
-                                  f"(target: {end_flag_progress * 100:.0f}%)")
-                            print(f"      Time: {time.time() - start_time:.2f}s")
-                            print(f"      Max heading change per frame: {max_heading_change_per_frame:.1f}°")
-                            final_pos = (state['x'], state['y'])
-                            stopped_ok = True   # running test: no stop required
-                            print(f"      Start: ({initial_pos[0]:.0f}, {initial_pos[1]:.0f}) seg {initial_segment} "
-                                  f"→ End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}")
-                            print(f"      Distance traveled: {((final_pos[0] - initial_pos[0])**2 + (final_pos[1] - initial_pos[1])**2)**0.5:.0f} pixels")
-                            try:
-                                self.reset_controls()   # release the throttle latch
-                            except requests.exceptions.RequestException:
-                                pass
-                            break
+                        # RUNNING TURN TEST (docs/TESTING.md): arrival is
+                        # handled by the geometric flag check above - the
+                        # car drives THROUGH the red flag and keeps going,
+                        # no stop, no parking. This guard exists so the
+                        # STOP-AT-FLAG logic below only applies to parking
+                        # (kerb_check) scenarios.
+                        pass
                     crossed_now = (prog is not None and entry is not None and (
                         (entry < 0.5 and prog >= 0.5)
                         or (entry > 0.5 and prog <= 0.5)))
@@ -1828,6 +1888,13 @@ class TurnTester:
                  or r.get('final_segment') == r.get('expected_end_segment'))
             and not r.get('expect_wrong_side')
         )
+        # Hard criterion: a scenario that never reaches its red target flag
+        # is a failure, whatever else may have happened on the way (this
+        # overlaps with the categories above - it is the union of all
+        # "never arrived" cases, not an extra one).
+        failed_no_flag = sum(1 for r in runnable
+                             if not r['reached_expected_segment']
+                             and not r.get('expect_wrong_side'))
         
         def line(count, fail_label, pass_label):
             if count > 0:
@@ -1846,6 +1913,8 @@ class TurnTester:
                    "runs past the end flag"))
         print(line(failed_wrong_route, "wrong end segment", "wrong end segments"))
         print(line(timeout, "timeout (never arrived)", "timeouts"))
+        print(line(failed_no_flag, "never reached the end flag",
+                   "missed end flags"))
         
         # Show detailed violations
         snap_violations = [r for r in self.test_results if r['instant_snap_detected']]

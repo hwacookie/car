@@ -223,9 +223,24 @@ Linksabbieger fahren Fahrerseite an Fahrerseite aneinander vorbei, jeder
 biegt vor der Mitte ab, und der Punkt liegt damit **rechts**.
 
 Das ist keine Feinheit: zwingt man Linksabbieger, den Punkt links zu lassen,
-ist die einzige verbleibende Linie enger als der Wendekreis des Autos
+ist die einzige verbleibende Linie enger als den Wendekreis des Autos
 (gemessen 1,5 m gegen 3,46 m Minimum) – die Beschränkung war schlicht falsch
 für dieses Manöver.
+
+Auf **Einbahnstraßen** gilt die Regel gar nicht: Es gibt keine Gegenfahrbahn,
+die geschützt werden müsste, und der Punkt wird von selbst frei (Geradeaus
+und Rechtsabbieger passieren ihn links; Linksabbieger sind ohnehin
+ausgeschlossen). Auf Einbahn-Abschnitten angewandt hätte sie die Linie bis zu
+0,9 m kerbseitig gedrückt – gemessen an einer 3,5 m × 3,5 m Einbahn-
+Kreuzung: statt gerade durchzufahren musste das Auto bei Einfahrtspeed einen
+S-Bogen steuern (Test #10).
+
+Zusätzlich **eased** die Grenze über `LANE_EASE_M / 2 = 12 m` auf beiden
+Seiten des Knotens, damit ein Geradeaus-Spurwechsel die Mittellinienzone
+direkt an der Kreuzung überqueren kann (siehe §7): vor dem Knoten blendet sie
+auf die Nominalposition der Ausfallstraße hinab, hinter dem Knoten rampiert
+sie von 0 hoch. Auf konstant-breiten Routen bleibt die eased Grenze unter
+der Nominallinie – dort ändert sich nichts.
 
 ### Erreichbarkeit
 
@@ -370,3 +385,56 @@ des Hindernisses um `RECOVERY_MARGIN_M` passiert hat, greift die
   Überquerung zum Ausweichen — nur Option 1 oder 3.
 - **Parken / Wenden am Ziel:** explizite Kommandos haben Vorrang; liegt das
   Ziel hinter einem Hindernis, gilt Option 3 (halten) statt drüberzufahren.
+
+---
+
+## 7. Spurwechsel bei Straßenwechsel (Einbahn ↔ Zweirichtung)
+
+**Auslöser:** Die Route kreuzt eine Kreuzung, an der sich Straßentyp oder
+Breite ändert (z. B. 3,5 m Einbahnstraße läuft in 7 m Zweirichtungsstraße).
+Die nominale Spurposition springt mit: Auf der 3,5 m Einbahn sitzt das Auto
+0,5 m von der Mittellinie (so weit rechts wie es geht), auf der 7 m Straße
+in der rechten Spur bei 1,75 m.
+
+| Phase | Beschreibung |
+|-------|-------------|
+| **Anfahrt** | Referenzlinie in der Nominalposition der eigenen Straße – pro Station (`lane_base_offset_m`, gekappt am Bordstein-Offset), nicht ein globaler Offset für die ganze Route. Ein globaler Wert wurde auf den schmalsten Segment gekappt und zwang dann den Sprung an der Kreuzung. |
+| **Übergang** | Eine **gerade Diagonale** von der Anfahrtsposition zur Ausfallposition durch die Kreuzung – keine S-Kurve am Knotenpunkt. Der Fahrer wechselt die Spur in einem geraden Strich, nicht mit S-Bögen. |
+| **Ausfall** | Referenzlinie in der Nominalposition der Ausfallstraße; ab da normales Geradeausfahren. |
+
+### Warum gerade Diagonale – und warum nur ~14 m
+
+Der Übergang lässt sich nicht so weit verteilen, wie man möchte: Auf der
+schmalen Anfahrtsstraße ist schlicht kein Platz, weiter rechts zu sitzen –
+die hi-Grenze kommt aus dem erodierten Pflaster-Polygon und öffnet sich erst
+innerhalb des Kreuzungsquadrats. Der laterale Sprung muss also dort
+passieren, wo beide Positionen befahrbar sind: an der Kreuzung. Die
+Diagonale spannt `LANE_EASE_M = 24 m` um den Knoten, wird aber so gelegt,
+dass das Clamping nirgends einen sichtbaren Knick zurücklässt:
+
+- **Steigend** (schmale Einbahn → breite Zweirichtung): Die Diagonale
+  startet an der letzten Station, wo die hi-Grenze noch unter der
+  Zielposition liegt – also genau da, wo Pflaster erstmals Raum lässt –
+  und läuft gerade auf die Ausfall-Nominal zu.
+- **Fallend** (breite Zweirichtung → schmale Einbahn): Die Diagonale
+  erreicht die Bordstein-Kappe der Ausfallstraße **genau am Knotenpunkt**,
+  damit dort springen darf, was springen muss, ohne sichtbaren Knick.
+
+### Easing der Mittellinien-Grenze
+
+Die „Punkt links lassen“-Grenze (§4) würde andernfalls genau am Knoten einen
+Sprung erzwingen: Auf der Zweirichtungsseite gilt sie ab der ersten Station
+in voller Stärke, die Diagonale ist aber erst ein paar Meter später dort.
+Die Grenze eased daher über `LANE_EASE_M / 2 = 12 m` auf beiden Seiten des
+Knotens (siehe §4). **Sicherheitsanmerkung:** In den ersten ~12 m nach der
+Kreuzung darf das Auto zeitweise näher an der Mittellinie sitzen als der
+volle 0,5 m Rand – es wechselt nie auf die andere Seite (die Diagonale
+bleibt durchgehend auf der eigenen). Das entspricht dem realen
+Einschleichverhalten an Kreuzungen.
+
+### Parameter
+
+- `LANE_EASE_M = 24.0` – Spannweite der diagonalen Übergangs (m)
+- `JUNCTION_EXTRA_ROOM_M = 1.5` – zusätzlicher hi-Raum in der
+  Kreuzungszone
+- `kerb_offset_m` / `lane_base_offset_m` wie gewohnt für die Nominalpositionen

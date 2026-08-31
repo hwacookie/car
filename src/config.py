@@ -108,6 +108,13 @@ PARK_KERB_CLEARANCE_M = 0.16   # empirically closest clean park (scripts/sweep_p
 # one. The painted P marks and the parking-lane boundary line stop this
 # far short of any junction (user decision: at least 5 m, visually).
 PARK_LANE_END_GAP_M = 5.0
+# Painted lane markings (dashed centerlines / lane dividers) stop BEFORE
+# the crossing itself: at a junction, the paint ends half the WIDEST arm's
+# width plus this margin before the node centre - just short of where the
+# Eckausrundung corner point C lies along the arm's axis. Without this the
+# dashes cut straight across the fillet corners (user decision: no paint
+# on the crossing itself).
+CENTERLINE_JUNCTION_GAP_M = 0.5
 
 # How far into a segment a car spawns, as a FRACTION of the segment
 # length. Never 0: a node sits in the middle of the junction rounding,
@@ -212,10 +219,10 @@ ROAD_COLOR = (120, 120, 124)
 # Kleinmachnow has no motorway/trunk/primary at all, its normal streets are
 # 'secondary'/'residential', all 7 m wide like the test map.)
 CENTERLINE_MIN_WIDTH_M = 7.0
-# Junction dots (white circle at 3+-way nodes) scale with zoom: world-space
-# radius, capped so they stay dots instead of giant circles when zoomed in.
-JUNCTION_DOT_RADIUS_M = 2.0
-JUNCTION_DOT_MAX_PX = 12
+# Junction dot (white circle at 3+-way nodes): physical size 30 cm in
+# diameter, rendered in world space so it scales with zoom (1 px floor so
+# it stays visible at low zoom - user decision).
+JUNCTION_DOT_RADIUS_M = 0.15
 MINIMAP_BG = (20, 60, 20)
 MINIMAP_CAR_COLOR = (255, 0, 0)
 MINIMAP_BORDER = (80, 80, 80)

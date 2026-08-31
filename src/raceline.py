@@ -359,6 +359,7 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
         return fallback if v is None else v
 
     lo, hi = [], []
+    node_idx_cache: dict = {}
     for i in range(n):
         a = knots[max(0, min(len(knots) - 2, (i // stride)))]
         b = knots[min(len(knots) - 1, knots.index(a) + 1)]
@@ -371,8 +372,9 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
         # and the optimiser happily routes the line through it - which is
         # both illegal and, being a huge lateral excursion, far tighter
         # than the car can steer.
-        oneway_i, width_i = station_props[i]
+        oneway_i, width_i, _lanes_i, _park_i = station_props[i]
         lane_cap = config.kerb_offset_m(width_i)
+        f_near = 1.0   # centreline-bound ease factor near a junction node
         # Inside a junction the carriageway cap does not apply: the paved
         # area is the whole intersection, and a left-turner NEEDS that
         # outside room to get around the centre dot rather than cutting
@@ -391,10 +393,6 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
         right = min(probed(a, 0, lane_cap), probed(b, 0, lane_cap), lane_cap)
         left = min(probed(a, 1, lane_cap), probed(b, 1, lane_cap), lane_cap)
         h = right
-        # One-way roads have no oncoming lane, so the centreline bound does
-        # not apply; everywhere else it does.
-        l = -left if oneway_i else centre_limit
-
         # Keep the junction centre on our LEFT. The node's lateral position
         # relative to this station is t (positive = node lies to the
         # right); the car sits at lateral o, so the node is on our left
@@ -410,11 +408,43 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
         # measured on the 3.5 m oneway x oneway crossing (test #10): base
         # offset 0.5 m -> forced 1.4 m, an S-bend the car had to steer
         # through at junction-entry speed instead of driving straight.
-        if junction_nodes is not None and junction_nodes[i] is not None \
-                and not oneway_i:
+        #
+        # The bound EASES over LANE_EASE_M/2 on both sides of the node:
+        # a straight-through lane change (narrow one-way <-> wide two-way)
+        # has to cross the centreline region right at the crossing - the
+        # pavement only allows the shift inside the intersection square -
+        # so a full-strength bound stepping in exactly at the node would
+        # force a visible kink there. Before the node it eases down to the
+        # far side's nominal position (the diagonal's arrival value), after
+        # it ramps up from 0; on constant-width routes the eased bound
+        # stays below the nominal line, so nothing changes there.
+        at_junc_two_way = junction_nodes is not None \
+            and junction_nodes[i] is not None and not oneway_i
+        t_junc = 0.0
+        if at_junc_two_way:
             qx, qy = junction_nodes[i]
-            t = ((qx - P[i][0]) * nx + (qy - P[i][1]) * ny) / PPPM
-            l = max(l, t + config.CAR_WIDTH / 2.0 + config.LANE_CENTRE_MARGIN_M)
+            t_junc = ((qx - P[i][0]) * nx + (qy - P[i][1]) * ny) / PPPM
+            kq = node_idx_cache.get((qx, qy))
+            if kq is None:
+                kq = _node_route_index((qx, qy), P)
+                node_idx_cache[(qx, qy)] = kq
+            d_after = (i - kq) * SAMPLE_M
+            ease = LANE_EASE_M / 2.0
+            if -ease <= d_after < 0:
+                # approach side: blend full -> far side's nominal position
+                ow_f, w_f, l_f, p_f = station_props[min(n - 1, kq + 1)]
+                floor = min(config.lane_base_offset_m(w_f, l_f, p_f, ow_f),
+                            config.kerb_offset_m(w_f), centre_limit)
+                f_near = 1.0 - (1.0 - floor / centre_limit) \
+                    * (1.0 + d_after / ease)
+            elif 0 <= d_after < ease:
+                # exit side: ramp up from 0
+                f_near = d_after / ease
+        # One-way roads have no oncoming lane, so the centreline bound does
+        # not apply; everywhere else it does, scaled by f_near near a node.
+        l = -left if oneway_i else centre_limit * f_near
+        if at_junc_two_way:
+            l = max(l, t_junc + centre_limit * f_near)
         if l > h:                             # degenerate / very narrow
             l = h = max(0.0, min(l, h))
         lo.append(l)
@@ -422,8 +452,74 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
     return lo, hi
 
 
+# Distance over which the nominal lane position transitions across a road
+# change (e.g. one-way -> two-way at a junction). The transition is a
+# STRAIGHT diagonal, not an S-curve: the pavement only allows the lateral
+# shift inside/around the intersection square, so the line simply goes
+# from the approach lane to the exit lane in one straight stroke.
+LANE_EASE_M = 24.0
+
+
+def _node_route_index(q, P):
+    """Station index nearest to junction node q along the route."""
+    qx, qy = q
+    return min(range(len(P)),
+               key=lambda k: (P[k][0] - qx) ** 2 + (P[k][1] - qy) ** 2)
+
+
+def _auto_base_profile(props, S, lo=None, hi=None):
+    """Per-station nominal lane offset: each station's own road's normal
+    position (lane_base_offset_m clamped to its kerb offset), with a
+    STRAIGHT diagonal across every point where the nominal changes - a
+    human changes lanes on a straight line through the crossing, not in
+    an S-curve at the node. On constant-width routes this is just a
+    constant (= the old global base_offset), so behaviour there is
+    unchanged.
+
+    The diagonal is placed so clamping never leaves a step: when the
+    approach position W sits below the far side's lower bound (the
+    centreline protection), it starts where the pavement first allows
+    rising and runs straight on to the exit nominal; when W sits above
+    the far side's cap, it reaches that cap exactly at the node, where
+    the bound may then step without a visible kink."""
+    n = len(S)
+    raw = [min(config.lane_base_offset_m(w, l, p, ow), config.kerb_offset_m(w))
+           for ow, w, l, p in props]
+    out = raw[:]
+    half = LANE_EASE_M / 2.0
+    for i in range(1, n):
+        if abs(raw[i] - raw[i - 1]) < 1e-9:
+            continue
+        s0, s1 = S[i] - half, S[i] + half
+        W, E = raw[i - 1], raw[i]
+        far_lo = max((lo[j] for j in range(n) if S[i] <= S[j] < s1),
+                     default=-1e9) if lo is not None else -1e9
+        far_hi = min((hi[j] for j in range(n) if S[i] <= S[j] < s1),
+                     default=1e9) if hi is not None else 1e9
+        sa, sb, v_end = s0, s1, E
+        if W < far_lo:                  # must rise across the crossing...
+            for j in range(i - 1, -1, -1):
+                if S[j] < s0:
+                    break
+                if hi is not None and hi[j] < far_lo - 1e-9:
+                    sa = S[j]           # ...starting where room first exists
+                    break
+        elif W > far_hi:                # must descend to the far cap...
+            # Tolerance: hi comes from the eroded-pavement probe, which
+            # reports a few cm INSIDE the nominal kerb cap that E is
+            # clamped to - compare with slack, not equality.
+            if E <= far_hi + 0.25:
+                sb = S[i]               # ...reached exactly at the node
+        for j in range(n):
+            if sa <= S[j] < sb:
+                t = (S[j] - sa) / max(1e-9, sb - sa)
+                out[j] = W + (v_end - W) * t
+    return out
+
+
 def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
                base_offset: float | None = None,
+               auto_base: bool = False,
                merge_from_m: float | None = None,
                merge_s0: float = 0.0, merge_s1: float = 0.0):
     """The fastest legal line for a route, as a dense uniform polyline.
@@ -432,6 +528,12 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
     sections (see min_curvature_offsets); default is the normal right-lane
     centre. The nav passes the car's spawn lateral position here so the
     car holds its initial line instead of re-centering (docs §1 variant).
+
+    `auto_base`: per-station nominal instead - each station settles at
+    its own road's normal position, eased over LANE_EASE_M across road
+    changes (see _auto_base_profile). Used for normal driving so that a
+    one-way -> two-way crossing shifts lanes gradually instead of in a
+    step at the node.
 
     Merge-right blend (docs §1 variant on multi-lane roads): with
     `merge_from_m` given, stations before `merge_s0` settle at
@@ -451,14 +553,23 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
     uniform stations keep every vertex-to-vertex bend small.
     """
     P, S, total = _resample(rounded, ds)
-    base = (base_offset if base_offset is not None else
-            min(config.LANE_OFFSET_DEFAULT_M,
-                config.kerb_offset_m(_min_width(network, route_seg_idx))))
-    if merge_from_m is not None and abs(merge_from_m - base) > 1e-6 \
+    props = _station_segments(network, route_seg_idx, P)
+    N, K = _normals_and_curvature(P, ds)
+    junction = _junction_node_per_station(network, P)
+    lo, hi = legal_corridor(network, P, N, props, junction)
+    if auto_base:
+        base = _auto_base_profile(props, S, lo=lo, hi=hi)
+    elif base_offset is not None:
+        base = base_offset
+    else:
+        base = min(config.LANE_OFFSET_DEFAULT_M,
+                   config.kerb_offset_m(_min_width(network, route_seg_idx)))
+    settled = base if isinstance(base, float) else base[-1]
+    if merge_from_m is not None and abs(merge_from_m - settled) > 1e-6 \
             and merge_s1 > merge_s0:
         m0, m1 = merge_s0, merge_s1
         span = max(1e-6, m1 - m0)
-        o_end = base          # the settled scalar (resolved above)
+        o_end = settled       # the settled value at the line's end
         prof: list[float] = []
         for s_ in S:
             if s_ <= m0:
@@ -471,13 +582,8 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
                 prof.append(merge_from_m + (o_end - merge_from_m) * t)
         base = prof
     if total < 4.0 or len(P) < 5:
-        N, _ = _normals_and_curvature(P, ds)
-        return P, N, [base] * len(P), S
-
-    N, K = _normals_and_curvature(P, ds)
-    props = _station_segments(network, route_seg_idx, P)
-    junction = _junction_node_per_station(network, P)
-    lo, hi = legal_corridor(network, P, N, props, junction)
+        return P, N, (list(base) if isinstance(base, (list, tuple))
+                      else [base] * len(P)), S
     # A straight route needs no curvature solving: a constant offset has
     # ZERO curvature, which is already the optimum. Running the solver
     # there would SMOOTH a per-station base profile - it minimises the
@@ -507,7 +613,8 @@ def _min_width(network, route_seg_idx):
 
 
 def _station_segments(network, route_seg_idx, P):
-    """Nearest route segment for each station -> (oneway, width) pairs."""
+    """Nearest route segment for each station ->
+    (oneway, width, lanes, parking_lane_width) tuples."""
     segs = [network.segments[i] for i in route_seg_idx] or list(network.segments)
     out = []
     for px, py in P:
@@ -521,5 +628,6 @@ def _station_segments(network, route_seg_idx, P):
             d = math.hypot(px - (sg.x1 + t * dx), py - (sg.y1 + t * dy))
             if d < bd:
                 bd, best = d, sg
-        out.append((bool(best.oneway), best.width) if best else (False, 7.0))
+        out.append((bool(best.oneway), best.width, best.lanes,
+                    best.parking_lane_width) if best else (False, 7.0, 0, 0.0))
     return out

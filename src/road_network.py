@@ -467,12 +467,19 @@ class RoadNetwork:
         unfiltered set."""
         if getattr(self, "_marking_centerlines_cache", None) is None:
             groups = _merge_and_round_lines(self, only_two_way=True,
-                                            skip_multi_lane=True)
-            self._marking_centerlines_cache = [
-                coords for (_hw, w), lines in groups.items()
-                if w >= config.CENTERLINE_MIN_WIDTH_M
-                for coords in lines
-            ]
+                                            skip_multi_lane=True,
+                                            stop_at_junctions=True)
+            out = []
+            for coords in (coords for (_hw, w), lines in groups.items()
+                           if w >= config.CENTERLINE_MIN_WIDTH_M
+                           for coords in lines):
+                # No paint on the crossing itself: stop the dashes just
+                # short of the fillet corner at 3+-way junctions.
+                t0, t1 = _junction_marking_trim_px(self, coords)
+                trimmed = _trim_ends(list(coords), t0, t1)
+                if trimmed:
+                    out.append(trimmed)
+            self._marking_centerlines_cache = out
         return self._marking_centerlines_cache
 
     def get_lane_markings(self):
@@ -577,8 +584,55 @@ def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: fl
     return d
 
 
+def _chain_segments(segs: list, network: "RoadNetwork") -> list:
+    """Chain segments into maximal polylines, continuing through a node
+    ONLY if it is a plain degree-2 bend. Shapely's linemerge would also
+    fuse arms that meet at a real junction (same group, shared endpoint),
+    producing lines that run straight across the crossing - fine for the
+    pavement union, wrong for painted markings, which must stop before
+    the intersection (user decision)."""
+    by_node: dict = {}
+    for i, s in enumerate(segs):
+        by_node.setdefault(s.start_node, []).append(i)
+        by_node.setdefault(s.end_node, []).append(i)
+    used = [False] * len(segs)
+    chains: list[list] = []
+
+    def extend(pts: list, from_node: str, prepend: bool):
+        cur, last = from_node, pts[0] if prepend else pts[-1]
+        new_pts = []
+        while network.node_degree.get(cur, 0) == 2:
+            cands = [j for j in by_node.get(cur, []) if not used[j]]
+            if not cands:
+                break
+            t = segs[cands[0]]
+            used[cands[0]] = True
+            if (t.x1, t.y1) == last:
+                nxt_pt, cur = (t.x2, t.y2), t.end_node
+            else:
+                nxt_pt, cur = (t.x1, t.y1), t.start_node
+            new_pts.append(nxt_pt)
+            last = nxt_pt
+        if prepend:
+            pts[:0] = list(reversed(new_pts))
+        else:
+            pts.extend(new_pts)
+
+    for i0 in range(len(segs)):
+        if used[i0]:
+            continue
+        s = segs[i0]
+        used[i0] = True
+        pts = [(s.x1, s.y1), (s.x2, s.y2)]
+        extend(pts, s.end_node, prepend=False)
+        extend(pts, s.start_node, prepend=True)
+        chains.append(pts)
+    return chains
+
+
 def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False,
-                           skip_multi_lane: bool = False):
+                           skip_multi_lane: bool = False,
+                           stop_at_junctions: bool = False):
     """Group segments by (highway, width), merge contiguous ones through
     plain degree-2 nodes, and round each merged line's own corners (see
     _round_polyline_corners). Shared by both _build_road_polygons
@@ -590,6 +644,10 @@ def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False,
     street has no opposing lane to divide, so it gets no center dashed
     line (used by _build_centerlines; _build_road_polygons still wants
     the pavement itself regardless of oneway).
+
+    stop_at_junctions: chain manually instead of Shapely's linemerge and
+    never continue through a degree-3+ node - for painted markings, which
+    must end at the crossing instead of running across it.
 
     Returns {(highway, width): [smoothed_coords, ...]}.
     """
@@ -614,12 +672,15 @@ def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False,
 
     result: dict[tuple[str, float], list] = {}
     for key, segs in groups.items():
-        lines = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in segs]
-        merged = linemerge(lines) if len(lines) > 1 else lines[0]
-        merged_lines = merged.geoms if hasattr(merged, "geoms") else [merged]
+        if stop_at_junctions:
+            raw = _chain_segments(segs, network)
+        else:
+            lines = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in segs]
+            merged = linemerge(lines) if len(lines) > 1 else lines[0]
+            merged_lines = merged.geoms if hasattr(merged, "geoms") else [merged]
+            raw = [list(line.coords) for line in merged_lines]
         result[key] = [
-            _round_polyline_corners(list(line.coords), corner_radius_px)
-            for line in merged_lines
+            _round_polyline_corners(coords, corner_radius_px) for coords in raw
         ]
     return result
 
@@ -655,6 +716,29 @@ def _junction_trim_m(network: "RoadNetwork", coords: list) -> tuple[float, float
         return 0.0
 
     return trim_at(*coords[0]), trim_at(*coords[-1])
+
+
+def _junction_marking_trim_px(network: "RoadNetwork", coords: list) -> tuple[float, float]:
+    """(start_trim, end_trim) in pixels for PAINTED lane markings (dashed
+    centerlines / lane dividers): where a line's end sits at a real
+    junction (node degree >= 3), the paint stops half the WIDEST arm's
+    width plus CENTERLINE_JUNCTION_GAP_M before the node centre - just
+    short of the Eckausrundung corner point C on this arm's axis, so the
+    dashes end where the rounded corner begins instead of cutting straight
+    across the crossing (user decision). 0 at ends without a junction."""
+    pppm = config.PIXELS_PER_METER
+
+    def gap_at(px: float, py: float) -> float:
+        for nid, nxy in network.nodes.items():
+            if network.node_degree.get(nid, 0) < 3:
+                continue
+            if (nxy[0] - px) ** 2 + (nxy[1] - py) ** 2 <= (0.5 * pppm) ** 2:
+                widest = max(network.segments[i].width
+                             for i in network.node_connections.get(nid, []))
+                return (widest / 2.0 + config.CENTERLINE_JUNCTION_GAP_M) * pppm
+        return 0.0
+
+    return gap_at(*coords[0]), gap_at(*coords[-1])
 
 
 def _trim_ends(coords: list, start_m: float, end_m: float) -> list:
@@ -722,7 +806,6 @@ def _build_lane_markings(network: "RoadNetwork"):
     distances.
     """
     from shapely.geometry import LineString
-    from shapely.ops import linemerge
 
     pppm = config.PIXELS_PER_METER
     corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
@@ -741,13 +824,13 @@ def _build_lane_markings(network: "RoadNetwork"):
         W = width_m * pppm
         S = shoulder_m * pppm
         P = park_w * pppm
-        lines = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in segs]
-        merged = linemerge(lines) if len(lines) > 1 else lines[0]
-        merged_lines = merged.geoms if hasattr(merged, "geoms") else [merged]
+        # Chain through plain bends only (never across a real junction -
+        # the paint must stop before the crossing, see _chain_segments).
+        raw = _chain_segments(segs, network)
 
         oriented: list[list] = []
-        for line in merged_lines:
-            coords = _round_polyline_corners(list(line.coords), corner_radius_px)
+        for coords0 in raw:
+            coords = _round_polyline_corners(coords0, corner_radius_px)
             # linemerge does not preserve our direction of travel - re-
             # orient the line so its first point is a segment START
             # (start_node side), i.e. the line runs the way traffic flows.
@@ -767,24 +850,32 @@ def _build_lane_markings(network: "RoadNetwork"):
             return [list(g.coords) for g in geoms if not g.is_empty]
 
         for coords in oriented:
+            # Paint stops before the crossing (see
+            # _junction_marking_trim_px); guardrails below are physical
+            # objects and keep their full length.
+            t0, t1 = _junction_marking_trim_px(network, coords)
+            paint = (list(coords) if not (t0 or t1)
+                     else _trim_ends(list(coords), t0, t1))
+            if not paint:
+                continue    # too short to fit paint away from both junctions
             if oneway:
                 markings.extend(("solid", c, 0.15)
-                                for c in offset_of(coords, -W / 2))
+                                for c in offset_of(paint, -W / 2))
                 markings.extend(("dashed", c, 0.15)
-                                for c in offset_of(coords, -S / 2))
+                                for c in offset_of(paint, -S / 2))
                 markings.extend(("solid", c, 0.30)
-                                for c in offset_of(coords, W / 2 - S))
+                                for c in offset_of(paint, W / 2 - S))
             else:
                 # Solid centreline: crossing it = oncoming lane.
-                markings.append(("solid", list(coords), 0.15))
+                markings.append(("solid", list(paint), 0.15))
                 D = W / 2 - P                     # driving strip per side
                 l = D / lanes                     # driving-lane width
                 for k in range(1, lanes):
                     d = k * l
                     markings.extend(("dashed", c, 0.15)
-                                    for c in offset_of(coords, d))
+                                    for c in offset_of(paint, d))
                     markings.extend(("dashed", c, 0.15)
-                                    for c in offset_of(coords, -d))
+                                    for c in offset_of(paint, -d))
                 if P > 0:
                     t0, t1 = _junction_trim_m(network, coords)
                     trimmed = _trim_ends(list(coords), t0, t1)

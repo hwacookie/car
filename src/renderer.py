@@ -488,11 +488,11 @@ class Renderer:
             if target is not surface:
                 surface.blit(target, (0, 0))
 
-        # Junction dots scale with zoom (world-space radius, capped).
-        dot_radius_px = min(int(config.JUNCTION_DOT_RADIUS_M * config.PIXELS_PER_METER * zoom),
-                            config.JUNCTION_DOT_MAX_PX)
-        if dot_radius_px < 1:
-            return   # sub-pixel at this zoom - skip the dots entirely
+        # Junction dots: physical size (30 cm diameter) rendered in world
+        # space, so they scale with zoom; 1 px floor keeps them visible
+        # at low zoom.
+        dot_radius_px = max(1, int(round(
+            config.JUNCTION_DOT_RADIUS_M * config.PIXELS_PER_METER * zoom)))
         for node_id, degree in self.network.node_degree.items():
             if degree < 3:
                 continue
