@@ -3,6 +3,31 @@
 > Companion to `TURN_REWORK_PLAN.md` §10. Status: implemented on branch
 > `turn-planning-rework`. This file records the non-obvious decisions and
 > the verification evidence.
+>
+> **Addendum 2026-08-31 — junction corners replaced by Eckausrundung:**
+> the node-centred fillet arcs described below (R = 6 m through the node,
+> buffered by a road half-width) are REPLACED. At every degree>=3 corner
+> the grass corner where two road EDGES meet is now rounded with a circular
+> arc of `config.JUNCTION_CORNER_RADIUS_M` (4 m, fixed; TODO: should depend
+> on road class / design vehicle per RASt/RAL "nach Art und Lage der
+> Straße"), tangent to both edges - the standard Eckausrundung
+> (de.wikipedia.org/wiki/Eckausrundung). The paved fill is the curvilinear
+> triangle between corner point and arc, built directly (no buffering).
+>
+> Why: the buffered node-centred capsules bulged up to ~5.4 m past the
+> kerbs where road widths differ (measured at the 3.5 m one-way × 7 m
+> crossing, test map tile (2,1)): two of the four corners were buffered by
+> the wide road's half-width and two by the narrow one's (seg_a = first
+> spoke in angle order), producing asymmetric lobes - visually "the wide
+> road bending into the narrow one". Rendering and drivable area were
+> affected alike (same shared polygons).
+>
+> Unchanged: the driving reference line still rounds route corners with
+> `BicycleNav.CORNER_RADIUS_M` (6 m through the node); e2e 19/19 green
+> with the new paved geometry, so the two remain compatible. The
+> `junction_fillets` entries now carry `corner` + `arc` (+ seg_a/seg_b,
+> radius_px) instead of t1/t2; consumers: `_build_smoothed_junction_fillets`
+> (paved fill) and `obstacles.py` (parked-car alignment along the arc).
 
 ## One curve, all consumers
 
