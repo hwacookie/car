@@ -400,7 +400,18 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
         # right); the car sits at lateral o, so the node is on our left
         # exactly when o > t. Add half the car's width plus a margin so it
         # is the whole body that clears it, not just the centreline.
-        if junction_nodes is not None and junction_nodes[i] is not None:
+        #
+        # This protects against ONCOMING traffic, so it only applies where
+        # there is some: on a one-way carriageway there is no oncoming
+        # lane, and the node is kept clear naturally (straight and right
+        # turns pass it on the left; left turns are already excluded by
+        # _junction_node_per_station). Applying it on one-way stations used
+        # to force the line ~0.9 m kerbward within 14 m of every junction -
+        # measured on the 3.5 m oneway x oneway crossing (test #10): base
+        # offset 0.5 m -> forced 1.4 m, an S-bend the car had to steer
+        # through at junction-entry speed instead of driving straight.
+        if junction_nodes is not None and junction_nodes[i] is not None \
+                and not oneway_i:
             qx, qy = junction_nodes[i]
             t = ((qx - P[i][0]) * nx + (qy - P[i][1]) * ny) / PPPM
             l = max(l, t + config.CAR_WIDTH / 2.0 + config.LANE_CENTRE_MARGIN_M)
