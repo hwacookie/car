@@ -411,14 +411,15 @@ class Renderer:
         w, h = surface.get_size()
         zoom = self.camera.zoom
         pppm = config.PIXELS_PER_METER
-        # Plain road centerlines vs. the Autobahn Leitlinie (RQ 31:
-        # 6 m dash / 12 m gap).
-        c_dash_px, c_gap_px = 3.0 * pppm, 3.0 * pppm
-        # Lane dividers: fine dashes (short dash, short gap) - the old
-        # 6 m / 12 m pattern read as a broken line, not a lane line.
-        l_dash_px, l_gap_px = 2.0 * pppm, 4.0 * pppm
-        # Parking-lane boundary: even finer dashes (user decision).
-        p_dash_px, p_gap_px = 1.0 * pppm, 1.0 * pppm
+        # Dash patterns from config (shared with the GET /map export so
+        # external renderers draw the same pattern - RQ 31: fine dashes
+        # for lane dividers, even finer for the parking-lane boundary).
+        c_dash_px = config.CENTER_DASH_M * pppm
+        c_gap_px = config.CENTER_GAP_M * pppm
+        l_dash_px = config.LANE_DASH_M * pppm
+        l_gap_px = config.LANE_GAP_M * pppm
+        p_dash_px = config.PARK_DASH_M * pppm
+        p_gap_px = config.PARK_GAP_M * pppm
 
         # Fade the markings out as zoom decreases: a dash's on-screen
         # length (dash_px * zoom) below ~1 px is just flickering noise.

@@ -223,6 +223,15 @@ CENTERLINE_MIN_WIDTH_M = 7.0
 # diameter, rendered in world space so it scales with zoom (1 px floor so
 # it stays visible at low zoom - user decision).
 JUNCTION_DOT_RADIUS_M = 0.15
+# Marking dash patterns (METRES). Shared by the pygame renderer and the
+# GET /map export (docs/GODOT_FRONTEND.md) so external renderers draw the
+# same pattern from one source of truth.
+CENTER_DASH_M = 3.0     # two-way centerline: 3 m dash / 3 m gap.
+CENTER_GAP_M = 3.0
+LANE_DASH_M = 2.0       # multi-lane lane divider: fine dashes.
+LANE_GAP_M = 4.0
+PARK_DASH_M = 1.0       # parking-lane boundary: even finer dashes.
+PARK_GAP_M = 1.0
 MINIMAP_BG = (20, 60, 20)
 MINIMAP_CAR_COLOR = (255, 0, 0)
 MINIMAP_BORDER = (80, 80, 80)

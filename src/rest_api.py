@@ -7,6 +7,7 @@ import io
 import time
 from typing import Dict, Any
 
+from . import config
 from .obstacles import PlacementError
 
 
@@ -69,6 +70,70 @@ class GameAPI:
                 'idx': idx,
                 'x1': s.x1, 'y1': s.y1, 'x2': s.x2, 'y2': s.y2,
                 'length': s.length, 'width': s.width, 'oneway': s.oneway,
+            })
+
+        @self.app.route('/map', methods=['GET'])
+        def map_export():
+            """Layer-2 geometry export for external renderers - the Godot
+            client renders the static world from this (M1 of
+            docs/GODOT_FRONTEND.md). Everything is static per map load;
+            fetch once and cache. All coordinates in METRES, x = east,
+            y = north (world pixels / PIXELS_PER_METER).
+
+            The polygons already contain the smoothed splines AND the
+            Eckausrundung junction patches (network caches); holes cover
+            closed-loop islands (roundabout). Colors/dash patterns come
+            from config so both renderers share one source of truth.
+            """
+            net = self.obstacle_network
+            if net is None:
+                return jsonify({'error': 'no map loaded'}), 503
+            pppm = config.PIXELS_PER_METER
+
+            def m(pts):
+                return [[round(x / pppm, 2), round(y / pppm, 2)]
+                        for x, y in pts]
+
+            roads = []
+            for _color, groups in net.get_road_polygons_by_color():
+                for ext, holes in groups:
+                    roads.append({'exterior': m(ext),
+                                  'holes': [m(h) for h in holes]})
+            junctions = [{'id': nid,
+                          'x': round(xy[0] / pppm, 2),
+                          'y': round(xy[1] / pppm, 2)}
+                         for nid, deg in net.node_degree.items()
+                         if deg >= 3 and (xy := net.nodes.get(nid))]
+            start_points = {}
+            for name, (x, y, hdg, seg, fwd, lat) in net.start_points.items():
+                start_points[name] = {
+                    'x': round(x / pppm, 2), 'y': round(y / pppm, 2),
+                    'heading_deg': hdg, 'seg': seg,
+                    'forward': fwd, 'lateral_offset_m': lat}
+            return jsonify({
+                'units': 'meters',
+                'bounds': [0.0, 0.0,
+                           round(net.world_width / pppm, 2),
+                           round(net.world_height / pppm, 2)],
+                'road_color': list(config.ROAD_COLOR),
+                'bg_color': list(config.BG_COLOR),
+                'roads': roads,
+                'centerlines': [m(c) for c in net.get_marking_centerlines()],
+                'lane_markings': [
+                    {'style': style, 'width_m': width_m, 'pts': m(coords)}
+                    for style, coords, width_m in net.get_lane_markings()],
+                'oneway_arrows': [m(p) for p in net.get_oneway_arrows()],
+                'parking_marks': [m(p) for p in net.get_parking_marks()],
+                'junctions': junctions,
+                'junction_dot_radius_m': config.JUNCTION_DOT_RADIUS_M,
+                'marking_style': {
+                    'center_dash_m': config.CENTER_DASH_M,
+                    'center_gap_m': config.CENTER_GAP_M,
+                    'lane_dash_m': config.LANE_DASH_M,
+                    'lane_gap_m': config.LANE_GAP_M,
+                    'park_dash_m': config.PARK_DASH_M,
+                    'park_gap_m': config.PARK_GAP_M},
+                'start_points': start_points,
             })
         
         @self.app.route('/control', methods=['POST'])
