@@ -96,6 +96,10 @@ KERB_CLEARANCE_M = ROAD_EDGE_TOLERANCE_M
 # nah am rechten Rand"). The pull-over target uses this smaller clearance;
 # the driving-line corridor keeps KERB_CLEARANCE_M.
 PARK_KERB_CLEARANCE_M = 0.16   # empirically closest clean park (scripts/sweep_park_clearance.py): at <=0.14 the reverse-in tuck grows past what _reverse_park_ok allows and the style falls back to a forward park ~0.6 m out
+# Parking lanes END before junctions - you cannot park right in front of
+# one. The painted P marks and the parking-lane boundary line stop this
+# far short of any junction (user decision: at least 5 m, visually).
+PARK_LANE_END_GAP_M = 5.0
 
 # How far into a segment a car spawns, as a FRACTION of the segment
 # length. Never 0: a node sits in the middle of the junction rounding,
@@ -145,6 +149,26 @@ def park_offset_m(road_width_m: float) -> float:
     flush against the kerb with only PARK_KERB_CLEARANCE_M to spare."""
     return max(0.0, road_width_m / 2.0 - CAR_WIDTH / 2.0
                - PARK_KERB_CLEARANCE_M)
+
+
+def lane_base_offset_m(width: float, lanes: int = 0,
+                       parking_lane_width: float = 0.0,
+                       oneway: bool = False) -> float:
+    """Nominal driving position (m right of the centreline) for a road.
+
+    Multi-lane carriageways (lanes > 0) pin to the CENTRE OF THE OUTERMOST
+    DRIVING LANE - a human keeps right, so normal traffic drives next to
+    the parking lane, not in it. One-way: all lanes run one way, so the
+    driving strip is the full width. Two-way: each side has its own
+    driving strip (half the road minus the parking lane). Plain roads keep
+    the fixed nominal offset."""
+    if lanes > 0 and not oneway:
+        d = max(0.0, width / 2.0 - parking_lane_width)   # per side
+        return max(0.0, d - (d / lanes) / 2.0)
+    if lanes > 0:                                        # one-way
+        l = width / lanes
+        return max(0.0, width / 2.0 - l / 2.0)
+    return min(LANE_OFFSET_DEFAULT_M, kerb_offset_m(width))
 
 # --- Road rendering ---
 # Real-world widths in meters (2-way / 1-way)

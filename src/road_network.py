@@ -24,11 +24,19 @@ class RoadSegment:
     start_node: str = ""   # node id at (x1, y1)
     end_node: str = ""     # node id at (x2, y2)
     length: float = 0.0    # metres
-    lanes: int = 0         # lanes in the direction of travel; > 0 marks a
-                           # multi-lane one-way carriageway that gets
+    lanes: int = 0         # DRIVING lanes per direction of travel; > 0
+                           # marks a multi-lane carriageway that gets
                            # offset lane markings instead of a plain
-                           # dashed centerline
+                           # dashed centerline. One-way: total = lanes;
+                           # two-way: total = 2 x lanes.
     shoulder: float = 0.0  # metres of stop lane (shoulder) on the right
+    parking_lane_width: float = 0.0  # metres; > 0 = the outermost right
+                                     # lane is a PARKING LANE (at each
+                                     # kerb - i.e. both sides of a two-way
+                                     # road). Drives the painted P marks
+                                     # and the parking-lane boundary line,
+                                     # which end >= config.PARK_LANE_END_GAP_M
+                                     # before any junction.
 
 
 @dataclass
@@ -458,7 +466,8 @@ class RoadNetwork:
         separate from get_centerlines() because the LaneGuard needs the
         unfiltered set."""
         if getattr(self, "_marking_centerlines_cache", None) is None:
-            groups = _merge_and_round_lines(self, only_two_way=True)
+            groups = _merge_and_round_lines(self, only_two_way=True,
+                                            skip_multi_lane=True)
             self._marking_centerlines_cache = [
                 coords for (_hw, w), lines in groups.items()
                 if w >= config.CENTERLINE_MIN_WIDTH_M
@@ -472,8 +481,8 @@ class RoadNetwork:
         traffic, from the median outward):
 
           'solid'     narrow (0.15 m)  edge of the overtaking lane
-          'dashed'    (0.15 m, drawn with a 6 m / 12 m dash by the
-                      renderer) between the two driving lanes
+          'dashed'    (0.15 m, fine 2 m / 4 m dashes by the renderer)
+                      between the two driving lanes
           'solid'     broad (0.30 m, Breitstrich) between the travel
                       lane and the stop lane (no line on the outer
                       edge of the stop lane)
@@ -497,6 +506,21 @@ class RoadNetwork:
         if getattr(self, "_oneway_arrows_cache", None) is None:
             self._oneway_arrows_cache = _build_oneway_arrows(self)
         return self._oneway_arrows_cache
+
+    def get_parking_marks(self):
+        """Painted 'P' letters in parking lanes (segments with
+        parking_lane_width > 0): one per lane every 100 m (starting 50 m
+        in), centred on the lane, readable by a driver travelling in that
+        lane's direction. Two-way roads get P marks at BOTH kerbs (the
+        left ones face the opposite way). Like the parking-lane boundary
+        line, no mark lies closer than PARK_LANE_END_GAP_M to a junction
+        - parking lanes end there (user decision).
+
+        Returns a list of polygons [(x, y), ...] in world pixels.
+        Cached - the road network never changes at runtime."""
+        if getattr(self, "_parking_marks_cache", None) is None:
+            self._parking_marks_cache = _build_parking_marks(self)
+        return self._parking_marks_cache
 
     def random_road_point(self) -> tuple[float, float, float, int, str]:
         """Return a random (x, y, heading, seg_idx, node_id) on any road segment.
@@ -553,7 +577,8 @@ def point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: fl
     return d
 
 
-def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False):
+def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False,
+                           skip_multi_lane: bool = False):
     """Group segments by (highway, width), merge contiguous ones through
     plain degree-2 nodes, and round each merged line's own corners (see
     _round_polyline_corners). Shared by both _build_road_polygons
@@ -577,6 +602,10 @@ def _merge_and_round_lines(network: "RoadNetwork", only_two_way: bool = False):
     groups: dict[tuple[str, float], list] = {}
     for seg in network.segments:
         if only_two_way and seg.oneway:
+            continue
+        # Multi-lane carriageways draw their OWN centerline (solid, via
+        # _build_lane_markings) - the plain dashed one would double it.
+        if skip_multi_lane and seg.lanes > 0:
             continue
         length = math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
         if length < 1e-6:
@@ -609,22 +638,81 @@ def _build_centerlines(network: "RoadNetwork"):
     return [coords for lines in groups.values() for coords in lines]
 
 
+def _junction_trim_m(network: "RoadNetwork", coords: list) -> tuple[float, float]:
+    """(start_trim, end_trim) in pixels: PARK_LANE_END_GAP_M where the
+    line's end sits at a real junction (node degree >= 3), else 0.
+    Parking-lane elements must end that far BEFORE a junction - visually,
+    not just semantically (user decision)."""
+    pppm = config.PIXELS_PER_METER
+    gap = config.PARK_LANE_END_GAP_M * pppm
+
+    def trim_at(px: float, py: float) -> float:
+        for nid, nxy in network.nodes.items():
+            if network.node_degree.get(nid, 0) < 3:
+                continue
+            if (nxy[0] - px) ** 2 + (nxy[1] - py) ** 2 <= (0.5 * pppm) ** 2:
+                return gap
+        return 0.0
+
+    return trim_at(*coords[0]), trim_at(*coords[-1])
+
+
+def _trim_ends(coords: list, start_m: float, end_m: float) -> list:
+    """Drop `start_m` / `end_m` pixels of arc length from a polyline's
+    ends, inserting exact cut points. Returns [] if nothing is left."""
+    if len(coords) < 2 or start_m <= 0 and end_m <= 0:
+        return list(coords)
+    total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(coords, coords[1:]))
+    if start_m + end_m >= total:
+        return []
+
+    def cut_at(pts: list, s: float) -> tuple[float, float]:
+        acc = 0.0
+        for i in range(len(pts) - 1):
+            a, b = pts[i], pts[i + 1]
+            seglen = math.hypot(b[0] - a[0], b[1] - a[1])
+            if acc + seglen >= s and seglen > 0:
+                t = (s - acc) / seglen
+                return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+            acc += seglen
+        return pts[-1]
+
+    head = cut_at(coords, start_m)
+    tail = cut_at(list(reversed(coords)), end_m)
+    out = [head]
+    for p in coords[1:-1]:
+        if (p[0] - head[0]) ** 2 + (p[1] - head[1]) ** 2 > 1e-9 and \
+           (p[0] - tail[0]) ** 2 + (p[1] - tail[1]) ** 2 > 1e-9:
+            out.append(p)
+    out.append(tail)
+    return out if len(out) >= 2 else []
+
+
 def _build_lane_markings(network: "RoadNetwork"):
-    """Offset lane-marking lines for multi-lane one-way carriageways.
+    """Offset lane-marking lines for multi-lane carriageways (lanes > 0).
 
-    For a carriageway of total width W with S metres of stop lane on the
-    right (right-hand traffic), measured as distances from the centerline
-    in the direction of travel (+ = left of travel):
-
+    One-way (RQ 31 layout, right-hand traffic, from the median outward):
       solid   +W/2        left edge (edge of the overtaking lane)
-      dashed  +S/2        between the two driving lanes
+      dashed  +S/2        between the driving lanes
       solid  -(W/2 - S)   between the travel lane and the stop lane
+
+    Two-way (e.g. the parking avenue: two driving + one parking lane per
+    side), measured from the centreline, symmetric about it:
+      solid   0           SOLID centreline - crossing it means entering
+                          the oncoming lane, so it must not be dashed
+                          (user decision)
+      dashed  +/-k*l      dividers between the two driving lanes of each
+                          direction (l = driving-lane width) - fine 2 m /
+                          4 m dashes (user decision)
+      p_dash  +/-(W/2-P)  boundary of the parking lane at each kerb -
+                          finer 1 m / 1 m dashes (user decision); like
+                          the painted P marks it ends >=
+                          PARK_LANE_END_GAP_M before any junction
 
     The lines are Shapely offset curves of the same corner-rounded
     centerlines the pavement is buffered from, so the markings follow the
-    road's curves exactly. (W - S) / lanes is the driving-lane width; the
-    dashed divider lands at +S/2 because the driving strip spans from
-    +W/2 (left edge) to -(W/2 - S) (right edge).
+    road's curves exactly.
 
     NOTE on signs: Shapely's offset_curve uses the standard math
     convention where a positive offset lands on the LEFT of the line's
@@ -645,12 +733,14 @@ def _build_lane_markings(network: "RoadNetwork"):
             continue
         if math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1) < 1e-6:
             continue
-        groups.setdefault((seg.highway, seg.width, seg.lanes, seg.shoulder), []).append(seg)
+        groups.setdefault((seg.highway, seg.width, seg.lanes, seg.shoulder,
+                           seg.oneway, seg.parking_lane_width), []).append(seg)
 
     markings: list[tuple[str, list, float]] = []
-    for (_hw, width_m, _lanes, shoulder_m), segs in groups.items():
+    for (_hw, width_m, lanes, shoulder_m, oneway, park_w), segs in groups.items():
         W = width_m * pppm
         S = shoulder_m * pppm
+        P = park_w * pppm
         lines = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in segs]
         merged = linemerge(lines) if len(lines) > 1 else lines[0]
         merged_lines = merged.geoms if hasattr(merged, "geoms") else [merged]
@@ -677,9 +767,32 @@ def _build_lane_markings(network: "RoadNetwork"):
             return [list(g.coords) for g in geoms if not g.is_empty]
 
         for coords in oriented:
-            markings.extend(("solid", c, 0.15) for c in offset_of(coords, -W / 2))
-            markings.extend(("dashed", c, 0.15) for c in offset_of(coords, -S / 2))
-            markings.extend(("solid", c, 0.30) for c in offset_of(coords, W / 2 - S))
+            if oneway:
+                markings.extend(("solid", c, 0.15)
+                                for c in offset_of(coords, -W / 2))
+                markings.extend(("dashed", c, 0.15)
+                                for c in offset_of(coords, -S / 2))
+                markings.extend(("solid", c, 0.30)
+                                for c in offset_of(coords, W / 2 - S))
+            else:
+                # Solid centreline: crossing it = oncoming lane.
+                markings.append(("solid", list(coords), 0.15))
+                D = W / 2 - P                     # driving strip per side
+                l = D / lanes                     # driving-lane width
+                for k in range(1, lanes):
+                    d = k * l
+                    markings.extend(("dashed", c, 0.15)
+                                    for c in offset_of(coords, d))
+                    markings.extend(("dashed", c, 0.15)
+                                    for c in offset_of(coords, -d))
+                if P > 0:
+                    t0, t1 = _junction_trim_m(network, coords)
+                    trimmed = _trim_ends(list(coords), t0, t1)
+                    if trimmed:
+                        markings.extend(("p_dash", c, 0.15)
+                                        for c in offset_of(trimmed, D))
+                        markings.extend(("p_dash", c, 0.15)
+                                        for c in offset_of(trimmed, -D))
 
         # Central median: two carriageways of this group that run
         # roughly parallel within a couple of metres of each other form
@@ -745,6 +858,69 @@ def _arrow_polygon(cx: float, cy: float, fx: float, fy: float,
         pt(0.3, 0.3),     # shaft -> head, right
         pt(-1.5, 0.3),    # tail, right
     ]
+
+
+def _p_polygons(cx: float, cy: float, fx: float, fy: float,
+                rx: float, ry: float, pppm: float) -> list:
+    """A blocky painted 'P' (2.0 m tall x 1.35 m wide, centred on (cx, cy)),
+    readable by traffic travelling along f: stem on the driver's left, bowl
+    to the right. Built from four overlapping rectangles so no polygon holes
+    are needed. (s_m, off_m) offsets are metres along / right of f."""
+    def rect(s0, s1, o0, o1) -> list:
+        return [
+            (cx + fx * s0 * pppm + rx * o0 * pppm,
+             cy + fy * s0 * pppm + ry * o0 * pppm),
+            (cx + fx * s1 * pppm + rx * o0 * pppm,
+             cy + fy * s1 * pppm + ry * o0 * pppm),
+            (cx + fx * s1 * pppm + rx * o1 * pppm,
+             cy + fy * s1 * pppm + ry * o1 * pppm),
+            (cx + fx * s0 * pppm + rx * o1 * pppm,
+             cy + fy * s0 * pppm + ry * o1 * pppm),
+        ]
+    # 5 x 7 pixel grid scaled to 1.35 m x 2.0 m (col w 0.27, row h ~0.286)
+    return [
+        rect(-1.0, 1.0, -0.675, -0.405),    # stem (full height, left)
+        rect(0.714, 1.0, -0.675, 0.405),    # top bar
+        rect(0.143, 1.0, 0.405, 0.675),     # right side of the bowl
+        rect(-0.143, 0.143, -0.675, 0.405), # middle bar (closes the bowl)
+    ]
+
+
+def _build_parking_marks(network: "RoadNetwork"):
+    """Painted P marks for parking lanes (see get_parking_marks)."""
+    pppm = config.PIXELS_PER_METER
+    gap = config.PARK_LANE_END_GAP_M * pppm
+    marks: list[list] = []
+    for seg in network.segments:
+        if seg.parking_lane_width <= 0 or seg.lanes <= 0:
+            continue
+        dx, dy = seg.x2 - seg.x1, seg.y2 - seg.y1
+        length_px = math.hypot(dx, dy)
+        if length_px < 1e-6:
+            continue
+        fx, fy = dx / length_px, dy / length_px   # unit direction of travel
+        rx, ry = fy, -fx                          # right-hand side of it
+        # Parking lanes end >= PARK_LANE_END_GAP_M before a junction.
+        s_min = gap if network.node_degree.get(seg.start_node, 0) >= 3 else 0.0
+        s_max = (seg.length * pppm - gap
+                 if network.node_degree.get(seg.end_node, 0) >= 3
+                 else seg.length * pppm)
+        # Centre of the parking lane: driving strip + half the parking
+        # lane, right of the centreline. Two-way roads have one at each
+        # kerb; the left one faces the opposite direction of travel.
+        off_m = seg.width / 2.0 - seg.parking_lane_width / 2.0
+        sides = [(1.0, fx, fy, rx, ry)]
+        if not seg.oneway:
+            sides.append((-1.0, -fx, -fy, -rx, -ry))
+        for side_sign, sfx, sfy, srx, sry in sides:
+            s = 50.0 * pppm
+            while s <= s_max - 20.0 * pppm:
+                if s >= s_min + 1e-6:
+                    cx = seg.x1 + fx * s + rx * off_m * side_sign * pppm
+                    cy = seg.y1 + fy * s + ry * off_m * side_sign * pppm
+                    marks.extend(_p_polygons(cx, cy, sfx, sfy, srx, sry, pppm))
+                s += 100.0 * pppm
+    return marks
 
 
 def _midpoint(coords: list) -> tuple[float, float]:

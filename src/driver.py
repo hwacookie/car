@@ -121,6 +121,11 @@ class BicycleDriver(Driver):
         # there was TRUE in all normal driving and killed every manually
         # signaled LEFT blinker within one frame).
         self._was_pulling_out = False
+        # Which indicator WE set for an active lane change (merge before
+        # parking) - None when no lane-change signal of ours is on. Used
+        # to switch it off exactly once when the merge settles, without
+        # touching user-signaled or turn indicators.
+        self._lane_change_side = None
         # Hazard lights (Warnblinkanlage): all four corner blinkers flash.
         # Turned on automatically when the car recognises it cannot
         # continue (e.g. U-turn stall) or manually via the REST API.
@@ -257,7 +262,31 @@ class BicycleDriver(Driver):
         # After the turn executes the signal clears (auto-off) and parking
         # resumes as usual.
         parking_blocked_by_turn = self._signal_would_turn(car, network)
-        if parking and not parking_blocked_by_turn:
+        # Lane change before parking (docs §1 variant, user rule): ALWAYS
+        # signal BEFORE changing lanes. The nav owns the timing - on from
+        # MERGE_SIGNAL_AHEAD_M before the merge zone starts, off once the
+        # car has settled onto the new line. While active it wins over the
+        # parking/pull-out signals; when it drops we switch off only the
+        # indicator WE set (a user-signaled or turn signal must survive).
+        lane_change = getattr(nav, 'lane_change_signal', None) \
+            if nav is not None else None
+        if lane_change is None and getattr(self, '_lane_change_side', None):
+            if self._lane_change_side == 'right':
+                self.blinker_right = False
+            else:
+                self.blinker_left = False
+            self._lane_change_side = None
+        if lane_change == 'right':
+            self.blinker_right = True
+            self.blinker_left = False
+            self.pending_turn = None
+            self._lane_change_side = 'right'
+        elif lane_change == 'left':
+            self.blinker_left = True
+            self.blinker_right = False
+            self.pending_turn = None
+            self._lane_change_side = 'left'
+        elif parking and not parking_blocked_by_turn:
             self.blinker_right = True
             self.blinker_left = False
             self.pending_turn = None

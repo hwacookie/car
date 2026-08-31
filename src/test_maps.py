@@ -45,14 +45,19 @@ class MapBuilder:
         width: float | None = None,
         lanes: int = 0,
         shoulder: float = 0.0,
+        parking_lane_width: float = 0.0,
     ) -> None:
         """Add a road segment between two named nodes.
 
         width (metres) overrides the ROAD_TYPES-derived width. lanes > 0
-        marks the segment as a multi-lane one-way carriageway: the
-        renderer draws a dashed divider between the driving lanes plus
-        solid lines at both edges of the driving lanes, with `shoulder`
-        metres of stop lane on the right (right-hand traffic).
+        marks the segment as a multi-lane carriageway with `lanes` DRIVING
+        lanes per direction (one-way: total = lanes; two-way: 2 x lanes):
+        the renderer draws a solid centreline on two-way roads, dashed
+        dividers between the driving lanes of each direction, and - with
+        `parking_lane_width` > 0 - a parking lane at each kerb (dashed
+        boundary + painted P marks, ending >= PARK_LANE_END_GAP_M before
+        any junction). `shoulder` metres of stop lane on the right apply
+        to one-way layouts (right-hand traffic).
         """
         x1_m, y1_m = self._nodes_m[n1]
         x2_m, y2_m = self._nodes_m[n2]
@@ -77,6 +82,7 @@ class MapBuilder:
             width=width,
             start_node=n1,
             end_node=n2,
+            parking_lane_width=parking_lane_width,
             length=length_m,
             lanes=lanes,
             shoulder=shoulder,
@@ -470,29 +476,29 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("www_entry", "www_a")
     b.start("www_exit", "www_f")
 
-    # --- Tile (4,1): Two-lane one-way straight (parking from lateral offsets) ---
-    # 300 m straight one-way street, 7 m wide = two 3.5 m lanes in the
-    # driving direction (south). Target of the "reverse park from
-    # different lateral start positions" scenarios
-    # (docs/DRIVING_MANEUVERS.md §1 variant): same route and destination
-    # flag for all five, only the lateral spawn position differs. The
-    # offsets are relative to the normal driving position (right-lane
-    # centre, 1.75 m right of the centreline), positive = toward the
-    # right kerb:
-    #   +0.65  -> right flank ~0.2 m at the kerb ("fast am rechten Rand")
-    #     0.0  -> middle of the right lane (normal position)
-    #   -1.75  -> middle of the street (on the centreline)
-    #   -3.5   -> middle of the left lane
-    #   -4.15  -> left flank ~0.2 m at the left kerb ("ganz links")
+    # --- Tile (4,1): Parking avenue (2 driving + 1 parking lane per side) ---
+    # 300 m straight two-way street, 19.4 m wide: per direction two 3.5 m
+    # driving lanes plus a 2.7 m parking lane at the kerb (6 lanes total).
+    # Solid centreline (crossing it = oncoming lane), painted P marks in
+    # both parking lanes. Target of the "park from different lateral start
+    # positions" scenarios (docs/DRIVING_MANEUVERS.md §1 variant): same
+    # route and destination flag for all three, only the lateral spawn
+    # position differs - always on our own side of the road. Offsets are
+    # relative to the normal driving position (centre of the outermost
+    # driving lane, 5.25 m right of the centreline), positive = toward
+    # the right kerb:
+    #   -3.50  -> middle of the left (overtaking) driving lane: a human
+    #             merges right first, then parks (see §1 variant)
+    #     0.0  -> middle of the right (normal) driving lane
+    #   +3.10  -> middle of the parking lane (8.35 m from centreline)
     ox, oy = origin(4, 1)
-    b.node("tl_ow_n", ox + 100, oy + 350)
-    b.node("tl_ow_s", ox + 100, oy + 50)
-    b.road("tl_ow_n", "tl_ow_s", oneway=True, lanes=2, width=7.0)
-    b.start("park_2lane_kerb",       "tl_ow_n", lateral_offset_m=+0.65)
-    b.start("park_2lane_right_lane", "tl_ow_n")
-    b.start("park_2lane_centre",     "tl_ow_n", lateral_offset_m=-1.75)
-    b.start("park_2lane_left_lane",  "tl_ow_n", lateral_offset_m=-3.50)
-    b.start("park_2lane_far_left",   "tl_ow_n", lateral_offset_m=-4.15)
+    b.node("pkw_n", ox + 100, oy + 350)
+    b.node("pkw_s", ox + 100, oy + 50)
+    b.road("pkw_n", "pkw_s", oneway=False, lanes=2, width=19.4,
+           parking_lane_width=2.7)
+    b.start("park_6lane_left_lane",  "pkw_n", lateral_offset_m=-3.50)
+    b.start("park_6lane_right_lane", "pkw_n")
+    b.start("park_6lane_parking",    "pkw_n", lateral_offset_m=+3.10)
 
     return b.build()
 

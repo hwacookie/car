@@ -131,7 +131,7 @@ through it and the run ends on the crossing, exactly like the full
 suite's running turn tests. Without it the nav has no destination at all:
 the car just drives through. To watch a parking maneuver live in the
 window, run one of the parking-offset scenarios from the suite instead
-(`python tests/test_turning.py --tests park_2lane_right_lane`): only those
+(`python tests/test_turning.py --tests park_6lane_right_lane`): only those
 set the flag as the nav's destination and trigger the full parking
 approach (including reverse-in where the geometry calls for it).
 

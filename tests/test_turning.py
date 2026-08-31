@@ -60,9 +60,10 @@ FLAG_CRAWL_KMH = 5.0
 # perfectly parked car sits PARK_KERB_CLEARANCE_M (0.16 m) out, so 30 cm
 # means "parked properly", not "touched the kerb".
 KERB_PASS_MAX_M = 0.30
-# Width of the two-lane one-way tile in src/test_maps.py (tile (4,1)) -
-# the right-kerb line for the check above is derived from it.
-PARK_2LANE_WIDTH_M = 7.0
+# Width of the parking avenue in src/test_maps.py (tile (4,1): two driving
+# + one parking lane per side) - the right-kerb line for the check above is
+# derived from it.
+PARK_AVENUE_WIDTH_M = 19.4
 
 # Running turn tests (docs/TESTING.md): the scenario drives THROUGH the
 # corner - no stopping, no parking (parking is covered by the dedicated
@@ -337,8 +338,8 @@ START_POINT_NUMBER = {
     'corner_left_entry': 11, 'corner_left_exit': 11,
     'tjunction_from_top': 12, 'tjunction_from_west': 12, 'tjunction_from_east': 12,
     'sliver_approach': 13, 'sliver_from_west': 13, 'sliver_from_east': 13,
-    'park_2lane_kerb': 14, 'park_2lane_right_lane': 14, 'park_2lane_centre': 14,
-    'park_2lane_left_lane': 14, 'park_2lane_far_left': 14,
+    'park_6lane_left_lane': 14, 'park_6lane_right_lane': 14,
+    'park_6lane_parking': 14,
 }
 
 
@@ -430,25 +431,28 @@ DETERMINISTIC_TESTS = [
     #  "Sliver junction: turning right off the tiny approach stub"),
     # ('sliver_approach', 'left', 80, 103, 15.0,
     #  "Sliver junction: turning left off the tiny approach stub"),
-    # Reverse park from different lateral start positions (docs/
-    # DRIVING_MANEUVERS.md §1 variant). Straight two-lane one-way street
-    # (tile (4,1), 7 m = 2 x 3.5 m lanes, segment index 109 - NOTE: the
-    # game's state/flag API uses 0-based indices, NOT the 1-based RoadSegment
-    # id 110); the car starts at 15% of the segment and must back into the
-    # flag at 50% with BOTH right-hand wheels within 30 cm of the right
-    # kerb (the extra tuple fields: start_progress, kerb_check). Only the
-    # lateral spawn position varies between the five - it is baked into the
-    # named start points.
-    ('park_2lane_kerb', 'straight', 80, 109, 45.0,
-     "Back-in park from ~0.2 m at the right kerb", 0.15, True),
-    ('park_2lane_right_lane', 'straight', 80, 109, 45.0,
-     "Back-in park from the middle of the right lane (normal position)", 0.15, True),
-    ('park_2lane_centre', 'straight', 80, 109, 45.0,
-     "Back-in park from the middle of the street", 0.15, True),
-    ('park_2lane_left_lane', 'straight', 80, 109, 45.0,
-     "Back-in park from the middle of the left lane", 0.15, True),
-    ('park_2lane_far_left', 'straight', 80, 109, 45.0,
-     "Back-in park from ~0.2 m at the left kerb", 0.15, True),
+    # Park from different lateral start positions (docs/DRIVING_MANEUVERS.md
+    # §1 variant). Straight parking avenue (tile (4,1), segment index 109 -
+    # NOTE: the game's state/flag API uses 0-based indices, NOT the 1-based
+    # RoadSegment id 110): two-way, 19.4 m = per side two 3.5 m driving
+    # lanes + a 2.7 m parking lane at the kerb (solid centreline, painted P
+    # marks). The car starts at 15% of the segment and must park at the flag
+    # (50%) with BOTH right-hand wheels within 30 cm of the right kerb (the
+    # extra tuple fields: start_progress, kerb_check) - i.e. INSIDE the
+    # parking lane. Only the lateral spawn position varies between the three,
+    # always on our own side of the road; it is baked into the named start
+    # points. From the left (overtaking) driving lane the car must first
+    # merge right onto the normal line, well before the flag - a human never
+    # backs in from the overtaking lane; from inside the PARKING LANE it
+    # merges LEFT back into traffic first - the parking lane is for
+    # parking, not for travelling (user rules, replace the old "hold
+    # initial line" rule of 2026-08-27).
+    ('park_6lane_left_lane', 'straight', 80, 109, 45.0,
+     "Park from the left (overtaking) driving lane - merge right first", 0.15, True),
+    ('park_6lane_right_lane', 'straight', 80, 109, 45.0,
+     "Back-in park from the right (normal) driving lane", 0.15, True),
+    ('park_6lane_parking', 'straight', 80, 109, 45.0,
+     "Park from inside the parking lane - rejoin the driving lane first", 0.15, True),
     # NEGATIVE TEST (wrong-side detector) - runs LAST on purpose: the old
     # test-14 config. Spawn at 80% of segment 29, i.e. right at the
     # hairpin fillet, already rolling at 50 km/h. The car cannot make the
@@ -567,7 +571,7 @@ class TurnTester:
 
         The basic map is deterministic, so the kerb line comes from the
         start point's centreline position + heading (GET /start_points):
-        a straight line PARK_2LANE_WIDTH_M/2 to the right of the legal
+        a straight line PARK_AVENUE_WIDTH_M/2 to the right of the legal
         direction of travel. The car pose is its rear axle (state x/y) +
         heading; the wheel stations are the rear axle and the front axle
         (SPRITE_WHEELBASE_M ahead), measured at the body flank
@@ -580,7 +584,7 @@ class TurnTester:
         h = math.radians(sp['heading'])
         fx, fy = math.sin(h), math.cos(h)          # direction of travel
         rx, ry = fy, -fx                           # right-hand side of it
-        half_w_px = (PARK_2LANE_WIDTH_M / 2.0) * pppm
+        half_w_px = (PARK_AVENUE_WIDTH_M / 2.0) * pppm
         cx, cy = sp['x'] + rx * half_w_px, sp['y'] + ry * half_w_px  # kerb line
         hd = math.radians(state['heading'])
         fcx, fcy = math.sin(hd), math.cos(hd)      # car forward

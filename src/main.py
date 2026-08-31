@@ -147,7 +147,12 @@ def main(smoke_test_frames: int = 0):
         # (+) / the left side of the road (-). The offset is returned so
         # _create_car can hand it to the nav (the car must HOLD this line,
         # not re-center onto the nominal lane).
-        offset_m = min(LANE_OFFSET_DEFAULT_M, kerb_offset_m(_seg.width)) + lat_off
+        # Road-aware normal position: on multi-lane carriageways that is
+        # the centre of the outermost DRIVING lane (next to the parking
+        # lane), not a fixed 1.75 m - see config.lane_base_offset_m.
+        offset_m = lane_base_offset_m(_seg.width, _seg.lanes,
+                                      _seg.parking_lane_width, _seg.oneway) \
+            + lat_off
         rx += math.cos(rad) * offset_m * PIXELS_PER_METER
         ry -= math.sin(rad) * offset_m * PIXELS_PER_METER
 

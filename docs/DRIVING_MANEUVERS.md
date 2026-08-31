@@ -89,30 +89,67 @@ zu verlassen – und hält.
   zurück auf die Fahrbahn, Blinker aus) – der Nudge behält die erreichte
   Randseite bei.
 
-### Variante: Rückwärts einparken aus verschiedenen Startquerlagen
+### Variante: Einparken aus verschiedenen Startquerlagen
 
-**Anforderung:** Das Rückwärtseinparken (Back-in) muss unabhängig von der
-Startquerlage funktionieren – aus jedem lateralen Abstand zum rechten
-Bordstein innerhalb der Fahrbahn. In der Realität zwingen andere parkende
-Autos dazu, weiter links zu fahren; ein Back-in-Plan darf sich nicht nur für
-den Fall „direkt am Rand startend" aufbauen lassen.
+**Anforderung:** Das Einparken (Back-in) muss unabhängig von der
+Startquerlage funktionieren – aus jeder Spur auf unserer Straßenseite.
+In der Realität zwingen andere parkende Autos dazu, weiter links zu fahren;
+ein Parkplan darf sich nicht nur für den Fall „direkt am Rand startend"
+aufbauen lassen.
 
-**Test (basic map):** Neue e2e-Scenario-Familie auf einer geraden,
-zweispurigen Einbahnstraße (eine Fahrtrichtung, keine Kreuzungen, keine
-Hindernisse). Route und Ziel-Flagge am rechten Rand bleiben in allen Fällen
-gleich – variiert wird ausschließlich die laterale Startposition:
+**Test (basic map):** e2e-Scenario-Familie auf einer geraden **Park-Avenue**
+(Tile 4,1, keine Kreuzungen, keine Hindernisse): zweispurig, pro Richtung
+zwei 3,5-m-Fahrspuren plus eine 2,7-m-Parkspur am Bordstein (19,4 m breit,
+gesamt 6 Spuren). Die Mittellinie ist **durchgezogen** (Überfahren =
+Gegenverkehr), in beiden Parkspuren stehen alle 100 m weiße „P"-Markierungen.
+Parkspuren enden mindestens **5 m vor einer Kreuzung** – auch visuell
+(`config.PARK_LANE_END_GAP_M`). Route und Ziel-Flagge am rechten Rand bleiben
+in allen Fällen gleich; variiert wird ausschließlich die laterale
+Startposition – immer auf unserer Straßenseite (Offsets relativ zur
+Normalposition = Mitte der äußeren Fahrspur, 5,25 m von der Mittellinie):
 
 | # | Startquerlage |
 |---|---------------|
-| 1 | fast am rechten Rand (so nah am Bordstein wie möglich) |
-| 2 | Mitte der rechten Spur |
-| 3 | Mitte der Straße (Mittellinie) |
-| 4 | Mitte der linken Spur |
-| 5 | ganz links (am linken Rand) |
+| 1 | Mitte der linken (Überhol-)Fahrspur (−3,50) |
+| 2 | Mitte der rechten (normalen) Fahrspur (0,0) |
+| 3 | Mitte der Parkspur (+3,10) |
 
-**Erfolgskriterium:** In allen fünf Fällen vollendet das Auto den Back-in an
-der Flagge: parallel zum Rand, so nah am Bordstein wie erlaubt, `parked == true` –
-dasselbe Endbild unabhängig von der Startquerlage.
+**Spurwechsel vor dem Parken:** Startet das Auto LINKS von der Normalposition
+(linke Fahrspur), wechselt es erst nach rechts – ein menschlicher Fahrer
+parkt nie aus der Überholspur. Startet es IN DER PARKSPUR, wechselt es erst
+nach links zurück in den Verkehr: **In der Parkspur darf nicht gefahren,
+sondern nur parkiert werden** (Nutzerregeln; beide Regeln ersetzen die alte
+Regel vom 2026-08-27, die Startlinie bis zur Flagge zu halten).
+
+Der Spurwechsel erfolgt **zügig und mit geschwindigkeitsabhängiger Distanz**
+(Nutzerregel): er dauert etwa `LANE_CHANGE_TIME_S` (2,5 s), also
+Distanz = Geschwindigkeit × 2,5 s (begrenzt auf 20–90 m). Die Referenzlinie
+blendet über diese Distanz in die rechte Fahrspur und ist
+`MERGE_SETTLE_BEFORE_M` (40 m) vor der Flagge dort; erst dann übernimmt die
+Parksequenz (vorbeifahren + Back-in), geplant von der Normalposition aus.
+**Vor dem Spurwechsel wird immer geblinkt** (Nutzerregel): der Blinker geht
+`MERGE_SIGNAL_AHEAD_M` (30 m) vor Zonenbeginn an und bleibt an, bis das Auto
+die neue Linie erreicht hat. Die Blendlänge wird eingefroren, sobald
+das Auto den Wechsel begonnen hat (kein Nachplanen unter den Rädern).
+Starts innerhalb des Fahrstreifens (rechts von der Normalposition, aber noch
+nicht in der Parkspur) halten ihre Linie.
+
+Zwei Fallstricke, die den Wechsel sonst wieder verschleppen (gemessen):
+1. Die Eintrittsgeschwindigkeit ist **nicht** das Profil: Das Profil ist ein
+   Limit, keine Vorhersage – vom Stand aus baut das Auto nur A_CRUISE pro
+   Meter auf. Geplant wird mit min(Profil, Aufbau) iterativ über die Zone.
+2. Auf geraden Routen muss der Krümmungs-Solver von `min_curvature_offsets`
+   übersprungen werden: Er minimiert die zweite Ableitung des Offsetprofils
+   und streckt einen 35 m-Blend auf ~180 m (gemessen). Gerade = konstanter
+   Offset = null Krümmung = bereits optimum; der Solver läuft nur dort,
+   wo die Straße wirklich krümmt. Der Spawn in der Parkspur (8,35 m) liegt
+   0,37 m außerhalb des legalen Korridors (hi = 7,98 m) und wird dort
+   geklemmt – das Auto gleitet erst kurz nach innen, dann Spurwechsel.
+
+**Erfolgskriterium:** In allen drei Fällen vollendet das Auto den Parkvorgang
+an der Flagge: parallel zum Rand, so nah am Bordstein wie erlaubt (in der
+Parkspur), `parked == true` – dasselbe Endbild unabhängig von der
+Startquerlage.
 
 ---
 

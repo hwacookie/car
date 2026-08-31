@@ -414,7 +414,11 @@ class Renderer:
         # Plain road centerlines vs. the Autobahn Leitlinie (RQ 31:
         # 6 m dash / 12 m gap).
         c_dash_px, c_gap_px = 3.0 * pppm, 3.0 * pppm
-        l_dash_px, l_gap_px = 6.0 * pppm, 12.0 * pppm
+        # Lane dividers: fine dashes (short dash, short gap) - the old
+        # 6 m / 12 m pattern read as a broken line, not a lane line.
+        l_dash_px, l_gap_px = 2.0 * pppm, 4.0 * pppm
+        # Parking-lane boundary: even finer dashes (user decision).
+        p_dash_px, p_gap_px = 1.0 * pppm, 1.0 * pppm
 
         # Fade the markings out as zoom decreases: a dash's on-screen
         # length (dash_px * zoom) below ~1 px is just flickering noise.
@@ -426,14 +430,18 @@ class Renderer:
         a_c = dash_alpha(c_dash_px)
         lane_marks = self.network.get_lane_markings()
         a_l = dash_alpha(l_dash_px) if lane_marks else 0
+        a_pd = dash_alpha(p_dash_px) if any(s == "p_dash" for s, *_ in lane_marks) else 0
         # One-way direction arrows fade with the same zoom rule as the
         # other markings (their ~3 m length sets the on-screen size).
         a_a = dash_alpha(3.0 * pppm)
-        if a_c > 0 or a_l > 0 or a_a > 0:
+        # Painted P marks in parking lanes (~2 m tall letters).
+        park_marks = self.network.get_parking_marks()
+        a_p = dash_alpha(2.0 * pppm) if park_marks else 0
+        if a_c > 0 or a_l > 0 or a_pd > 0 or a_a > 0 or a_p > 0:
             # Any alpha < 255 needs a per-pixel-alpha overlay; full
             # opacity can draw straight onto the screen surface.
             need_overlay = (0 < a_c < 255) or (0 < a_l < 255) \
-                or (0 < a_a < 255)
+                or (0 < a_pd < 255) or (0 < a_a < 255) or (0 < a_p < 255)
             target = surface if not need_overlay else pygame.Surface((w, h), pygame.SRCALPHA)
             if a_c > 0:
                 # Width-filtered set (>= CENTERLINE_MIN_WIDTH_M) - the
@@ -451,6 +459,9 @@ class Renderer:
                     if style == "dashed":
                         self._draw_dashed_polyline(target, coords, l_dash_px,
                                                    l_gap_px, w, h, a_l, xform)
+                    elif style == "p_dash":
+                        self._draw_dashed_polyline(target, coords, p_dash_px,
+                                                   p_gap_px, w, h, a_pd, xform)
                     elif style == "solid":
                         self._draw_solid_polyline(target, coords, w, h, a_l,
                                                   width_m, xform=xform)
@@ -464,6 +475,14 @@ class Renderer:
                 col = ((255, 255, 255, a_a) if need_overlay
                        else (255, 255, 255))
                 for poly in self.network.get_oneway_arrows():
+                    pygame.draw.polygon(target, col,
+                                        [xform(*p) for p in poly])
+            if a_p > 0:
+                # Painted P marks in parking lanes (both kerbs on two-way
+                # roads); they end >= PARK_LANE_END_GAP_M before junctions.
+                col = ((255, 255, 255, a_p) if need_overlay
+                       else (255, 255, 255))
+                for poly in park_marks:
                     pygame.draw.polygon(target, col,
                                         [xform(*p) for p in poly])
             if target is not surface:

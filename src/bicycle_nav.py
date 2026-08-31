@@ -601,6 +601,23 @@ class BicycleNav:
     # Pull-out: from right edge into normal lane (symmetric to park).
     PULL_OUT_START_M = 20.0
     PULL_OUT_END_M = 5.0
+    # Lane change before parking (docs §1 variant on multi-lane roads):
+    # a human in the overtaking lane changes lanes RIGHT first - well
+    # before the spot - and only then parks; nobody backs in from the
+    # left lane. A car starting IN THE PARKING LANE changes lanes LEFT
+    # back into traffic: the parking lane is for parking, not for
+    # travelling (user rules; replace the "hold initial line" rule of
+    # 2026-08-27).
+    # The lane change takes ~LANE_CHANGE_TIME_S (brisk, user rule) - so the
+    # DISTANCE it covers is speed dependent: L = v * T (user rule), clamped.
+    LANE_CHANGE_TIME_S = 2.5
+    MERGE_LEN_MIN_M = 20.0        # crawl-speed floor for the blend length
+    MERGE_LEN_MAX_M = 90.0        # high-speed cap
+    MERGE_SETTLE_BEFORE_M = 40.0  # blend must end this far before the flag
+    # The blinker comes on this far BEFORE the lane change starts (user
+    # rule: always signal before changing lanes) and stays on until the
+    # car has settled onto the new line.
+    MERGE_SIGNAL_AHEAD_M = 30.0
     # Lookahead (m) used to track the straight edge line in the final
     # pull-over stretch. Kept short so the car corrects its lateral offset
     # onto the edge quickly and holds the wheels parallel to the curb before
@@ -774,6 +791,15 @@ class BicycleNav:
         # Reverse-in parking (docs §1b): style of the current approach,
         # how much of the pull-over is left to the reverse tuck, and how far
         # ahead of the final spot the car stops first.
+        # Lane-change episode (merge before parking): the zone [s0, s1] on
+        # the current reference line, its direction, and the speed-dependent
+        # blend length (frozen once committed - see _merge_params).
+        self._merge_episode = None           # (s0, s1, 'left'|'right') or None
+        self._merge_key = None               # episode identity (dest, spawn)
+        self._merge_len = None               # frozen blend length for the episode
+        # Blinker state for the driver: which indicator to show while a
+        # lane change is pending/active (None = no lane-change signal).
+        self.lane_change_signal = None       # 'left' | 'right' | None
         self._park_style = 'forward'        # forward | reverse
         self._park_style_locked = False     # decided once per destination
         self._park_tuck = 0.0
@@ -858,18 +884,159 @@ class BicycleNav:
     def _lane_base_offset(self, max_offset: float) -> float:
         """Nominal lane offset for this run (m right of the centreline).
 
-        Normally the right-lane centre. If the car was SPAWNED with a
-        lateral offset (named start points with lateral_offset_m - the
-        parking-offset scenarios, docs §1 variant), that position is the
-        nominal one: the car holds its initial line up to the flag and
-        parks from it, instead of re-centering first (explicit decision
-        2026-08-27). Clamped to what the road allows.
+        The SETTLED line: the road's normal position - centre of the
+        outermost DRIVING lane on multi-lane carriageways, fixed 1.75 m
+        elsewhere (config.lane_base_offset_m) - clamped to what the route
+        allows. If the car was SPAWNED at/right of that position (named
+        start points with lateral_offset_m - the parking-lane scenario),
+        the spawn line is the nominal one: the car holds it up to the flag
+        and parks from it. Spawned LEFT of it, the car merges right onto
+        this line first (see _merge_params) and parks from HERE - nobody
+        backs in from the overtaking lane (user decision, replaces the
+        "hold initial line" rule of 2026-08-27).
         """
-        base = min(self.LANE_OFFSET_M, max_offset)
+        seg = self._dest_segment() or self.network.segments[self.car.seg_idx]
+        base = min(config.lane_base_offset_m(seg.width, seg.lanes,
+                                             seg.parking_lane_width,
+                                             seg.oneway), max_offset)
         ovr = getattr(self.car, 'lane_offset_override_m', None)
         if ovr is not None:
-            base = max(0.0, min(ovr, max_offset))
+            o_spawn = max(0.0, min(ovr, max_offset))
+            # The parking lane is for PARKING, not for travelling (user
+            # rule): a car spawned in it re-joins the driving lane first
+            # and parks from there - the settled line stays at the normal
+            # position, NOT the spawn line. Spawned inside the DRIVING
+            # strip: hold the spawn line (docs §1 variant).
+            drive_edge = seg.width / 2.0 - seg.parking_lane_width
+            if not o_spawn > drive_edge + 0.25:
+                base = max(base, o_spawn)
         return base
+
+    def _merge_params(self, rounded, max_offset: float):
+        """Lane-change blend for solve_line (docs §1 variant on multi-lane
+        roads): (from_m, s0, s1) or None when the car holds its line.
+
+        Applies to a spawned lateral offset OUTSIDE the normal driving lane
+        with a flag destination ahead: LEFT of it (overtaking lane) the car
+        changes lanes RIGHT onto the normal line; INSIDE THE PARKING LANE
+        it changes lanes LEFT back into traffic - the parking lane is for
+        parking, not for travelling (user rule). The blend runs over
+        MERGE_BLEND_LEN_M and finishes MERGE_SETTLE_BEFORE_M before the
+        flag, where the parking sequence (drive past + back-in) takes over
+        from the settled line.
+        """
+        ovr = getattr(self.car, 'lane_offset_override_m', None)
+        if ovr is None or self._dest is None:
+            if PARK_DEBUG:
+                print(f"[MERGE] none: ovr={ovr} dest={self._dest}")
+            return None
+        seg = self._dest_segment()
+        if seg is None:
+            if PARK_DEBUG:
+                print("[MERGE] none: no dest segment")
+            return None
+        o_norm = min(config.lane_base_offset_m(seg.width, seg.lanes,
+                                               seg.parking_lane_width,
+                                               seg.oneway), max_offset)
+        o_spawn = max(0.0, min(ovr, max_offset))
+        drive_edge = seg.width / 2.0 - seg.parking_lane_width
+        if not (o_spawn < o_norm - 0.25 or o_spawn > drive_edge + 0.25):
+            self._merge_episode = None
+            if PARK_DEBUG:
+                print(f"[MERGE] hold: o_spawn={o_spawn:.2f} o_norm={o_norm:.2f} "
+                      f"drive_edge={drive_edge:.2f}")
+            return None                      # inside the driving strip: hold
+        s_dest = self._dest_arc_s_on(rounded)
+        if s_dest is None or s_dest < 30.0:
+            self._merge_episode = None
+            if PARK_DEBUG:
+                print(f"[MERGE] none: s_dest={s_dest}")
+            return None                      # not on this line / too close
+        s1 = max(20.0, s_dest - self.MERGE_SETTLE_BEFORE_M)
+        direction = 'right' if o_spawn < o_norm else 'left'
+        # Speed-dependent blend length (user rule): the lane change takes
+        # ~LANE_CHANGE_TIME_S, so L scales with the speed DURING the blend -
+        # i.e. at zone entry, not at the end (sizing to the exit speed
+        # stretches a 2.5 s change into a crawl when the car is still
+        # accelerating in). The profile alone is the wrong estimate: it is
+        # a CAP, not a prediction - from spawn the car can only build up
+        # A_CRUISE per metre, so its ACTUAL entry speed is min(cap, built).
+        # Iterate (s0 = s1 - L, v = entry(s0), L = v*T); both terms are
+        # monotone in s0 before the braking ramp, so it settles fast.
+        v_ref = self.car.speed
+        if self._profile:
+            last = len(self._profile) - 1
+            L_g = self.MERGE_LEN_MIN_M
+            for _ in range(3):
+                s0_g = max(0.0, s1 - L_g)
+                v_build = math.sqrt(
+                    self.car.speed ** 2 +
+                    2.0 * self.A_CRUISE * max(0.0, s0_g - self._s))
+                v_entry = min(self._target_speed(min(s0_g, last)), v_build)
+                L_g = min(self.MERGE_LEN_MAX_M,
+                          max(self.MERGE_LEN_MIN_M,
+                              v_entry * self.LANE_CHANGE_TIME_S))
+            # The live speed guards against planning from far away (speed
+            # ~0); the estimate is stable per route, so L is too.
+            v_ref = max(v_ref, v_entry)
+        key = (self._dest, round(o_spawn, 2))
+        if getattr(self, '_merge_key', None) != key:
+            self._merge_key = key
+            self._merge_len = None           # new episode: recompute L
+        L = self._merge_len
+        if L is None:
+            L = min(self.MERGE_LEN_MAX_M,
+                    max(self.MERGE_LEN_MIN_M, v_ref * self.LANE_CHANGE_TIME_S))
+            # Freeze once the car has committed to the change (at/near the
+            # zone): re-planning the length under the wheels would step the
+            # reference line laterally and pursuit would overshoot it.
+            if s1 - self._s <= L + 15.0:
+                self._merge_len = L
+        s0 = max(0.0, s1 - L)
+        if PARK_DEBUG:
+            print(f"[MERGE] plan: o_spawn={o_spawn:.2f} o_norm={o_norm:.2f} "
+                  f"s_dest={s_dest:.1f} s1={s1:.1f} v_ref={v_ref:.1f} "
+                  f"L={L if L is None else round(L, 1)} s0={s0:.1f}")
+        if s1 - s0 < 5.0:
+            self._merge_episode = None
+            return None
+        self._merge_episode = (s0, s1, direction)
+        return (o_spawn, s0, s1)
+
+    @staticmethod
+    def _merge_kwargs(merge) -> dict:
+        """solve_line kwargs for a _merge_params result ({} to hold line)."""
+        if merge is None:
+            return {}
+        o_spawn, s0, s1 = merge
+        return dict(merge_from_m=o_spawn, merge_s0=s0, merge_s1=s1)
+
+    def _dest_arc_s_on(self, pts) -> float | None:
+        """Arc length (m) of the destination along `pts`, or None when it
+        is not on this line (same 10 m guard as _cut_polyline_at)."""
+        if self._dest is None or len(pts) < 2:
+            return None
+        x, y = self._dest
+        best_i, best_t, best_d2 = 0, 0.0, float("inf")
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            vx, vy = pts[i + 1][0] - x0, pts[i + 1][1] - y0
+            l2 = vx * vx + vy * vy
+            if l2 < 1e-12:
+                continue
+            t = max(0.0, min(1.0, ((x - x0) * vx + (y - y0) * vy) / l2))
+            d2 = ((x0 + t * vx - x) ** 2 + (y0 + t * vy - y) ** 2)
+            if d2 < best_d2:
+                best_i, best_t, best_d2 = i, t, d2
+        if best_d2 > (10.0 * PPPM) ** 2:
+            return None
+        s = 0.0
+        for i in range(best_i):
+            s += math.hypot(pts[i + 1][0] - pts[i][0],
+                            pts[i + 1][1] - pts[i][1])
+        vx, vy = (pts[best_i + 1][0] - pts[best_i][0],
+                  pts[best_i + 1][1] - pts[best_i][1])
+        return (s + best_t * math.hypot(vx, vy)) / PPPM
 
     def _decide_park_style(self):
         """Forwards, or forwards-then-reverse (docs §1b)? Decided ONCE per
@@ -946,10 +1113,11 @@ class BicycleNav:
               f"v={self.car.speed*3.6:.0f} km/h, in_turn="
               f"{self._in_turn_blend_zone(self._s)}]")
 
-    def _dest_segment_width(self) -> float:
-        """Width (m) of the road segment the destination sits on."""
+    def _dest_segment(self):
+        """The road segment the destination sits on (None if no destination
+        or it is not on the current route)."""
         if self._dest is None:
-            return self.network.segments[self.car.seg_idx].width
+            return None
         dx_, dy_ = self._dest
         best, best_d2 = None, float('inf')
         for idx in (self._route_seg_set or set(range(len(self.network.segments)))):
@@ -964,8 +1132,14 @@ class BicycleNav:
             d2 = (px - dx_) ** 2 + (py - dy_) ** 2
             if d2 < best_d2:
                 best_d2, best = d2, seg
-        return best.width if best is not None else \
-            self.network.segments[self.car.seg_idx].width
+        return best
+
+    def _dest_segment_width(self) -> float:
+        """Width (m) of the road segment the destination sits on."""
+        seg = self._dest_segment()
+        if seg is not None:
+            return seg.width
+        return self.network.segments[self.car.seg_idx].width
 
     def _stop_margin(self) -> float:
         """Distance (m) from the end of the reference line back to where
@@ -1300,6 +1474,11 @@ class BicycleNav:
         # position for the whole turn, in the wrong direction for right
         # turns, and had to be blended in and out, which is what made the
         # car S-wobble through bends.
+        # Pass 1 - provisional line WITHOUT the merge blend: the speed
+        # profile below must belong to THIS route, because the merge
+        # length is speed dependent (user rule) and planning it against
+        # the previous rebuild's profile read a dead-end braking ramp as
+        # "entry speed" and stretched the change to the 90 m cap.
         P, N, offsets, cum = raceline.solve_line(
             self.network, rounded, self._route_segments(),
             base_offset=base_offset)
@@ -1316,10 +1495,27 @@ class BicycleNav:
         if PARK_DEBUG:
             print(f"[REBUILD] key={key} old={self._route_key} "
                   f"car=({self.car.x:.0f},{self.car.y:.0f}) "
-                  f"v={self.car.speed*3.6:.0f} phase={getattr(self,'park_phase','?')}")
+                  f"v={self.car.speed*3.6:.0f} phase={getattr(self,'park_phase','?')} "
+                  f"merge={self._merge_episode}")
         self._route_key = key
         self._route_seg_set = self._route_segments()
         self._profile = self._build_speed_profile()
+        # Pass 2 - the merge blend, planned against the FRESH profile.
+        # A lateral blend does not change a straight road's curvature, so
+        # pass 1's profile stays valid for the re-solved line.
+        merge = self._merge_params(rounded, max_offset)
+        if merge is not None:
+            P, N, offsets, cum = raceline.solve_line(
+                self.network, rounded, self._route_segments(),
+                base_offset=base_offset, **self._merge_kwargs(merge))
+            lane = self._apply_end_blends(P, N, offsets, cum,
+                                          edge_offset=max_offset,
+                                          pulling_over=pulling_over,
+                                          pulling_out=pulling_out)
+            if self._dest is not None:
+                lane = self._cut_polyline_at(lane, *self._dest,
+                                             extend_m=self._park_stage_m)
+            self._ref = RefLine(lane)
         # Re-project the car onto the (new) reference line.
         self._s = project_s(self._ref, car.x, car.y, self._s)
 
@@ -1370,9 +1566,12 @@ class BicycleNav:
             (self.network.segments[i].width for i in self._route_segments()),
             default=7.0,
         )
+        max_offset = config.kerb_offset_m(min_width)
+        merge = self._merge_params(rounded, max_offset)
         P, N, offsets, cum = raceline.solve_line(
             self.network, rounded, self._route_segments(),
-            base_offset=self._lane_base_offset(config.kerb_offset_m(min_width)))
+            base_offset=self._lane_base_offset(max_offset),
+            **self._merge_kwargs(merge))
         lane = self._apply_end_blends(P, N, offsets, cum,
                                       edge_offset=config.kerb_offset_m(min_width),
                                       pulling_over=pulling_over,
@@ -2813,6 +3012,8 @@ class BicycleNav:
             if control.get("brake") or car.speed != 0.0:
                 car.speed = 0.0
             self.park_phase = 'stopped'
+            self.lane_change_signal = None
+            self._merge_episode = None
             car.target_speed = 0.0
             return
         # U-turn request (one-shot flag on the driver, set by keyboard/API).
@@ -2873,6 +3074,15 @@ class BicycleNav:
                 return
         pulling_over = plan is not None \
             and plan[0] in ('decel', 'swerve', 'final')
+        # Lane-change blinker (user rule: ALWAYS signal before changing
+        # lanes): on from MERGE_SIGNAL_AHEAD_M before the merge zone starts,
+        # off once the car has settled onto the new line (past s1).
+        self.lane_change_signal = None
+        ep = self._merge_episode
+        if ep is not None and self._ref is not None:
+            s0, s1, direction = ep
+            if s0 - self.MERGE_SIGNAL_AHEAD_M <= self._s < s1:
+                self.lane_change_signal = direction
         self._maybe_rebuild(pulling_over=pulling_over, pulling_out=pulling_out)
         ref = self._ref
         if ref is None or ref.total < 1e-3:

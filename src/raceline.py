@@ -93,9 +93,16 @@ def _band_solve(A: list[list[float]], b: list[float]) -> list[float]:
     return x
 
 
+def _base_at(base, i: int) -> float | None:
+    """`base` may be a scalar or a per-station profile (list)."""
+    if base is None:
+        return None
+    return base[i] if isinstance(base, (list, tuple)) else base
+
+
 def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
                           ds: float, max_rounds: int = 40,
-                          base: float | None = None) -> list[float]:
+                          base: float | list | None = None) -> list[float]:
     """Lateral offsets minimising line curvature inside [lo, hi].
 
     Minimise  sum_i ( kappa0_i - (o_{i-1} - 2 o_i + o_{i+1}) / ds^2 )^2
@@ -110,11 +117,14 @@ def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
     line settles at `base` instead of drifting to the corridor centre. On
     a wide one-way (no centreline bound) the corridor centre IS the middle
     of the road - which would make the car abandon its lane position.
+    `base` may also be a per-station PROFILE (list, same length as the
+    stations): each station then settles at its own nominal offset - used
+    for the merge-right blend before parking (docs §1 variant).
     """
     n = len(kappa0)
     if n < 5:
         return [max(lo[i], min(hi[i],
-                               base if base is not None
+                               _base_at(base, i) if _base_at(base, i) is not None
                                else 0.5 * (lo[i] + hi[i]))) for i in range(n)]
 
     inv = 1.0 / (ds * ds)
@@ -138,8 +148,9 @@ def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
         # 300 m one-way). base=None reproduces the old pull-toward-zero.
         for i in range(n):
             A[i][BW] += LAMBDA
+            _b = _base_at(base, i)
             b[i] += LAMBDA * max(lo[i], min(hi[i],
-                                            base if base is not None else 0.0))
+                                            _b if _b is not None else 0.0))
         # One residual row per interior station.
         for i in range(1, n - 1):
             for da, ca in stencil:
@@ -160,7 +171,8 @@ def min_curvature_offsets(kappa0: list[float], lo: list[float], hi: list[float],
         for i in (0, n - 1):
             if i not in pinned:
                 A[i][BW] += 1e-3
-                tgt = (max(lo[i], min(hi[i], base)) if base is not None
+                _b = _base_at(base, i)
+                tgt = (max(lo[i], min(hi[i], _b)) if _b is not None
                        else 0.5 * (lo[i] + hi[i]))
                 b[i] += 1e-3 * tgt
 
@@ -400,13 +412,22 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
 
 
 def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
-               base_offset: float | None = None):
+               base_offset: float | None = None,
+               merge_from_m: float | None = None,
+               merge_s0: float = 0.0, merge_s1: float = 0.0):
     """The fastest legal line for a route, as a dense uniform polyline.
 
     `base_offset` overrides the nominal lane offset used to pin straight
     sections (see min_curvature_offsets); default is the normal right-lane
     centre. The nav passes the car's spawn lateral position here so the
     car holds its initial line instead of re-centering (docs §1 variant).
+
+    Merge-right blend (docs §1 variant on multi-lane roads): with
+    `merge_from_m` given, stations before `merge_s0` settle at
+    `merge_from_m` (the spawn lane), stations from `merge_s1` on at
+    `base_offset`, and between them a smoothstep - the human-like "change
+    lanes right first, then park" instead of holding the overtaking lane
+    all the way to the kerb.
 
     Returns (points, normals, offsets, cum) sampled every ~ds metres.
 
@@ -422,6 +443,22 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
     base = (base_offset if base_offset is not None else
             min(config.LANE_OFFSET_DEFAULT_M,
                 config.kerb_offset_m(_min_width(network, route_seg_idx))))
+    if merge_from_m is not None and abs(merge_from_m - base) > 1e-6 \
+            and merge_s1 > merge_s0:
+        m0, m1 = merge_s0, merge_s1
+        span = max(1e-6, m1 - m0)
+        o_end = base          # the settled scalar (resolved above)
+        prof: list[float] = []
+        for s_ in S:
+            if s_ <= m0:
+                prof.append(merge_from_m)
+            elif s_ >= m1:
+                prof.append(o_end)
+            else:
+                t = (s_ - m0) / span
+                t = t * t * (3.0 - 2.0 * t)
+                prof.append(merge_from_m + (o_end - merge_from_m) * t)
+        base = prof
     if total < 4.0 or len(P) < 5:
         N, _ = _normals_and_curvature(P, ds)
         return P, N, [base] * len(P), S
@@ -430,7 +467,20 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
     props = _station_segments(network, route_seg_idx, P)
     junction = _junction_node_per_station(network, P)
     lo, hi = legal_corridor(network, P, N, props, junction)
-    o = min_curvature_offsets(K, lo, hi, ds, base=base)
+    # A straight route needs no curvature solving: a constant offset has
+    # ZERO curvature, which is already the optimum. Running the solver
+    # there would SMOOTH a per-station base profile - it minimises the
+    # profile's own second derivative, stretching the merge blend from its
+    # planned ~35 m zone to ~180 m and turning a brisk lane change into a
+    # crawl (measured: 8.35->5.25 over [75,110] came back as 7.7@45,
+    # 6.2@110, still converging at 120). The solver only earns its keep
+    # where the road actually curves.
+    if max((abs(k) for k in K), default=0.0) < 1e-4:
+        o = [max(lo[i], min(hi[i],
+                            _base_at(base, i) if _base_at(base, i) is not None
+                            else 0.5 * (lo[i] + hi[i]))) for i in range(len(K))]
+    else:
+        o = min_curvature_offsets(K, lo, hi, ds, base=base)
     return P, N, o, S
 
 
