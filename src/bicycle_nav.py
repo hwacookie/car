@@ -399,12 +399,12 @@ def project_s(ref: RefLine, x: float, y: float, s_hint: float,
                 best_d2 = d2
                 best_s = s
     # Optional refinement to centimetres. The coarse scan resolves the line
-    # only to ~1 m (30 m window / 60 steps), and for the parking plan that
-    # quantisation is not harmless: the plan derives its target speed from
-    # the distance to the stop point, so a staircase in s becomes a
-    # staircase in the brake demand (measured: the brake pulsing between 0
-    # and A_PARK every few frames, then a ~1 m overshoot past the stop
-    # point that tripped the emergency full-brake). Refinement is OFF for
+    # only to ~1 m (30 m window / 60 steps), and that quantisation is not
+    # harmless: for the parking plan a staircase in s becomes a staircase
+    # in the brake demand (measured: the brake pulsing between 0 and A_PARK
+    # every few frames, then a ~1 m overshoot past the stop point that
+    # tripped the emergency full-brake); for steering it lets the pursuit
+    # target land behind the car in tight corners. Refinement is OFF for
     # the steering projection on purpose - that is a behaviour change for
     # every manoeuvre on the map and is not part of this fix.
     if refine and step > 0.0:
@@ -766,6 +766,10 @@ class BicycleNav:
         self._route: list[str] = []
         self._route_key: tuple | None = None
         self._route_seg_set: set[int] = set()
+        self._route_exit_dir: str | None = None
+        self._route_exit_node: str | None = None
+        self._turn_signal_target: str | None = None
+        self._prev_pending_turn: str | None = None
         self._profile: list[float] = []
         self._s = 0.0
         # No pull-out on spawn: the car is placed in the normal driving
@@ -1304,6 +1308,11 @@ class BicycleNav:
         cur_node = junction
         # First hop: the signaled turn at the upcoming junction.
         turn = self._intended_turn()
+        # A roundabout exit that entered the horizon this build (node +
+        # turn direction), so _maybe_rebuild can re-arm the driver's
+        # signal for it - see there for why that matters.
+        self._route_exit_dir: str | None = None
+        self._route_exit_node: str | None = None
         for hop in range(self.HORIZON_SEGMENTS + 1):
             route.append(cur_node)
             if hop == 0:
@@ -1318,9 +1327,25 @@ class BicycleNav:
                 # Dead end or no further road - stop extending.
                 break
             nseg = net.segments[nxt]
+            # Leaving a one-way ring via a non-oneway spoke: remember the
+            # exit's geometric direction (negative=left, positive=right).
+            if hop > 0 and not nseg.oneway \
+                    and net.segments[cur_seg].oneway:
+                angle = net.get_exit_angle(cur_seg, nxt)
+                self._route_exit_dir = 'right' if angle >= 0 else 'left'
+                self._route_exit_node = cur_node
             # The node on the far side of the next segment.
             cur_node = nseg.end_node if nseg.start_node == cur_node else nseg.start_node
             cur_seg = nxt
+        # Off-by-one: the loop's last hop RESOLVES one more segment (its
+        # `nxt`) but never appends that segment's far node - so the final
+        # decision in the horizon (e.g. a roundabout exit at the last ring
+        # node) was known but not driven: the line ended at the junction
+        # with no fillet, no corridor and no braking ramp for it. Measured
+        # on the basic map's roundabout: the west exit entered the horizon
+        # only when the car was ~20 m from its corner at 65 km/h - infeasible.
+        if cur_node != route[-1]:
+            route.append(cur_node)
         return route
 
     def _next_after_first(self, cur_seg: int, cur_node: str, turn: str) -> int | None:
@@ -1503,6 +1528,47 @@ class BicycleNav:
                   f"car=({self.car.x:.0f},{self.car.y:.0f}) "
                   f"v={self.car.speed*3.6:.0f} phase={getattr(self,'park_phase','?')} "
                   f"merge={self._merge_episode}")
+        # --- Turn-signal lifecycle -------------------------------------
+        # Re-arm the signal for a roundabout exit that just entered the
+        # horizon: after the entry turn is executed, pending_turn is
+        # cleared (see below), but the exit still needs its intent -
+        # without it _intended_turn() is 'straight', which disables the
+        # junction approach cap at the exit node (gated on turn !=
+        # 'straight'); measured: the car cruised the ring at 65 km/h and
+        # arrived at the exit corner with ~20 m of braking distance.
+        # Re-flicking for the exit is what a driver does too.
+        d = car.driver
+        if (self._route_exit_dir is not None and d is not None
+                and hasattr(d, 'signal_turn')
+                and getattr(d, 'pending_turn', None) is None):
+            d.signal_turn(self._route_exit_dir)
+            self._turn_signal_target = self._route_exit_node
+            # Keep the key consistent with the re-armed intent, or every
+            # following frame would see a "turn change" and rebuild.
+            key = (car.seg_idx, self._route_exit_dir,
+                   pulling_over, pulling_out)
+        pending = getattr(d, 'pending_turn', None) if d is not None else None
+        # A fresh signal (API/keyboard, not the re-arm above): remember
+        # WHICH junction it is for - the one ahead of the car now.
+        if (pending is not None and self._prev_pending_turn is None
+                and self._turn_signal_target is None):
+            seg = self.network.segments[car.seg_idx]
+            self._turn_signal_target = (
+                seg.end_node if car.forward else seg.start_node)
+        # Auto-off: once the car has PASSED the junction the signal was
+        # for, clear light + intent. (The old steering-cam version cleared
+        # on any steering dip and killed multi-stage maneuvers mid-corner.
+        # After a node crossing the rebuild above puts the passed node at
+        # route[0] or drops it out of the route entirely.)
+        if pending is not None:
+            if (self._turn_signal_target is not None
+                    and self._turn_signal_target not in self._route[1:]):
+                d._clear_turn_signal()
+                self._turn_signal_target = None
+        else:
+            self._turn_signal_target = None
+        self._prev_pending_turn = (
+            getattr(d, 'pending_turn', None) if d is not None else None)
         self._route_key = key
         self._route_seg_set = self._route_segments()
         self._profile = self._build_speed_profile()
@@ -3136,9 +3202,22 @@ class BicycleNav:
         h = math.radians(car.heading)
         local_right = dx * math.cos(h) - dy * math.sin(h)
         local_forward = dx * math.sin(h) + dy * math.cos(h)
-        if local_forward < 0.5:
-            local_forward = 0.5
-        delta = math.atan2(local_right, local_forward)
+        if local_forward <= 0.0:
+            # Aim point at or BEHIND us: happens in tight corners where the
+            # s-projection (coarse window scan, ~0.5-1 m resolution) lags
+            # the car while the high-curvature lookahead (0.5 m) is shorter
+            # than that lag. Aiming at a point behind commands a hard
+            # counter-steer and oscillates the car in place until it leaves
+            # the road (measured: roundabout entry, test 17 - heading sawed
+            # 190 -> 178 -> 210 deg at 9 km/h while s sat on a quantisation
+            # step). Align with the line's tangent instead: that is what a
+            # driver does when the aim point slips behind.
+            lh = math.radians(ref.heading_at(self._s))
+            delta = math.atan2(math.sin(lh - h), math.cos(lh - h))
+        else:
+            if local_forward < 0.5:
+                local_forward = 0.5
+            delta = math.atan2(local_right, local_forward)
         delta = max(-self.MAX_STEER, min(self.MAX_STEER, delta))
 
         # No steering override while pulling out. The reference line

@@ -104,17 +104,6 @@ class BicycleDriver(Driver):
         # API; consumed by BicycleNav on the next frame.
         self.uturn_requested = False
         self._uturn_was_active = False
-        # Mechanical indicator auto-off (like a real car's steering cam):
-        # the signal cancels itself once the wheel has been turned IN by at
-        # least STEER_IN_DEG in the signaled direction and is now back
-        # within BACK_CENTRE_DEG of straight - "steered in, then steered
-        # back". Deliberately NOT tied to road geometry (junctions,
-        # segment changes): a plain 90-degree corner with no junction node
-        # must cancel the blinker too. Gentle approach curves steer only a
-        # couple of degrees (delta = atan(WHEELBASE / R_path)), so they
-        # never reach STEER_IN_DEG and cannot cancel a signal that is meant
-        # for a junction further ahead.
-        self._steer_extreme = 0.0   # signed max in-direction steer since signal-on (deg)
         # Remember whether we were just pulling out of the kerb, so the
         # pull-out blinker can be switched off exactly once - see the
         # elif chain in get_control (a bare `_pull_out_frames <= 0` test
@@ -137,17 +126,16 @@ class BicycleDriver(Driver):
 
     HAZARD_MIN_DISPLAY_S = 5.0
 
-    # Mechanical blinker auto-off thresholds (see _steer_extreme).
-    # STEER_IN_DEG: how far the wheel must have been turned toward the
-    # signal before the "cam" arms. ~1/3 of full lock (MAX_STEER = 38 deg):
-    # any real corner sweeps well past it, while ordinary road curvature
-    # (R >= ~50 m means delta <= ~3 deg) never does - so a signal for a
-    # junction ahead survives gentle approach curves.
-    STEER_IN_DEG = 12.0
-    # BACK_CENTRE_DEG: the wheel must be this close to straight again
-    # before the cam clicks the indicator off (mid-sweep it is still far
-    # from centre, so the signal always survives the turn itself).
-    BACK_CENTRE_DEG = 6.0
+    # NOTE: the old steering-cam auto-off (STEER_IN_DEG / BACK_CENTRE_DEG,
+    # clearing pending_turn once the wheel steered in and back to centre)
+    # is gone: it cleared the intent on any steering DIP, which broke
+    # multi-decision-point maneuvers - measured on the roundabout, it fired
+    # mid-approach to the exit corner (pure-pursuit dips below 6 deg while
+    # the extreme had already hit 38), so the route reverted to 'straight'
+    # and the car skipped the exit. pending_turn is now cleared by the nav
+    # when the car actually PASSES the junction the signal was for
+    # (BicycleNav._turn_signal_target); _clear_turn_signal does both the
+    # light and the intent.
 
     def set_hazard(self, on: bool, reason: str = "") -> None:
         """Turn the hazard lights on/off (with logging).
@@ -186,38 +174,18 @@ class BicycleDriver(Driver):
             if self.blinker_left:
                 self.blinker_right = False
                 self.pending_turn = "left"
-                self._steer_extreme = 0.0
             else:
                 self.pending_turn = None
-                self._steer_extreme = 0.0
         if right and not self._last_right:
             self.blinker_right = not self.blinker_right
             if self.blinker_right:
                 self.blinker_left = False
                 self.pending_turn = "right"
-                self._steer_extreme = 0.0
             else:
                 self.pending_turn = None
-                self._steer_extreme = 0.0
 
         self._last_left = left
         self._last_right = right
-
-        # Indicator auto-off - MECHANICAL, like a real car's steering cam:
-        # off once we have steered IN (>= STEER_IN_DEG toward the signal)
-        # and then steered back toward centre. Not tied to road geometry.
-        if self.pending_turn in ('left', 'right'):
-            steer_deg = math.degrees(getattr(car, 'steer_angle', 0.0))
-            if self.pending_turn == 'right':
-                self._steer_extreme = max(self._steer_extreme, steer_deg)
-                steered_in = self._steer_extreme >= self.STEER_IN_DEG
-                back_centre = steer_deg < self.BACK_CENTRE_DEG
-            else:
-                self._steer_extreme = min(self._steer_extreme, steer_deg)
-                steered_in = self._steer_extreme <= -self.STEER_IN_DEG
-                back_centre = steer_deg > -self.BACK_CENTRE_DEG
-            if steered_in and back_centre:
-                self._clear_turn_signal()
 
         # W/S for speed control (manual override)
         accel = keys[pygame.K_UP] or keys[pygame.K_w]
@@ -363,10 +331,9 @@ class BicycleDriver(Driver):
         return chosen != straight
 
     def signal_turn(self, direction: str):
-        """Arm a turn signal (used by the REST API one-shot commands).
-        Resets the mechanical auto-off accumulator so a stale steering
-        history from an earlier maneuver can never clear the new signal.
-        """
+        """Arm a turn signal (used by the REST API one-shot commands and
+        by BicycleNav's roundabout-exit re-arm). The nav clears it again
+        when the car passes the junction the signal was for."""
         self.pending_turn = direction
         if direction == 'left':
             self.blinker_left = True
@@ -374,13 +341,11 @@ class BicycleDriver(Driver):
         else:
             self.blinker_right = True
             self.blinker_left = False
-        self._steer_extreme = 0.0
 
     def _clear_turn_signal(self):
         self.blinker_left = False
         self.blinker_right = False
         self.pending_turn = None
-        self._steer_extreme = 0.0
 
     def get_name(self) -> str:
         return "BICYCLE"

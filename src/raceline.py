@@ -313,6 +313,10 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
         network._raceline_safe = safe
         network._raceline_safe_prep = prep(safe)
     safe_prep = network._raceline_safe_prep
+    # Ground-truth fallback (see reach4): the exact rule the live off-road
+    # check enforces - four corners within tolerance of the RAW pavement.
+    raw_pav = network.get_paved_polygon()
+    tol_px = config.ROAD_EDGE_TOLERANCE_M * PPPM
 
     def reach(px, py, nx, ny, sign):
         """Bisect outward along +-normal for the last on-pavement offset."""
@@ -336,6 +340,47 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
                 bad = mid
         return good
 
+    # A ray reading this small is never a real kerb: approaching a genuine
+    # edge the reach tapers smoothly, it does not cliff to centimetres.
+    # That pattern means the eroded set has a NOTCH at the probe point -
+    # measured at the roundabout entry, where the spoke's round end-cap
+    # meets the narrow ring band: 7 cm reported although a full car fits
+    # 1.5 m further out (four-corner test). The pin that caused the line
+    # to kink to a 1.6 m radius - tighter than the car can steer.
+    SUSPICIOUS_REACH_M = 0.3
+
+    def reach4(px, py, nx, ny, sign):
+        """Re-measure one direction with the game's actual rule: bisect
+        over offsets while testing whether a full car (four corners within
+        tolerance of the raw pavement - exactly what is_car_on_road checks)
+        fits with its rear axle at P + o*N, heading along the tangent.
+        ~13x slower than the ray, so only used for suspicious readings."""
+        h = math.atan2(-ny, nx)          # forward = (sin h, cos h) = tangent
+        fx, fy = math.sin(h), math.cos(h)
+        rx, ry = math.cos(h), -math.sin(h)
+        hl = 4.5 / 2.0 * PPPM           # is_car_on_road's body defaults
+        hw = config.CAR_WIDTH / 2.0 * PPPM
+
+        def fits(o):
+            cx = px + nx * sign * o * PPPM
+            cy = py + ny * sign * o * PPPM
+            for sfx in (1.0, -1.0):
+                for srx in (1.0, -1.0):
+                    if raw_pav.distance(Point(cx + sfx * fx * hl + srx * rx * hw,
+                                               cy + sfx * fy * hl + srx * ry * hw)) > tol_px:
+                        return False
+            return True
+        if not fits(0.0):
+            return None                  # car doesn't even fit here: keep ray
+        good, bad = 0.0, 8.0
+        for _ in range(9):
+            mid = 0.5 * (good + bad)
+            if fits(mid):
+                good = mid
+            else:
+                bad = mid
+        return good
+
     centre_limit = config.CAR_WIDTH / 2.0 + config.LANE_CENTRE_MARGIN_M
 
     # Probe the pavement only every `stride` stations and interpolate
@@ -352,7 +397,15 @@ def legal_corridor(network, P, N, station_props, junction_nodes=None):
     for i in knots:
         px, py = P[i]
         nx, ny = N[i]
-        probe[i] = (reach(px, py, nx, ny, +1.0), reach(px, py, nx, ny, -1.0))
+        r = (reach(px, py, nx, ny, +1.0), reach(px, py, nx, ny, -1.0))
+        # Suspicious reading -> ground-truth re-measurement of that side
+        # only (a few knots per route at most; ~1 ms each).
+        for k in range(2):
+            if r[k] is not None and r[k] < SUSPICIOUS_REACH_M:
+                v = reach4(px, py, nx, ny, +1.0 if k == 0 else -1.0)
+                if v is not None:
+                    r = (v, r[1]) if k == 0 else (r[0], v)
+        probe[i] = r
 
     def probed(i, k, fallback):
         v = probe[i][k]
@@ -552,18 +605,44 @@ def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
     3.46 m mechanical minimum and make the speed profile crawl. Dense
     uniform stations keep every vertex-to-vertex bend small.
     """
+    # How far the driven line may deviate from the nominal lane position.
+    # The curvature objective alone lets the solver abandon its lane by a
+    # metre or more wherever that widens an arc (measured on the
+    # roundabout entry: offset swung +1.2 -> -0.48 across a 7 m corner -
+    # 1.9 m of lateral swing in one turn, which no pure-pursuit controller
+    # can follow at entry speed; the car drifted ~1 m inside and clipped
+    # the kerb). A human stays in their lane through the crossing and lets
+    # the corner be a metre or two tighter; that is what this band encodes.
+    LANE_BAND_M = 0.5
+
     P, S, total = _resample(rounded, ds)
     props = _station_segments(network, route_seg_idx, P)
     N, K = _normals_and_curvature(P, ds)
     junction = _junction_node_per_station(network, P)
     lo, hi = legal_corridor(network, P, N, props, junction)
     if auto_base:
-        base = _auto_base_profile(props, S, lo=lo, hi=hi)
+        base_prof = _auto_base_profile(props, S, lo=lo, hi=hi)
     elif base_offset is not None:
-        base = base_offset
+        # e2e spawns set lane_offset_override_m so the car holds its
+        # spawn line - a SCALAR nominal that does not follow road changes.
+        base_prof = [base_offset] * len(S)
     else:
-        base = min(config.LANE_OFFSET_DEFAULT_M,
-                   config.kerb_offset_m(_min_width(network, route_seg_idx)))
+        base_prof = [min(config.LANE_OFFSET_DEFAULT_M,
+                         config.kerb_offset_m(_min_width(network, route_seg_idx)))
+                    ] * len(S)
+    # Band the corridor around the nominal profile BEFORE solving: the
+    # optimiser then stays smooth (it eases along a bound it cannot cross),
+    # whereas clamping the solved offsets afterwards kinks the line wherever
+    # the solution crosses the band edge (measured: R = 2.1 m kink on the
+    # roundabout entry). Feasibility guard: where base +/- band lies outside
+    # the corridor (a wide-road spawn nominal on a narrow ring), fall back
+    # to the corridor itself instead of inverting it.
+    if merge_from_m is None:
+        for i in range(len(lo)):
+            lo[i] = max(lo[i], min(hi[i], base_prof[i] - LANE_BAND_M))
+            hi[i] = min(hi[i], max(lo[i], base_prof[i] + LANE_BAND_M))
+    base = base_prof if auto_base else (
+        base_offset if base_offset is not None else base_prof[0])
     settled = base if isinstance(base, float) else base[-1]
     if merge_from_m is not None and abs(merge_from_m - settled) > 1e-6 \
             and merge_s1 > merge_s0:

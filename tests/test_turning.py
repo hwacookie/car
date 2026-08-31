@@ -857,7 +857,8 @@ class TurnTester:
                       label: str | None = None, start_progress: float = 0.5,
                       kerb_check: bool = False,
                       end_flag_progress: float = END_FLAG_PROGRESS,
-                      expect_wrong_side: bool = False) -> dict:
+                      expect_wrong_side: bool = False,
+                      spawn_speed_kmh: float | None = None) -> dict:
         """Monitor a turn for violations.
         
         Args:
@@ -940,7 +941,12 @@ class TurnTester:
                   f"({start_progress * 100:.0f}% of segment)...")
             # Running turn tests spawn ALREADY MOVING (rolling start, no
             # standstill-to-cruise phase); parking tests start from rest.
-            rolling = None if kerb_check else RUNNING_START_KMH / 3.6
+            if kerb_check:
+                rolling = None
+            elif spawn_speed_kmh is not None:
+                rolling = spawn_speed_kmh / 3.6
+            else:
+                rolling = RUNNING_START_KMH / 3.6
             self.create_car_at_start_point(start_point, progress=start_progress,
                                            speed_mps=rolling)
             # Label under the minimap: the current test number ("10/15")
@@ -2007,6 +2013,10 @@ def main():
             speed = float(sys.argv[idx + 3])
             end_seg = int(sys.argv[idx + 4]) if len(sys.argv) > idx + 4 \
                 else None
+            # Optional: spawn speed in km/h (default: RUNNING_START_KMH
+            # rolling start). Pass 0 to start from a standstill.
+            spawn_kmh = float(sys.argv[idx + 5]) if len(sys.argv) > idx + 5 \
+                else None
             # Show the same "i/total" test number as a suite run does.
             test_no = next((n for n, t in enumerate(DETERMINISTIC_TESTS, 1)
                             if t[0] == start_point and t[1] == direction),
@@ -2015,7 +2025,8 @@ def main():
                                start_point=start_point, results=results,
                                expected_end_segment=end_seg,
                                label=f"{test_no}/{len(DETERMINISTIC_TESTS)}"
-                                     if test_no else None)
+                                     if test_no else None,
+                               spawn_speed_kmh=spawn_kmh)
             save_results(results)
             tester.print_summary()
         elif '--random' in sys.argv:
