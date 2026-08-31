@@ -16,6 +16,10 @@ class PhysicsValidator:
     
     State is tracked by car id — when a car is destroyed and replaced,
     the old entry simply goes stale. No skip/reset plumbing needed.
+
+    Violations are PER CAR (car_id -> log): each new car starts with an
+    empty counter, which is what parallel test runs (one car per test in
+    the same world) need.
     """
     
     HEADING_EPSILON_DEG = 0.05
@@ -23,9 +27,18 @@ class PhysicsValidator:
     
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self.violations: list[dict] = []  # log of all violations
+        # car_id -> log of that car's violations
+        self._violations_by_car: Dict[int, list] = {}
         # car_id -> (x, y, heading)
         self._last_state: Dict[int, Tuple[float, float, float]] = {}
+    
+    def violations_for(self, car) -> list:
+        """This car's violation log (empty for a new/unknown car)."""
+        return self._violations_by_car.get(getattr(car, "uid", id(car)), [])
+    
+    def count(self, car) -> int:
+        """Number of violations logged for this car."""
+        return len(self.violations_for(car))
     
     def enable(self):
         self.enabled = True
@@ -118,8 +131,10 @@ class PhysicsValidator:
             )
             print(msg)
             traceback.print_stack()
-            self.violations.append({
+            car_id = getattr(car, "uid", id(car))
+            self._violations_by_car.setdefault(car_id, []).append({
                 'type': 'off_road',
+                'car': car_id,
                 'position': (car.x, car.y),
                 'speed': car.speed,
                 'segment': car.seg_idx,

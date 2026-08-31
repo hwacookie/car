@@ -25,9 +25,11 @@ class LaneGuard:
         # Per-car state: car_id -> last lateral offset (m)
         self._last_offset: Dict[int, float] = {}
         
-        # Statistics
-        self.violations: int = 0          # number of frames on wrong side
-        self.violation_time: float = 0.0  # cumulative seconds on wrong side
+        # Statistics - PER CAR (car_id -> value): each new car starts at
+        # zero, which is what parallel test runs (one car per test in the
+        # same world) need. Stale entries for destroyed cars are harmless.
+        self._violations_by_car: Dict[int, int] = {}       # frames on wrong side
+        self._violation_time_by_car: Dict[int, float] = {}  # seconds on wrong side
     
     def enable(self):
         self.enabled = True
@@ -67,8 +69,10 @@ class LaneGuard:
         is_wrong = offset_m < (threshold - EPSILON)
         
         if is_wrong:
-            self.violations += 1
-            self.violation_time += dt
+            self._violations_by_car[car_id] = \
+                self._violations_by_car.get(car_id, 0) + 1
+            self._violation_time_by_car[car_id] = \
+                self._violation_time_by_car.get(car_id, 0.0) + dt
             # Only print once per crossing event (not every frame)
             if not was_wrong:
                 print(
@@ -130,9 +134,20 @@ class LaneGuard:
         car_id = getattr(car, "uid", id(car))
         self._last_offset.pop(car_id, None)
     
-    def stats(self) -> dict:
-        """Return a summary dict suitable for test reports."""
+    def stats(self, car=None) -> dict:
+        """Return a summary dict suitable for test reports.
+
+        With a car: that car's counters (zero for a new/unknown car).
+        Without: the whole-lifetime total over all cars (legacy behaviour).
+        """
+        if car is None:
+            frames = sum(self._violations_by_car.values())
+            secs = sum(self._violation_time_by_car.values())
+        else:
+            car_id = getattr(car, "uid", id(car))
+            frames = self._violations_by_car.get(car_id, 0)
+            secs = self._violation_time_by_car.get(car_id, 0.0)
         return {
-            "wrong_side_frames": self.violations,
-            "wrong_side_seconds": round(self.violation_time, 2),
+            "wrong_side_frames": frames,
+            "wrong_side_seconds": round(secs, 2),
         }

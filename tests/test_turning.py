@@ -340,6 +340,7 @@ START_POINT_NUMBER = {
     'sliver_approach': 13, 'sliver_from_west': 13, 'sliver_from_east': 13,
     'park_6lane_left_lane': 14, 'park_6lane_right_lane': 14,
     'park_6lane_parking': 14,
+    'mixed_from_west': 15, 'mixed_from_east': 16,
 }
 
 
@@ -381,6 +382,18 @@ DETERMINISTIC_TESTS = [
     # One-way street (legal direction)
     ('oneway_entry', 'straight', 50, 20, 60.0,
      "Entering a one-way street in the legal direction"),
+    # Mixed one-way/two-way crossroads (tile (4,2)): W spoke is one-way
+    # INTO the junction; entering from the west, the car must swing
+    # slightly right across the junction into its own lane on the two-way
+    # east side (the keep-centre-on-left rule does not apply on the
+    # one-way approach - no oncoming traffic there).
+    ('mixed_from_west', 'straight', 50, 111, 60.0,
+     "One-way into a two-way crossroads: straight through"),
+    # Mixed one-way/two-way crossroads (tile (4,3)): W spoke is one-way
+    # OUT of the junction; entering from the east (two-way), the car
+    # crosses the junction and eases onto the narrow one-way exit.
+    ('mixed_from_east', 'straight', 50, 114, 60.0,
+     "Two-way into a one-way exit: straight through"),
     # Simple curves (degree-2 nodes, no blinker needed). Under the running
     # protocol only the corner ENTRY is covered (last 20% of the approach
     # + first 20% of the target segment) - the long S-curve traversal the
@@ -948,6 +961,8 @@ class TurnTester:
             violations_at_start = state.get('validator_violations', 0)
             ws_frames_at_start = (state.get('lane_guard_stats') or {}) \
                 .get('wrong_side_frames', 0)
+            ws_secs_at_start = (state.get('lane_guard_stats') or {}) \
+                .get('wrong_side_seconds', 0.0)
             print(f"   Starting at segment {initial_segment}")
             print(f"   Position: ({state['x']:.0f}, {state['y']:.0f})")
             print(f"   Heading: {state['heading']:.1f}°")
@@ -1548,15 +1563,18 @@ class TurnTester:
               f"End: ({final_pos[0]:.0f}, {final_pos[1]:.0f}) seg {state['segment']}"
               + (f"  (expected seg {expected_end_segment})" if expected_end_segment is not None else ""))
 
-        # Validator violations (off-road caught between API polls)
-        vv = state.get('validator_violations', 0)
+        # Validator violations (off-road caught between API polls) -
+        # PER-TEST delta against the post-spawn baseline: the game's
+        # counter is a lifetime log, printing it raw read as "this test
+        # logged N" when it was really everything since game start.
+        vv = max(0, state.get('validator_violations', 0) - violations_at_start)
         if vv > 0:
             print(red(f"   ⚠️  Validator: {vv} off-road violation(s) logged"))
 
-        # Lane guard stats
+        # Lane guard stats (per-test delta, same reason)
         lg = state.get('lane_guard_stats', {})
-        wrong_frames = lg.get('wrong_side_frames', 0)
-        wrong_secs = lg.get('wrong_side_seconds', 0.0)
+        wrong_frames = max(0, lg.get('wrong_side_frames', 0) - ws_frames_at_start)
+        wrong_secs = max(0.0, lg.get('wrong_side_seconds', 0.0) - ws_secs_at_start)
         if wrong_frames > 0:
             print(red(f"   ⚠️  Wrong-side driving: {wrong_frames} frames ({wrong_secs}s)"))
         else:
@@ -1920,9 +1938,15 @@ def main():
             speed = float(sys.argv[idx + 3])
             end_seg = int(sys.argv[idx + 4]) if len(sys.argv) > idx + 4 \
                 else None
+            # Show the same "i/total" test number as a suite run does.
+            test_no = next((n for n, t in enumerate(DETERMINISTIC_TESTS, 1)
+                            if t[0] == start_point and t[1] == direction),
+                           None)
             tester.monitor_turn(direction, duration=60.0, target_speed=speed,
                                start_point=start_point, results=results,
-                               expected_end_segment=end_seg)
+                               expected_end_segment=end_seg,
+                               label=f"{test_no}/{len(DETERMINISTIC_TESTS)}"
+                                     if test_no else None)
             save_results(results)
             tester.print_summary()
         elif '--random' in sys.argv:

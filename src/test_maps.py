@@ -222,6 +222,16 @@ def build_basic_test_map() -> RoadNetwork:
                     start positions" scenarios (docs/DRIVING_MANEUVERS.md
                     §1 variant): five named starts at five lateral
                     positions on the same road, same destination flag.
+        Tile (4,2): One-way INTO a 4-way junction - the W spoke is
+                    one-way heading into the junction (travel west->east),
+                    N/E/S spokes two-way. Entering from the west, the car
+                    must swing slightly right across the junction so it
+                    ends up in its own lane on the two-way east side.
+        Tile (4,3): One-way OUT of a 4-way junction - the W spoke is
+                    one-way heading away from the junction (travel
+                    east->west), N/E/S spokes two-way. Entering from the
+                    east, the car crosses the junction and eases onto the
+                    narrow one-way exit, where there is no oncoming lane.
     """
     b = MapBuilder()
     TILE = 500.0  # pitch between tiles, meters
@@ -499,6 +509,42 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("park_6lane_left_lane",  "pkw_n", lateral_offset_m=-3.50)
     b.start("park_6lane_right_lane", "pkw_n")
     b.start("park_6lane_parking",    "pkw_n", lateral_offset_m=+3.10)
+
+    # --- Tile (4,2): One-way INTO a 4-way junction ---
+    # W spoke is one-way heading INTO the junction (travel west->east);
+    # N/E/S spokes are two-way. The "keep the junction centre on our left"
+    # corridor rule protects against oncoming traffic and therefore does
+    # NOT apply on the one-way approach: entering from the west, the car
+    # should swing slightly right across the junction so it ends up in its
+    # own (right) lane on the two-way east side.
+    ox, oy = origin(4, 2)
+    b.node("mixin_center", ox + 250, oy + 220)
+    b.node("mixin_w", ox + 80, oy + 220)
+    b.node("mixin_e", ox + 420, oy + 220)
+    b.node("mixin_n", ox + 250, oy + 400)
+    b.node("mixin_s", ox + 250, oy + 50)
+    b.road("mixin_w", "mixin_center", oneway=True)   # seg 110: into the junction
+    b.road("mixin_center", "mixin_e")                # seg 111: two-way exit (test target)
+    b.road("mixin_n", "mixin_center")
+    b.road("mixin_center", "mixin_s")
+    b.start("mixed_from_west", "mixin_w")
+
+    # --- Tile (4,3): One-way OUT of a 4-way junction ---
+    # W spoke is one-way heading AWAY from the junction (travel east->west);
+    # N/E/S spokes are two-way. Entering from the east (two-way), the car
+    # crosses the junction and eases onto the narrow one-way exit, where
+    # there is no oncoming lane to keep clear of.
+    ox, oy = origin(4, 3)
+    b.node("mixout_center", ox + 250, oy + 220)
+    b.node("mixout_w", ox + 80, oy + 220)
+    b.node("mixout_e", ox + 420, oy + 220)
+    b.node("mixout_n", ox + 250, oy + 400)
+    b.node("mixout_s", ox + 250, oy + 50)
+    b.road("mixout_center", "mixout_w", oneway=True) # seg 114: one-way exit (test target)
+    b.road("mixout_e", "mixout_center")              # two-way approach from the east
+    b.road("mixout_n", "mixout_center")
+    b.road("mixout_center", "mixout_s")
+    b.start("mixed_from_east", "mixout_e")
 
     return b.build()
 
