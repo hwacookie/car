@@ -327,10 +327,11 @@ class SmoothedNetwork:
     - `lines`: the merged road lines (same group key and same merged
       polylines as _merge_and_round_lines), each with its SmoothCurve
       (through the original nodes) and a dense resampled polyline.
-    - `junction_fillets`: for every degree>=3 node, the circular fillet
-      arcs between adjacent spokes (same filters and radii as the old
-      _build_multiway_junction_fillets) — the §10 junction connections,
-      tangent-continuous with the line splines.
+    - `junction_fillets`: for every degree>=3 node, the Eckausrundung
+      (corner rounding) at each corner where two road EDGES meet: the
+      corner point, a circular arc of JUNCTION_CORNER_RADIUS_M tangent to
+      both edges, and the data needed to build the paved fill between them
+      (de.wikipedia.org/wiki/Eckausrundung).
     - `segment_curve`: (seg_idx, direction) -> (curve, s_start, s_end)
       for every segment in both travel directions, so the driving model
       can take the exact sub-curve of a segment's line.
@@ -342,7 +343,7 @@ class SmoothedNetwork:
     def __init__(self, network: RoadNetwork, resample_m: float = 0.5):
         self.network = network
         self.pppm = config.PIXELS_PER_METER
-        corner_radius_px = config.ROAD_CORNER_RADIUS_M * self.pppm
+        corner_radius_px = config.JUNCTION_CORNER_RADIUS_M * self.pppm
 
         # ---- per merged line: spline + resampled polyline ----
         groups = _merge_and_round_lines(network)
@@ -406,7 +407,13 @@ class SmoothedNetwork:
                            0.0, 0.0)
                 self.segment_curve[(idx, forward)] = hit
 
-        # ---- junction fillets (degree >= 3) ----
+        # ---- junction corners: Eckausrundung (degree >= 3) ----
+        # Where two road EDGES meet at a node, round the grass corner:
+        # compass centre r off both edge lines, arc of radius r between
+        # the tangent points, paved fill = the curvilinear triangle
+        # between the corner point and the arc. (Replaces the old
+        # node-centred fillet capsules, which bulged past the kerbs when
+        # road widths differed.)
         self.junction_fillets: list[dict] = []
         for node_id, connected in network.node_connections.items():
             if len(connected) < 3:
@@ -439,25 +446,64 @@ class SmoothedNetwork:
                 gap_deg = math.degrees(gap)
                 if gap_deg < self.MIN_GAP_DEG or gap_deg > self.MAX_GAP_DEG:
                     continue
-                half_w_px = (min(seg_a.width, seg_b.width) / 2) * self.pppm
-                reach = corner_radius_px * 3 + half_w_px
-                fillet = corner_fillet(
-                    (node_x + reach * ax, node_y + reach * ay),
-                    (node_x, node_y),
-                    (node_x + reach * bx, node_y + reach * by),
-                    corner_radius_px,
-                )
-                if fillet is None:
+
+                # Corner point C: where a's edge (on b's side of a's
+                # centreline) meets b's edge (on a's side).
+                cross_z = ax * by - ay * bx          # != 0: gap filter keeps
+                sa = 1.0 if cross_z > 0 else -1.0    #   spokes off-parallel
+                sb = -sa                             # b is left/right of a
+                wa_px = (seg_a.width / 2.0) * self.pppm
+                wb_px = (seg_b.width / 2.0) * self.pppm
+                pax, pay = sa * wa_px * (-ay), sa * wa_px * ax    # on a's edge
+                pbx, pby = sb * wb_px * (-by), sb * wb_px * bx    # on b's edge
+                t = ((pbx - pax) * by - (pby - pay) * bx) / cross_z
+                cx, cy = node_x + pax + t * ax, node_y + pay + t * ay
+
+                # Cap the radius so the tangent points stay on the paved
+                # edge (short stubs: the rounding simply cannot fit).
+                corner_off = math.hypot(cx - node_x, cy - node_y)
+                avail_a = max(0.0, seg_a.length * self.pppm - corner_off)
+                avail_b = max(0.0, seg_b.length * self.pppm - corner_off)
+                tangent_dist = corner_radius_px / math.tan(gap / 2.0)
+                r_px = corner_radius_px
+                if tangent_dist > min(avail_a, avail_b):
+                    r_px = min(avail_a, avail_b) * math.tan(gap / 2.0)
+                if r_px < self.pppm:                 # < 1 m: no rounding
                     continue
-                t1, t2, arc, actual_radius, tangent_dist = fillet
+
+                # Compass centre O: r further out, off both edge lines.
+                pax_o, pay_o = pax + sa * r_px * (-ay), pay + sa * r_px * ax
+                pbx_o, pby_o = pbx + sb * r_px * (-by), pby + sb * r_px * bx
+                t = ((pbx_o - pax_o) * by - (pby_o - pay_o) * bx) / cross_z
+                ox, oy = node_x + pax_o + t * ax, node_y + pay_o + t * ay
+
+                # Tangent points on the edges, then the arc between them
+                # (the sweep that passes through the corner direction).
+                tax, tay = ox - sa * r_px * (-ay), oy - sa * r_px * ax
+                tbx, tby = ox - sb * r_px * (-by), oy - sb * r_px * bx
+                ang_a = math.atan2(tay - oy, tax - ox)
+                ang_b = math.atan2(tby - oy, tbx - ox)
+                ang_c = math.atan2(cy - oy, cx - ox)
+                fwd = (ang_b - ang_a) % (2 * math.pi)
+                back = (ang_a - ang_b) % (2 * math.pi)
+                if ((ang_c - ang_a) % (2 * math.pi)) < fwd:
+                    direction, sweep = 1.0, fwd
+                else:
+                    direction, sweep = -1.0, back
+                steps = 24
+                arc = []
+                for s in range(steps + 1):
+                    a = ang_a + direction * sweep * (s / steps)
+                    arc.append((ox + r_px * math.cos(a),
+                                oy + r_px * math.sin(a)))
+
                 self.junction_fillets.append({
                     "node": node_id,
                     "seg_a": seg_a_id,
                     "seg_b": seg_b_id,
-                    "t1": t1,
-                    "t2": t2,
+                    "corner": (cx, cy),
                     "arc": arc,
-                    "radius_px": actual_radius,
+                    "radius_px": r_px,
                 })
 
     @staticmethod

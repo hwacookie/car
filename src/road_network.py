@@ -995,9 +995,8 @@ def _build_road_polygons(network: "RoadNetwork"):
         exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors]) for p in polys if not p.is_empty]
         result.append((color, exteriors))
 
-    # Junction fillets at degree-3+ nodes (same as the old code).
-    corner_radius_px = config.ROAD_CORNER_RADIUS_M * pppm
-    extras = _build_smoothed_junction_fillets(network, sm_net, pppm, corner_radius_px)
+    # Junction corner roundings (Eckausrundung patches).
+    extras = _build_smoothed_junction_fillets(network, sm_net)
     result.extend(extras)
     return result
 
@@ -1073,31 +1072,22 @@ def _build_multiway_junction_fillets(network: "RoadNetwork", pppm: float):
 
 
 def _build_smoothed_junction_fillets(network: "RoadNetwork",
-                                      sm_net: "SmoothedNetwork", pppm: float,
-                                      corner_radius_px: float) -> list:
-    """Build polygon patches for junction corners using the smoothed
-    network's precomputed fillet arcs (tangent-continuous with the
-    Catmull-Rom splines). Same filters and radii as the old
-    _build_multiway_junction_fillets, but reuses SmoothedNetwork's
-    fillet data instead of recomputing."""
-    from shapely.geometry import LineString
+                                      sm_net: "SmoothedNetwork") -> list:
+    """Build the Eckausrundung patches (de.wikipedia.org/wiki/Eckausrundung):
+    at every junction corner, the curvilinear triangle between the corner
+    point and the rounding arc - the paved fill that lets a car swing from
+    one road into the other without leaving the pavement. The arcs come
+    precomputed from SmoothedNetwork.junction_fillets.
 
+    (Historical note: this used to buffer node-centred fillet arcs by a
+    road half-width, which bulged past the kerbs when road widths differed;
+    see git history for the old implementation.)"""
     extras = []
     for fillet in sm_net.junction_fillets:
-        seg_a_id = fillet["seg_a"]
-        arc = fillet["arc"]  # list of (x, y) points
-        if not arc or len(arc) < 2:
-            continue
-        half_w_px = (network.segments[seg_a_id].width / 2) * pppm
-        buffered = LineString(arc).buffer(
-            half_w_px, cap_style="round", join_style="round", resolution=8
-        )
-        color = config.ROAD_TYPES.get(network.segments[seg_a_id].highway,
+        ring = [fillet["corner"]] + list(fillet["arc"])
+        color = config.ROAD_TYPES.get(network.segments[fillet["seg_a"]].highway,
                                       {}).get("color", (150, 150, 150))
-        polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]
-        exteriors = [(list(p.exterior.coords), [list(r.coords) for r in p.interiors])
-                     for p in polys if not p.is_empty]
-        extras.append((color, exteriors))
+        extras.append((color, [(ring, [])]))
     return extras
 
 

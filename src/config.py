@@ -28,6 +28,14 @@ PIXELS_PER_METER = 2
 # turning arc stays on paved surface.
 JUNCTION_WIDENING_M = 4.0
 ROAD_CORNER_RADIUS_M = 6.0  # visible curb-style rounding radius at road bends
+# Junction corner rounding (Eckausrundung, de.wikipedia.org/wiki/Eckausrundung):
+# where two road EDGES meet at a degree>=3 node, the grass corner is rounded
+# with a circular arc of this radius tangent to both edges. Fixed for all
+# junctions (user decision 2026-08-31: 4 m).
+# TODO: the radius should depend on road class / design vehicle ("nach Art
+# und Lage der Straße", RASt/RAL Pauschalwerte) - bigger where buses or
+# trucks turn, smaller on quiet residential corners.
+JUNCTION_CORNER_RADIUS_M = 4.0
 ROAD_EDGE_TOLERANCE_M = 0.35  # shared slack between planned-arc validation and live off-road checks
 
 # Zoom limits: viewport width = WINDOW_WIDTH / (zoom * PIXELS_PER_METER)
