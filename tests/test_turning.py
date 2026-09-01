@@ -393,12 +393,19 @@ DETERMINISTIC_TESTS = [
     # slightly right across the junction into its own lane on the two-way
     # east side (the keep-centre-on-left rule does not apply on the
     # one-way approach - no oncoming traffic there).
-    ('mixed_from_west', 'straight', 50, 111, 60.0,
+    #
+    # NOTE: the expected end segments below are POSITIONAL indices into
+    # network.segments - they shift when tracks are added to the basic
+    # map. The figure-8 inserted 48 segments at index 104 (Sept 2026),
+    # moving everything after it by +48: old 111/114 -> 159/162, and for
+    # the park tests further down old 109 -> 157. Verify against the node
+    # names if the map changes again.
+    ('mixed_from_west', 'straight', 50, 159, 60.0,
      "One-way into a two-way crossroads: straight through"),
     # Mixed one-way/two-way crossroads (tile (4,3)): W spoke is one-way
     # OUT of the junction; entering from the east (two-way), the car
     # crosses the junction and eases onto the narrow one-way exit.
-    ('mixed_from_east', 'straight', 50, 114, 60.0,
+    ('mixed_from_east', 'straight', 50, 162, 60.0,
      "Two-way into a one-way exit: straight through"),
     # Simple curves (degree-2 nodes, no blinker needed). Under the running
     # protocol only the corner ENTRY is covered (last 20% of the approach
@@ -466,11 +473,11 @@ DETERMINISTIC_TESTS = [
     # merges LEFT back into traffic first - the parking lane is for
     # parking, not for travelling (user rules, replace the old "hold
     # initial line" rule of 2026-08-27).
-    ('park_6lane_left_lane', 'straight', 80, 109, 45.0,
+    ('park_6lane_left_lane', 'straight', 80, 157, 45.0,
      "Park from the left (overtaking) driving lane - merge right first", 0.15, True),
-    ('park_6lane_right_lane', 'straight', 80, 109, 45.0,
+    ('park_6lane_right_lane', 'straight', 80, 157, 45.0,
      "Back-in park from the right (normal) driving lane", 0.15, True),
-    ('park_6lane_parking', 'straight', 80, 109, 45.0,
+    ('park_6lane_parking', 'straight', 80, 157, 45.0,
      "Park from inside the parking lane - rejoin the driving lane first", 0.15, True),
     # NEGATIVE TEST (wrong-side detector) - runs LAST on purpose: the old
     # test-14 config. Spawn at 80% of segment 29, i.e. right at the
