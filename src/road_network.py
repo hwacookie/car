@@ -450,6 +450,7 @@ class RoadNetwork:
             deck_parts = []
             road_parts = []
             centerlines: list[list[tuple[float, float]]] = []
+            edge_lines: list[list[tuple[float, float]]] = []
             for ids, nodes, width in chains:
                 ext = list(nodes)
                 # one context neighbour at each end (the one NOT in the
@@ -485,8 +486,26 @@ class RoadNetwork:
                 # the deck's own centreline (renderers draw it ABOVE the
                 # deck - the ground-level one is covered by it)
                 centerlines.append(pts)
+                # Open white edge lines: the centreline offset laterally
+                # by (width/2 - EDGE_LINE_INSET_M), one polyline per side.
+                # OPEN at the ends (no transverse cap) so no line runs
+                # across the road where the deck starts/ends - there they
+                # meet the ground-road edge line, which continues.
+                off = (width / 2.0 - config.EDGE_LINE_INSET_M) * pppm
+                left: list[tuple[float, float]] = []
+                right: list[tuple[float, float]] = []
+                for i, (x, y) in enumerate(pts):
+                    x0, y0 = pts[max(0, i - 1)]
+                    x1, y1 = pts[min(len(pts) - 1, i + 1)]
+                    tx, ty = x1 - x0, y1 - y0
+                    tl = math.hypot(tx, ty) or 1.0
+                    nx, ny = -ty / tl, tx / tl
+                    left.append((x + nx * off, y + ny * off))
+                    right.append((x - nx * off, y - ny * off))
+                edge_lines.extend([left, right])
 
             self._elevated_centerlines_cache: list[list[tuple[float, float]]] = centerlines
+            self._elevated_edge_lines_cache: list[list[tuple[float, float]]] = edge_lines
             if deck_parts:
                 self._elevated_geom_cache = (unary_union(deck_parts),
                                              unary_union(road_parts))
@@ -517,24 +536,13 @@ class RoadNetwork:
         exactly. Renderers draw this on top of the deck/sidewalk."""
         return self._rings(self._elevated_geometry()[1])
 
-    def get_elevated_edge_rings(self):
-        """White boundary-line rings for the decks (world PIXELS): the
-        carriageway offset inward by EDGE_LINE_INSET_M, so a 15 cm tarmac
-        shoulder stays outside the line - same rule as ground roads."""
-        road = self._elevated_geometry()[1]
-        if road is None or getattr(road, "is_empty", False):
-            return []
-        # (geometry is in world PIXELS - scale the inset!)
-        road = road.buffer(-config.EDGE_LINE_INSET_M * config.PIXELS_PER_METER,
-                           join_style="round")
-        polys = road.geoms if hasattr(road, "geoms") else [road]
-        rings = []
-        for p in polys:
-            if p.is_empty:
-                continue
-            for ring in (p.exterior, *p.interiors):
-                rings.append(list(ring.coords))
-        return rings
+    def get_elevated_edge_lines(self):
+        """Open white edge lines for the decks (world PIXELS): the deck
+        centreline offset laterally by (width/2 - EDGE_LINE_INSET_M), one
+        polyline per side. Open at the ends (no transverse cap) - they
+        meet the ground-road edge line where the deck starts/ends."""
+        self._elevated_geometry()
+        return getattr(self, "_elevated_edge_lines_cache", [])
 
     def get_elevated_centerlines(self):
         """Centreline polylines (world PIXELS) of the elevated decks -

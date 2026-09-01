@@ -150,9 +150,10 @@ class GameAPI:
                 # segments (metres). elevated_roads = full deck incl. the
                 # 1 m sidewalk per side (draw concrete); elevated_roadways
                 # = the asphalt carriageway on top (same size as the ground
-                # road under it); elevated_edge_rings = white boundary line
-                # with the same 15 cm inset as ground roads. Cars at lower
-                # levels pass underneath.
+                # road under it); elevated_edge_lines = OPEN white edge
+                # lines (no transverse cap at the deck ends) with the same
+                # 15 cm inset as ground roads. Cars at lower levels pass
+                # underneath.
                 'elevated_roads': [
                     {'exterior': m(ext), 'holes': [m(h) for h in holes]}
                     for ext, holes in net.get_elevated_polygons()
@@ -161,8 +162,8 @@ class GameAPI:
                     {'exterior': m(ext), 'holes': [m(h) for h in holes]}
                     for ext, holes in net.get_elevated_roadway_polygons()
                 ],
-                'elevated_edge_rings': [m(r)
-                                        for r in net.get_elevated_edge_rings()],
+                'elevated_edge_lines': [m(l)
+                                        for l in net.get_elevated_edge_lines()],
                 # Deck centrelines (metres): draw as dashes ABOVE the
                 # deck - the ground-level centreline is covered by it.
                 'elevated_centerlines': [m(cl)
