@@ -491,60 +491,52 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("sliver_from_west", "sliv_w")   # spawn on the sharp-right exit
     b.start("sliver_from_east", "sliv_e")   # spawn on the sharp-left exit
 
-    # --- Tile (1,3): Figure-8 with a bridge at the crossing ---
-    # Two two-way rings that cross transversally at P = (750, 1750) but
-    # share NO node - topologically independent (like the widths x WWW
-    # crossing). The right ring crosses OVER: its neck segment plus one
-    # segment on each side are level 1 (bridge); everything else is
-    # ground. A car driving a lobe passes straight through the crossing
-    # and can never switch to the other lobe.
+    # --- Tile (1,3): Figure-8 - ONE continuous loop crossing itself ---
+    # A single closed circuit shaped like an 8: it goes around the left
+    # lobe, crosses at P = (750, 1750), goes around the right lobe,
+    # crosses again and closes. The crossing is modelled with TWO nodes
+    # at the SAME point: p1 on the NE-SW branch, p2 on the NW-SE branch.
+    # Every node has degree 2 (no junction logic needed - the driver
+    # simply drives straight through), yet the whole figure-8 is ONE
+    # connected cycle. The NE-SW branch (through p1) is a BRIDGE: the
+    # two crossing segments plus one on each side are level 1, so a car
+    # on that branch passes OVER the other branch.
     ox, oy = origin(1, 3)
     px, py = ox + 250, oy + 250            # the crossing point P
-    # Left ring (ground): neck along the NE-SW diagonal through P, the
-    # rest of the ring bulges west. All nodes degree 2 (closed loop).
-    b.node("fig8l_a", px - 24.8, py - 24.8)   # SW neck end
-    b.node("fig8l_b", px + 24.8, py + 24.8)   # NE neck end (a->b passes P)
-    b.node("fig8l_c", px,        py + 80)
-    b.node("fig8l_d", px - 60,   py + 130)
-    b.node("fig8l_e", px - 140,  py + 145)
-    b.node("fig8l_f", px - 210,  py + 110)
-    b.node("fig8l_g", px - 250,  py + 40)
-    b.node("fig8l_h", px - 250,  py - 40)
-    b.node("fig8l_i", px - 210,  py - 110)
-    b.node("fig8l_j", px - 140,  py - 145)
-    b.node("fig8l_k", px - 70,   py - 95)
-    for n1, n2 in [("fig8l_a", "fig8l_b"), ("fig8l_b", "fig8l_c"),
-                   ("fig8l_c", "fig8l_d"), ("fig8l_d", "fig8l_e"),
-                   ("fig8l_e", "fig8l_f"), ("fig8l_f", "fig8l_g"),
-                   ("fig8l_g", "fig8l_h"), ("fig8l_h", "fig8l_i"),
-                   ("fig8l_i", "fig8l_j"), ("fig8l_j", "fig8l_k"),
-                   ("fig8l_k", "fig8l_a")]:
+    # Left lobe (bulges west): b1..b6 around the oval, pinch at P.
+    b.node("fig8_p1", px, py)              # NE-SW branch node (bridge)
+    b.node("fig8_p2", px, py)              # NW-SE branch node (ground)
+    b.node("fig8_b1", px - 60,  py - 70)   # SW arm end (below-left of P)
+    b.node("fig8_b2", px - 120, py - 130)  # lobe bottom
+    b.node("fig8_b3", px - 210, py - 90)
+    b.node("fig8_b4", px - 240, py)        # leftmost point
+    b.node("fig8_b5", px - 210, py + 90)
+    b.node("fig8_b6", px - 120, py + 130)  # lobe top (NW arm start)
+    # Right lobe (bulges east): point-symmetric about P.
+    b.node("fig8_r1", px + 60,  py - 70)   # SE arm end (below-right of P)
+    b.node("fig8_r2", px + 120, py - 130)  # lobe bottom
+    b.node("fig8_r3", px + 210, py - 90)
+    b.node("fig8_r4", px + 240, py)        # rightmost point
+    b.node("fig8_r5", px + 210, py + 90)
+    b.node("fig8_r6", px + 120, py + 130)  # lobe top (NE arm start)
+    # The full cycle: p1 -> left lobe -> p2 -> right lobe -> p1.
+    # (The four bridge segments are added below; the rest here.)
+    for n1, n2 in [("fig8_b2", "fig8_b3"), ("fig8_b3", "fig8_b4"),
+                   ("fig8_b4", "fig8_b5"), ("fig8_b5", "fig8_b6"),
+                   ("fig8_r2", "fig8_r3"), ("fig8_r3", "fig8_r4"),
+                   ("fig8_r4", "fig8_r5")]:
         b.road(n1, n2)
-    # Right ring: point-symmetric about P (neck along the NW-SE
-    # diagonal). The crossing piece is a BRIDGE: neck + one segment on
-    # each side at level 1.
-    b.node("fig8r_a", px + 24.8, py + 24.8)   # NW neck end
-    b.node("fig8r_b", px - 24.8, py - 24.8)   # SE neck end (a->b passes P)
-    b.node("fig8r_c", px,        py - 80)
-    b.node("fig8r_d", px + 60,   py - 130)
-    b.node("fig8r_e", px + 140,  py - 145)
-    b.node("fig8r_f", px + 210,  py - 110)
-    b.node("fig8r_g", px + 250,  py - 40)
-    b.node("fig8r_h", px + 250,  py + 40)
-    b.node("fig8r_i", px + 210,  py + 110)
-    b.node("fig8r_j", px + 140,  py + 145)
-    b.node("fig8r_k", px + 70,   py + 95)
-    for n1, n2 in [("fig8r_c", "fig8r_d"), ("fig8r_d", "fig8r_e"),
-                   ("fig8r_e", "fig8r_f"), ("fig8r_f", "fig8r_g"),
-                   ("fig8r_g", "fig8r_h"), ("fig8r_h", "fig8r_i"),
-                   ("fig8r_i", "fig8r_j"), ("fig8r_j", "fig8r_k")]:
-        b.road(n1, n2)
-    # bridge pieces: one segment before the neck, the neck, one after
-    for n1, n2 in [("fig8r_k", "fig8r_a"), ("fig8r_a", "fig8r_b"),
-                   ("fig8r_b", "fig8r_c")]:
+    # The NE-SW branch through p1 is the BRIDGE: one segment before
+    # (r5->r6), the two crossing segments (r6->p1, p1->b1), one after
+    # (b1->b2).
+    for n1, n2 in [("fig8_r5", "fig8_r6"), ("fig8_r6", "fig8_p1"),
+                   ("fig8_p1", "fig8_b1"), ("fig8_b1", "fig8_b2")]:
         b.road(n1, n2, level=1)
-    b.start("fig8_left",  "fig8l_e", facing="fig8l_f")   # top of the ground lobe
-    b.start("fig8_right", "fig8r_j", facing="fig8r_i")   # bottom of the bridge lobe
+    # The NW-SE branch through p2 stays on the ground.
+    for n1, n2 in [("fig8_b6", "fig8_p2"), ("fig8_p2", "fig8_r1"),
+                   ("fig8_r1", "fig8_r2")]:
+        b.road(n1, n2)
+    b.start("fig8", "fig8_b4", facing="fig8_b5")   # leftmost point, heading north
 
     # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
     # A W-shaped zig-zag road: right-down, left-down, right-down.

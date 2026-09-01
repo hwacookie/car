@@ -149,6 +149,10 @@ class GameAPI:
                     {'exterior': m(ext), 'holes': [m(h) for h in holes]}
                     for ext, holes in net.get_elevated_polygons()
                 ],
+                # Deck centrelines (metres): draw as dashes ABOVE the
+                # deck - the ground-level centreline is covered by it.
+                'elevated_centerlines': [m(cl)
+                                         for cl in net.get_elevated_centerlines()],
                 'paved_edge_rings': paved_edge_rings,
                 'centerlines': [m(c) for c in net.get_marking_centerlines()],
                 'lane_markings': [

@@ -391,44 +391,92 @@ class RoadNetwork:
         if getattr(self, "_elevated_polygons_cache", None) is None:
             from shapely.geometry import LineString
             from shapely.ops import unary_union
-            from .smooth_geometry import smoothed_network
+            from .smooth_geometry import (SmoothCurve, SmoothedNetwork,
+                                          smoothed_network)
 
             sm_net = smoothed_network(self)
             pppm = config.PIXELS_PER_METER
-            # Collect the spline s-ranges of all elevated segments, per
-            # merged line (curve) and width; consecutive segments on one
-            # line share an endpoint and merge into a single arc.
-            arcs: dict[int, dict] = {}
+
+            # 1) Walk the elevated segments into ordered chains. Each
+            #    chain: (node_coords_px in path order, max_width).
+            by_node: dict[str, list[int]] = {}
             for idx, seg in enumerate(self.segments):
-                if seg.level < 1:
+                if seg.level >= 1:
+                    by_node.setdefault(seg.start_node, []).append(idx)
+                    by_node.setdefault(seg.end_node, []).append(idx)
+            seen_seg: set[int] = set()
+            # chain: (node ids in path order, node coords px, max width)
+            chains: list[tuple[list[str], list[tuple[float, float]], float]] = []
+            for start_idx in range(len(self.segments)):
+                if self.segments[start_idx].level < 1 or start_idx in seen_seg:
                     continue
-                line, s0, s1 = sm_net.segment_curve[(idx, True)]
-                curve = line["curve"]
-                key = id(curve)
-                entry = arcs.setdefault(
-                    key, {"curve": curve, "width": seg.width, "ranges": []})
-                entry["width"] = max(entry["width"], seg.width)
-                entry["ranges"].append((s0, s1))
+                seg = self.segments[start_idx]
+                ids = [seg.start_node, seg.end_node]
+                widths = [seg.width]
+                seen_seg.add(start_idx)
+                # extend the chain in both directions while elevated
+                for direction in (0, 1):  # 0 = toward start_node, 1 = end
+                    cur = seg.start_node if direction == 0 else seg.end_node
+                    while True:
+                        i2 = next((i for i in by_node.get(cur, [])
+                                   if i not in seen_seg), None)
+                        if i2 is None:
+                            break
+                        s2 = self.segments[i2]
+                        other = (s2.end_node if s2.start_node == cur
+                                 else s2.start_node)
+                        if direction == 0:
+                            ids.insert(0, other)
+                        else:
+                            ids.append(other)
+                        widths.append(s2.width)
+                        seen_seg.add(i2)
+                        cur = other
+                chains.append((ids, [self.nodes[i] for i in ids],
+                               max(widths)))
+
+            # 2) For each chain build a centripetal Catmull-Rom curve
+            #    through the chain PLUS one context node at each end
+            #    (so the interior tangents match the network spline -
+            #    CR at a point only needs its two neighbours), then slice
+            #    between the chain's own end nodes' arc lengths.
+            adj: dict[str, set[str]] = {}
+            for seg in self.segments:
+                adj.setdefault(seg.start_node, set()).add(seg.end_node)
+                adj.setdefault(seg.end_node, set()).add(seg.start_node)
 
             parts = []
-            for entry in arcs.values():
-                curve = entry["curve"]
-                half_w_px = (entry["width"] / 2.0) * pppm
-                ranges = sorted(entry["ranges"])
-                merged: list[list[float]] = []
-                for s0, s1 in ranges:
-                    if merged and s0 <= merged[-1][1] + 1e-6:
-                        merged[-1][1] = max(merged[-1][1], s1)
-                    else:
-                        merged.append([s0, s1])
-                for a, b in merged:
-                    n = max(2, int((b - a) / (0.5 * pppm)) + 1)
-                    pts = [curve.point_at(a + (b - a) * i / (n - 1))
-                           for i in range(n)]
-                    parts.append(LineString(pts).buffer(
-                        half_w_px, cap_style="flat", join_style="round",
-                        resolution=8))
+            centerlines: list[list[tuple[float, float]]] = []
+            for ids, nodes, width in chains:
+                ext = list(nodes)
+                # one context neighbour at each end (the one NOT in the
+                # chain) so the CR tangents at the slice ends match the
+                # network spline
+                for nid, end in ((ids[0], 0), (ids[-1], -1)):
+                    for nbr in adj.get(nid, ()):
+                        if nbr not in ids:
+                            if end == 0:
+                                ext.insert(0, self.nodes[nbr])
+                            else:
+                                ext.append(self.nodes[nbr])
+                            break
+                curve = SmoothCurve(ext, pppm=pppm)
+                s0 = SmoothedNetwork._node_s(curve, nodes[0])
+                s1 = SmoothedNetwork._node_s(curve, nodes[-1])
+                if s0 > s1:
+                    s0, s1 = s1, s0
+                half_w_px = (width / 2.0) * pppm
+                n = max(2, int((s1 - s0) / (0.5 * pppm)) + 1)
+                pts = [curve.point_at(s0 + (s1 - s0) * i / (n - 1))
+                       for i in range(n)]
+                parts.append(LineString(pts).buffer(
+                    half_w_px, cap_style="flat", join_style="round",
+                    resolution=8))
+                # the deck's own centreline (renderers draw it ABOVE the
+                # deck - the ground-level one is covered by it)
+                centerlines.append(pts)
 
+            self._elevated_centerlines_cache: list[list[tuple[float, float]]] = centerlines
             if parts:
                 unioned = unary_union(parts)
                 polys = unioned.geoms if hasattr(unioned, "geoms") else [unioned]
@@ -439,6 +487,14 @@ class RoadNetwork:
             else:
                 self._elevated_polygons_cache = []
         return self._elevated_polygons_cache
+
+    def get_elevated_centerlines(self):
+        """Centreline polylines (world PIXELS) of the elevated decks -
+        the same sliced splines the deck surface is buffered from.
+        Renderers draw them ABOVE the deck (the ground-level centreline
+        underneath is covered). Computed alongside get_elevated_polygons."""
+        self.get_elevated_polygons()
+        return getattr(self, "_elevated_centerlines_cache", [])
 
     def get_paved_polygon(self):
         """A single unioned Shapely (Multi)Polygon covering the entire
