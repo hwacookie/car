@@ -30,7 +30,9 @@ class MapBuilder:
         self._nodes_m: dict[str, tuple[float, float]] = {}
         self._segments: list[RoadSegment] = []
         self._next_seg_id = 1
-        self._start_points: dict[str, str] = {}  # name -> node_id (must be degree-1)
+        self._start_points: dict[str, tuple[str, float, str | None]] = {}
+        # name -> (node_id, lateral_offset_m, facing); degree-1 nodes or
+        # loops with an explicit facing neighbour
 
     def node(self, node_id: str, x_m: float, y_m: float) -> None:
         """Define a node position in meters (X east, Y north)."""
@@ -46,6 +48,7 @@ class MapBuilder:
         lanes: int = 0,
         shoulder: float = 0.0,
         parking_lane_width: float = 0.0,
+        level: int = 0,
     ) -> None:
         """Add a road segment between two named nodes.
 
@@ -58,6 +61,12 @@ class MapBuilder:
         boundary + painted P marks, ending >= PARK_LANE_END_GAP_M before
         any junction). `shoulder` metres of stop lane on the right apply
         to one-way layouts (right-hand traffic).
+
+        `level` is the vertical level: 0 = ground, 1 = bridge over the
+        ground, -1 = tunnel. Top-down view has no z axis; levels decide
+        rendering order/style and keep cars on different levels from
+        colliding (a figure-8 track crosses itself at one point where
+        one ring is a bridge over the other).
         """
         x1_m, y1_m = self._nodes_m[n1]
         x2_m, y2_m = self._nodes_m[n2]
@@ -86,10 +95,12 @@ class MapBuilder:
             length=length_m,
             lanes=lanes,
             shoulder=shoulder,
+            level=level,
         ))
         self._next_seg_id += 1
 
-    def start(self, name: str, node_id: str, lateral_offset_m: float = 0.0) -> None:
+    def start(self, name: str, node_id: str, lateral_offset_m: float = 0.0,
+              facing: str | None = None) -> None:
         """Register a named, deterministic start point at a node.
 
         The node must have exactly one connected segment (a scenario's
@@ -97,12 +108,16 @@ class MapBuilder:
         are unambiguous. Use this to give tests a reproducible spawn
         location + heading approaching a specific junction.
 
+        On a closed loop every node has TWO segments: pass `facing` = the
+        id of the neighbour node the car faces (drives toward) to make
+        the direction unambiguous (figure-8 lobbies).
+
         lateral_offset_m shifts the spawn laterally from the NORMAL
         DRIVING POSITION (right-lane centre): positive = toward the right
         kerb, negative = toward the left side of the road. Used by the
         parking-offset scenarios on the two-lane one-way tile.
         """
-        self._start_points[name] = (node_id, lateral_offset_m)
+        self._start_points[name] = (node_id, lateral_offset_m, facing)
 
     def build(self, margin_m: float = 50.0) -> RoadNetwork:
         """Finalize and return the RoadNetwork."""
@@ -160,14 +175,27 @@ class MapBuilder:
         # The named node must have exactly one connected segment so the
         # direction of travel (heading, forward flag) is unambiguous.
         start_points: dict[str, tuple[float, float, float, int, bool, float]] = {}
-        for name, (node_id, lateral_offset_m) in self._start_points.items():
+        for name, (node_id, lateral_offset_m, facing) in self._start_points.items():
             connected = node_connections.get(node_id, [])
-            if len(connected) != 1:
+            if len(connected) == 1:
+                seg_idx = connected[0]
+            elif len(connected) == 2 and facing is not None:
+                # Closed loop: pick the segment toward `facing`.
+                seg_idx = next(
+                    (i for i in connected
+                     if self._segments[i].start_node == facing
+                     or self._segments[i].end_node == facing),
+                    None)
+                if seg_idx is None:
+                    raise ValueError(
+                        f"Start point '{name}' -> node '{node_id}': 'facing' "
+                        f"node '{facing}' is not a neighbour")
+            else:
                 raise ValueError(
                     f"Start point '{name}' -> node '{node_id}' must have exactly "
-                    f"1 connected segment, found {len(connected)}"
+                    f"1 connected segment (or 2 + facing on a loop), found "
+                    f"{len(connected)}"
                 )
-            seg_idx = connected[0]
             seg = self._segments[seg_idx]
             forward = (seg.start_node == node_id)
             x, y = (seg.x1, seg.y1) if forward else (seg.x2, seg.y2)
@@ -462,6 +490,61 @@ def build_basic_test_map() -> RoadNetwork:
     b.start("sliver_approach", "sliv_ap")   # spawn on the sliver, heading for the junction
     b.start("sliver_from_west", "sliv_w")   # spawn on the sharp-right exit
     b.start("sliver_from_east", "sliv_e")   # spawn on the sharp-left exit
+
+    # --- Tile (1,3): Figure-8 with a bridge at the crossing ---
+    # Two two-way rings that cross transversally at P = (750, 1750) but
+    # share NO node - topologically independent (like the widths x WWW
+    # crossing). The right ring crosses OVER: its neck segment plus one
+    # segment on each side are level 1 (bridge); everything else is
+    # ground. A car driving a lobe passes straight through the crossing
+    # and can never switch to the other lobe.
+    ox, oy = origin(1, 3)
+    px, py = ox + 250, oy + 250            # the crossing point P
+    # Left ring (ground): neck along the NE-SW diagonal through P, the
+    # rest of the ring bulges west. All nodes degree 2 (closed loop).
+    b.node("fig8l_a", px - 24.8, py - 24.8)   # SW neck end
+    b.node("fig8l_b", px + 24.8, py + 24.8)   # NE neck end (a->b passes P)
+    b.node("fig8l_c", px,        py + 80)
+    b.node("fig8l_d", px - 60,   py + 130)
+    b.node("fig8l_e", px - 140,  py + 145)
+    b.node("fig8l_f", px - 210,  py + 110)
+    b.node("fig8l_g", px - 250,  py + 40)
+    b.node("fig8l_h", px - 250,  py - 40)
+    b.node("fig8l_i", px - 210,  py - 110)
+    b.node("fig8l_j", px - 140,  py - 145)
+    b.node("fig8l_k", px - 70,   py - 95)
+    for n1, n2 in [("fig8l_a", "fig8l_b"), ("fig8l_b", "fig8l_c"),
+                   ("fig8l_c", "fig8l_d"), ("fig8l_d", "fig8l_e"),
+                   ("fig8l_e", "fig8l_f"), ("fig8l_f", "fig8l_g"),
+                   ("fig8l_g", "fig8l_h"), ("fig8l_h", "fig8l_i"),
+                   ("fig8l_i", "fig8l_j"), ("fig8l_j", "fig8l_k"),
+                   ("fig8l_k", "fig8l_a")]:
+        b.road(n1, n2)
+    # Right ring: point-symmetric about P (neck along the NW-SE
+    # diagonal). The crossing piece is a BRIDGE: neck + one segment on
+    # each side at level 1.
+    b.node("fig8r_a", px + 24.8, py + 24.8)   # NW neck end
+    b.node("fig8r_b", px - 24.8, py - 24.8)   # SE neck end (a->b passes P)
+    b.node("fig8r_c", px,        py - 80)
+    b.node("fig8r_d", px + 60,   py - 130)
+    b.node("fig8r_e", px + 140,  py - 145)
+    b.node("fig8r_f", px + 210,  py - 110)
+    b.node("fig8r_g", px + 250,  py - 40)
+    b.node("fig8r_h", px + 250,  py + 40)
+    b.node("fig8r_i", px + 210,  py + 110)
+    b.node("fig8r_j", px + 140,  py + 145)
+    b.node("fig8r_k", px + 70,   py + 95)
+    for n1, n2 in [("fig8r_c", "fig8r_d"), ("fig8r_d", "fig8r_e"),
+                   ("fig8r_e", "fig8r_f"), ("fig8r_f", "fig8r_g"),
+                   ("fig8r_g", "fig8r_h"), ("fig8r_h", "fig8r_i"),
+                   ("fig8r_i", "fig8r_j"), ("fig8r_j", "fig8r_k")]:
+        b.road(n1, n2)
+    # bridge pieces: one segment before the neck, the neck, one after
+    for n1, n2 in [("fig8r_k", "fig8r_a"), ("fig8r_a", "fig8r_b"),
+                   ("fig8r_b", "fig8r_c")]:
+        b.road(n1, n2, level=1)
+    b.start("fig8_left",  "fig8l_e", facing="fig8l_f")   # top of the ground lobe
+    b.start("fig8_right", "fig8r_j", facing="fig8r_i")   # bottom of the bridge lobe
 
     # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
     # A W-shaped zig-zag road: right-down, left-down, right-down.

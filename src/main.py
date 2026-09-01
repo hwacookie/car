@@ -867,6 +867,11 @@ def main(smoke_test_frames: int = 0):
                     'speed': car.speed,
                     'speed_kmh': car.speed * 3.6,
                     'segment': car.seg_idx,
+                    # Vertical level of the current segment (0 = ground,
+                    # 1 = bridge): the Godot renderer z-orders the car
+                    # above its own deck but below any higher level, so a
+                    # ground car disappears under a bridge.
+                    'level': network.segments[car.seg_idx].level,
                     'progress': car.progress,
                     'segment_length': network.segments[car.seg_idx].length,
                     'forward': car.forward,

@@ -136,9 +136,19 @@ class GameAPI:
                 # floor so every road stays visible at any map scale.
                 # NOTE: segment coords are world PIXELS (x pppm) — convert
                 # to metres like every other export.
+                # level: 0 = ground, 1 = bridge over the ground (figure-8
+                # crossing). Renderers use it for z-ordering - a car at
+                # level L renders above its own deck but below level L+1.
                 'segments': [[round(s.x1 / pppm, 2), round(s.y1 / pppm, 2),
                               round(s.x2 / pppm, 2), round(s.y2 / pppm, 2),
-                              s.width] for s in net.segments],
+                              s.width, s.level] for s in net.segments],
+                # Bridge decks: buffered smoothed surface of all level>=1
+                # segments (metres). Drawn on top of the ground roads with
+                # a heavier edge; cars at lower levels pass underneath.
+                'elevated_roads': [
+                    {'exterior': m(ext), 'holes': [m(h) for h in holes]}
+                    for ext, holes in net.get_elevated_polygons()
+                ],
                 'paved_edge_rings': paved_edge_rings,
                 'centerlines': [m(c) for c in net.get_marking_centerlines()],
                 'lane_markings': [

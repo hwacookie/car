@@ -30,6 +30,11 @@ class RoadSegment:
                            # dashed centerline. One-way: total = lanes;
                            # two-way: total = 2 x lanes.
     shoulder: float = 0.0  # metres of stop lane (shoulder) on the right
+    level: int = 0         # vertical LEVEL: 0 = ground, 1 = bridge over
+                           # the ground, 2 = bridge over a bridge,
+                           # -1 = tunnel. Top-down view has no z axis -
+                           # levels only decide rendering order/style and
+                           # that cars on different levels never collide.
     parking_lane_width: float = 0.0  # metres; > 0 = the outermost right
                                      # lane is a PARKING LANE (at each
                                      # kerb - i.e. both sides of a two-way
@@ -372,6 +377,68 @@ class RoadNetwork:
         if getattr(self, "_road_polygons_cache", None) is None:
             self._road_polygons_cache = _build_road_polygons(self)
         return self._road_polygons_cache
+
+    def get_elevated_polygons(self):
+        """Buffered road surface of every segment with level >= 1 (bridge).
+
+        Returns [(exterior_coords, [hole_coords, ...]), ...] in world
+        PIXELS. Uses the SAME smoothed spline + buffer parameters as the
+        ground roads so the bridge deck matches the carriageway under it
+        exactly (no sliver of ground road poking out from under the edge).
+        Renderers draw these on top of the ground, with their own styling,
+        and keep cars at lower levels below them in z-order. Cached -
+        the network never changes at runtime."""
+        if getattr(self, "_elevated_polygons_cache", None) is None:
+            from shapely.geometry import LineString
+            from shapely.ops import unary_union
+            from .smooth_geometry import smoothed_network
+
+            sm_net = smoothed_network(self)
+            pppm = config.PIXELS_PER_METER
+            # Collect the spline s-ranges of all elevated segments, per
+            # merged line (curve) and width; consecutive segments on one
+            # line share an endpoint and merge into a single arc.
+            arcs: dict[int, dict] = {}
+            for idx, seg in enumerate(self.segments):
+                if seg.level < 1:
+                    continue
+                line, s0, s1 = sm_net.segment_curve[(idx, True)]
+                curve = line["curve"]
+                key = id(curve)
+                entry = arcs.setdefault(
+                    key, {"curve": curve, "width": seg.width, "ranges": []})
+                entry["width"] = max(entry["width"], seg.width)
+                entry["ranges"].append((s0, s1))
+
+            parts = []
+            for entry in arcs.values():
+                curve = entry["curve"]
+                half_w_px = (entry["width"] / 2.0) * pppm
+                ranges = sorted(entry["ranges"])
+                merged: list[list[float]] = []
+                for s0, s1 in ranges:
+                    if merged and s0 <= merged[-1][1] + 1e-6:
+                        merged[-1][1] = max(merged[-1][1], s1)
+                    else:
+                        merged.append([s0, s1])
+                for a, b in merged:
+                    n = max(2, int((b - a) / (0.5 * pppm)) + 1)
+                    pts = [curve.point_at(a + (b - a) * i / (n - 1))
+                           for i in range(n)]
+                    parts.append(LineString(pts).buffer(
+                        half_w_px, cap_style="flat", join_style="round",
+                        resolution=8))
+
+            if parts:
+                unioned = unary_union(parts)
+                polys = unioned.geoms if hasattr(unioned, "geoms") else [unioned]
+                self._elevated_polygons_cache = [
+                    (list(p.exterior.coords),
+                     [list(r.coords) for r in p.interiors])
+                    for p in polys if not p.is_empty]
+            else:
+                self._elevated_polygons_cache = []
+        return self._elevated_polygons_cache
 
     def get_paved_polygon(self):
         """A single unioned Shapely (Multi)Polygon covering the entire
