@@ -1,9 +1,8 @@
 # REST API for remote car control and testing
 # Runs in separate thread, shares state with game loop
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request
 from threading import Thread, Lock
-import io
 import time
 from typing import Dict, Any
 
@@ -37,7 +36,6 @@ class GameAPI:
             'uturn': False,
         }
         self.commands: Dict[str, Any] = {}  # For one-shot commands (teleport, etc.)
-        self.screenshot_buffer: bytes = None
         
         # Obstacle system (docs/OBSTACLES.md): wired in by the game via
         # set_obstacles(). Placement/removal goes through the SAME logic as
@@ -109,8 +107,8 @@ class GameAPI:
             # Paved-edge rings: the UNIONED paved polygon (unary_union), so
             # shared/interior buffer edges inside junctions are gone — only
             # the true outer perimeter + island holes remain. Renderers draw
-            # a fixed 2 px white line along every ring (pygame parity,
-            # always on since 2026-08-31). The rings are offset INWARD by
+            # a thin white line along every ring (always on since
+            # 2026-08-31, user decision - no toggle). The rings are offset INWARD by
             # EDGE_LINE_INSET_M so a 15 cm tarmac shoulder stays outside
             # the white line (user decision; ALL roads).
             # (get_paved_polygon is in world PIXELS - scale the inset!)
@@ -285,21 +283,18 @@ class GameAPI:
             with self.lock:
                 self.commands['toggle'] = data
             return jsonify({'ok': True, 'command': 'toggle', 'params': data})
-        
-        @self.app.route('/screenshot', methods=['GET'])
-        def screenshot():
-            """Get current frame as PNG."""
+
+        @self.app.route('/freeze', methods=['POST'])
+        def freeze():
+            """Freeze / resume the simulation (replaces the old ESC key).
+
+            Body: {"frozen": bool}
+            """
+            data = request.get_json()
             with self.lock:
-                if self.screenshot_buffer is None:
-                    return jsonify({'error': 'No screenshot available'}), 404
-                
-                return send_file(
-                    io.BytesIO(self.screenshot_buffer),
-                    mimetype='image/png',
-                    as_attachment=False,
-                    download_name='frame.png'
-                )
-        
+                self.commands['freeze'] = bool(data.get('frozen', True))
+            return jsonify({'ok': True, 'command': 'freeze'})
+
         @self.app.route('/wait', methods=['POST'])
         def wait():
             """Wait for condition or timeout.
@@ -424,11 +419,6 @@ class GameAPI:
             commands = self.commands.copy()
             self.commands.clear()
             return commands
-    
-    def update_screenshot(self, png_bytes: bytes):
-        """Update screenshot buffer (called from game loop)."""
-        with self.lock:
-            self.screenshot_buffer = png_bytes
     
     def start(self, port: int = 5000, host: str = '127.0.0.1'):
         """Start API server in background thread."""

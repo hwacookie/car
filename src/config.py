@@ -1,9 +1,22 @@
 # Configuration
 
 import math
-import pygame
 
-# --- Window ---
+# --- Key names for control input ---
+# Renderer-agnostic stand-ins for the old pygame K_* constants (M5: the
+# simulator runs headless; drivers index a plain mapping with these).
+KEY_UP = 'up'
+KEY_DOWN = 'down'
+KEY_LEFT = 'left'
+KEY_RIGHT = 'right'
+KEY_W = 'w'
+KEY_S = 's'
+KEY_A = 'a'
+KEY_D = 'd'
+KEY_Q = 'q'
+KEY_E = 'e'
+
+# --- Viewport (sim camera; the remote renderer mirrors it) ---
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 
@@ -231,7 +244,7 @@ EDGE_LINE_INSET_M = 0.15
 # Elevated decks (bridges) carry a sidewalk this wide on each side of
 # the carriageway (visual only - cars drive on the carriageway).
 BRIDGE_SIDEWALK_M = 1.0
-# Marking dash patterns (METRES). Shared by the pygame renderer and the
+# Marking dash patterns (METRES). Shared by the Godot frontend (via /map)
 # GET /map export (docs/GODOT_FRONTEND.md) so external renderers draw the
 # same pattern from one source of truth.
 CENTER_DASH_M = 3.0     # two-way centerline: 3 m dash / 3 m gap.

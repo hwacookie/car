@@ -1,4 +1,4 @@
-pygame>=2.5.0
+
 shapely>=2.0.0
 psycopg[binary]>=3.2.0
 flask>=3.0.0

@@ -483,45 +483,5 @@ class TestRestAPI(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
 
-class TestUIHeadless(unittest.TestCase):
-    """The palette must survive a drag of an EXISTING obstacle: its drag
-    payload is an obstacle id, not a color (regression test for a KeyError
-    found in live testing when a click picked up a placed car)."""
-
-    @classmethod
-    def setUpClass(cls):
-        import os
-        # Headless: never pop a real window during the test run.
-        os.environ["SDL_VIDEODRIVER"] = "dummy"
-        import pygame
-        if not pygame.get_init():
-            pygame.init()
-        cls.screen = pygame.display.set_mode((1280, 720))
-        cls.network = make_network()
-        from src.camera import Camera
-        from src.renderer import Renderer
-        from src.obstacle_ui import ObstaclePalette
-        cam = Camera(1280, 720)
-        cam.zoom = 7.0
-        cls.mgr = ObstacleManager("basic", base_dir="/tmp/obst-test-unused")
-        cls.ob = cls.mgr.place(cls.network, "car", "blue",
-                               97 * PPPM, 150 * PPPM)
-        cls.ui = ObstaclePalette(cls.mgr, cls.network, cam,
-                                 Renderer(cls.network, cam))
-
-    def test_dragging_existing_obstacle_does_not_crash(self):
-        self.ui.drag = ("move", self.ob.id)      # payload is an id, not a color
-        self.ui.cursor = (300, 300)              # over the map
-        self.ui.draw_world(self.screen)
-        self.ui.draw_panel(self.screen)
-
-    def test_dragging_fresh_slot_does_not_crash(self):
-        self.ui.drag = ("new", "yellow")
-        self.ui.cursor = (300, 300)
-        self.ui.draw_world(self.screen)
-        self.ui.draw_panel(self.screen)
-        self.ui.drag = None
-
-
 if __name__ == "__main__":
     unittest.main()

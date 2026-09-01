@@ -4,7 +4,9 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 import math
-import pygame
+
+from .config import (KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+                     KEY_W, KEY_S, KEY_A, KEY_D, KEY_Q, KEY_E)
 
 
 class Driver(ABC):
@@ -53,11 +55,11 @@ class KeyboardDriver(Driver):
         """Manual steering control."""
         # Momentary blinkers (held = on). Stored on the driver too - the
         # renderer and HUD read driver.blinker_left/right for the lights.
-        self.blinker_left = bool(keys[pygame.K_q])
-        self.blinker_right = bool(keys[pygame.K_e])
+        self.blinker_left = bool(keys[KEY_Q])
+        self.blinker_right = bool(keys[KEY_E])
 
-        w = keys[pygame.K_UP] or keys[pygame.K_w]
-        s = keys[pygame.K_DOWN] or keys[pygame.K_s]
+        w = keys[KEY_UP] or keys[KEY_W]
+        s = keys[KEY_DOWN] or keys[KEY_S]
         control = {
             'accelerate': w,
             'brake': s,
@@ -66,8 +68,8 @@ class KeyboardDriver(Driver):
             # forward. Holding the brake through zero must NOT shift.
             'accelerate_pressed': w and not self._last_w,
             'brake_pressed': s and not self._last_s,
-            'steer_left': keys[pygame.K_LEFT] or keys[pygame.K_a],
-            'steer_right': keys[pygame.K_RIGHT] or keys[pygame.K_d],
+            'steer_left': keys[KEY_LEFT] or keys[KEY_A],
+            'steer_right': keys[KEY_RIGHT] or keys[KEY_D],
             'blinker_left': self.blinker_left,
             'blinker_right': self.blinker_right,
         }
@@ -165,8 +167,8 @@ class BicycleDriver(Driver):
     def get_control(self, car, network, dt, keys) -> dict:
         """Automatic road following with blinkers."""
         # Update blinkers based on A/D keys
-        left = keys[pygame.K_LEFT] or keys[pygame.K_a]
-        right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
+        left = keys[KEY_LEFT] or keys[KEY_A]
+        right = keys[KEY_RIGHT] or keys[KEY_D]
 
         # Toggle blinkers
         if left and not self._last_left:
@@ -188,8 +190,8 @@ class BicycleDriver(Driver):
         self._last_right = right
 
         # W/S for speed control (manual override)
-        accel = keys[pygame.K_UP] or keys[pygame.K_w]
-        brake = keys[pygame.K_DOWN] or keys[pygame.K_s]
+        accel = keys[KEY_UP] or keys[KEY_W]
+        brake = keys[KEY_DOWN] or keys[KEY_S]
 
         # Destination parking (spec §1): mirror the indicator from the
         # nav's brake & park plan phase. The plan owns the deceleration;

@@ -1,54 +1,52 @@
 #!/usr/bin/env python3
-"""Car Game — Entry Point"""
+"""Car Game — Entry Point (headless world simulator, M5)
+
+The sim runs without any window: physics + AI driver + REST API. The
+Godot frontend (driving-game repo) is the renderer - it polls /state
+and mirrors the sim camera. There is no pygame anywhere in this package.
+"""
 
 import math
 import os
 import sys
 import time
-import pygame
 
 from .config import *
 from .osm_loader import fetch_osm_data
 from .road_network import RoadNetwork
 from .camera import Camera
-from .renderer import Renderer
 from .car import Car
 from .driver import Driver, KeyboardDriver, BicycleDriver
 from .physics_validator import PhysicsValidator
 from .lane_guard import LaneGuard
 from .obstacles import ObstacleManager
-from .obstacle_ui import ObstaclePalette
 from .rest_api import GameAPI
 from .test_maps import build_test_map, TEST_MAPS
 
 
-def copy_screenshot_to_clipboard(screen: pygame.Surface) -> None:
-    """Save the current frame and copy it to the system clipboard.
-    
-    Useful for quick bug reports: press ESC in-game to stop the car and
-    grab a screenshot you can immediately paste elsewhere.
+class TestFlags:
+    """Server-side state of the test pennants + HUD label.
+
+    Lives here (not in a renderer) since M5: the remote frontend draws
+    them from /state, the sim only owns their positions. flag_red is
+    given as [segment, progress] and resolved to a map position by the
+    main loop once the car's route covers that segment.
     """
-    import tempfile
-    from PIL import Image
-    
-    # Convert pygame surface -> PIL image (pygame lacks reliable PNG
-    # encoding on this platform, see docs/SPEC.md)
-    w, h = screen.get_size()
-    raw = pygame.image.tostring(screen, 'RGBA')
-    img = Image.frombytes('RGBA', (w, h), raw)
-    
-    path = tempfile.mktemp(suffix='.png')
-    img.save(path, 'PNG')
-    
-    if sys.platform == 'darwin':
-        import subprocess
-        subprocess.run([
-            'osascript', '-e',
-            f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)'
-        ], capture_output=True)
-        print(f"📷 Screenshot copied to clipboard (saved to {path})")
-    else:
-        print(f"📷 Screenshot saved to {path} (clipboard copy only supported on macOS)")
+    def __init__(self):
+        self.flag_green: list | None = None
+        self.flag_red: list | None = None
+        self.flag_red_pending: tuple | None = None
+        self.flag_red_nav: bool = True
+        self.hud_label: str | None = None
+
+
+class _NoKeys:
+    """Headless key state: nothing is pressed. API control drives the car."""
+    def __getitem__(self, key):
+        return False
+
+
+_NO_KEYS = _NoKeys()
 
 
 def _distance_to_junction(car, network) -> float:
@@ -84,24 +82,8 @@ def _flag_position_on_route(network, nav, seg_idx: int,
 
 
 def main(smoke_test_frames: int = 0):
-    """Run the game. If smoke_test_frames > 0, run headless for that many frames."""
-    # --- Init ---
-    pygame.init()
-    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT),
-                                     pygame.RESIZABLE)
-    pygame.display.set_caption("Car Game — Kleinmachnow")
-    clock = pygame.time.Clock()
-
-    # macOS: bring the window to the foreground (it may open behind the terminal
-    # or on another Space/display)
-    if sys.platform == "darwin":
-        import subprocess
-        subprocess.run([
-            "osascript", "-e",
-            f'tell application "System Events" to set frontmost of '
-            f'(first process whose unix id is {os.getpid()}) to true',
-        ], capture_output=True)
-
+    """Run the simulator (headless). If smoke_test_frames > 0, run for that
+    many frames and exit - used by CI to prove the sim stays alive."""
     # --- Load road data ---
     map_name = None
     if "--map" in sys.argv:
@@ -256,9 +238,9 @@ def main(smoke_test_frames: int = 0):
             print(f"Spawn: '{start_name}' (deterministic; --start <name> to change)")
     print("Navigation model: BICYCLE (kinematic, free particle)")
     
-    # --- Physics validator (can be toggled with V key) ---
+    # --- Physics validator (toggle via POST /toggle {"validator": false}) ---
     validator = PhysicsValidator(enabled=True)
-    print("Physics validator: ENABLED (press V to toggle)")
+    print("Physics validator: ENABLED")
     
     # --- Lane guard (wrong-side detection, softer than validator) ---
     lane_guard = LaneGuard(enabled=True)
@@ -289,7 +271,7 @@ def main(smoke_test_frames: int = 0):
         print("   Example: python -m src.main --api")
         print("   Then: curl http://localhost:5000/state\n")
 
-    # --- Camera + Renderer ---
+    # --- Sim camera (mirrored by the remote renderer via /state) ---
     camera = Camera(WINDOW_WIDTH, WINDOW_HEIGHT)
     if car is not None:
         camera.x, camera.y = car.x, car.y   # snap to car at start
@@ -298,26 +280,20 @@ def main(smoke_test_frames: int = 0):
         # --start point when given, else on the world centre - NOT fitted
         # to show the whole map: you want to watch the maneuver up close.
         # The suite's teleport then places the car exactly where the view
-        # is looking. The minimap keeps the overview; '-' / mouse wheel
-        # zooms out to see the full network.
+        # is looking; the Godot client mirrors this camera from /state.
         camera.zoom = 7.0
         if focus_point is not None:
             camera.x, camera.y = focus_point
         else:
             camera.x, camera.y = network.world_width / 2, network.world_height / 2
-    renderer = Renderer(network, camera)
-    renderer.hud_label = None  # optional short text (e.g. "2/3") set via API /label
-    obstacle_ui = ObstaclePalette(obstacle_mgr, network, camera, renderer)
+    flags = TestFlags()   # pennants + HUD label (exported via /state)
 
-    # --- Game loop ---
-    # Quit button (top-left, drawn topmost): an orderly way to end the game
-    # so a closed window is never mistaken for a crash by the e2e suite -
-    # every deliberate exit prints "orderly shutdown" to the log.
-    _quit_rect = pygame.Rect(10, 10, 64, 28)
+    # --- Game loop (headless, paced at 60 Hz) ---
     frame = 0
     running = True
     frozen = False
     dt_fixed = 1 / 60
+    _last_frame_wall = time.perf_counter()
     _physics_accum = 0.0
     _prev_render = None   # (x, y, heading) before the last physics substep
     while running:
@@ -326,157 +302,37 @@ def main(smoke_test_frames: int = 0):
             running = False
             break
 
-        frame_ms = clock.tick(60) if not smoke_test_frames else 1000.0 / 60
+        # Pacing: measure the real elapsed time since the last frame and
+        # sleep out the remainder of this frame's 60 Hz budget (the
+        # headless replacement for clock.tick(60)). A slow frame simply
+        # sleeps less; the fixed-timestep accumulator below catches up
+        # with capped substeps, so a stall never becomes a leap.
+        # Pacing (headless replacement for clock.tick(60)): measure the
+        # whole previous cycle (work + sleep) at the top, do the work,
+        # then sleep out the remainder of THIS frame's 60 Hz budget at the
+        # bottom. Anchoring the sleep target one cycle early instead would
+        # halve the steady-state period (~107 fps).
+        _now = time.perf_counter()
+        if not smoke_test_frames:
+            frame_ms = (_now - _last_frame_wall) * 1000.0
+            _last_frame_wall = _now
+        else:
+            frame_ms = 1000.0 / 60
         dt = frame_ms / 1000.0
-        # Clamp the physics step. If a frame stalls (route rebuild, GC, the
-        # window being dragged), the real elapsed time can be hundreds of
-        # milliseconds; integrating that in one go teleports the car metres
-        # downroad, straight through any geometry in between. Better to run
-        # briefly in slow motion than to take an unphysical leap.
+        # Clamp the physics step. If a frame stalls (route rebuild, GC),
+        # the real elapsed time can be hundreds of milliseconds; integrating
+        # that in one go teleports the car metres downroad, straight through
+        # any geometry in between. Better to run briefly in slow motion than
+        # to take an unphysical leap.
         dt = min(dt, 1.0 / 30.0)
 
-        # Events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                print("\n👋 Window closed - orderly shutdown (NOT a crash).")
-                running = False
-            elif event.type == pygame.VIDEORESIZE:
-                # Resizable window: rebuild the surface and tell the camera
-                # its new size (the renderer already uses live surface
-                # dimensions for everything it draws).
-                screen = pygame.display.set_mode((event.w, event.h),
-                                                 pygame.RESIZABLE)
-                camera.width, camera.height = event.w, event.h
-            elif event.type == pygame.MOUSEWHEEL:
-                camera.handle_zoom(event.y)
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                # The Quit button gets first claim; then the obstacle palette
-                # (slots, world obstacles); what both decline - empty map area
-                # - starts a camera pan drag.
-                if event.button == 1 and _quit_rect.collidepoint(event.pos):
-                    print("\n👋 Quit button pressed - orderly shutdown "
-                          "(NOT a crash).")
-                    running = False
-                elif not obstacle_ui.handle_event(event):
-                    camera.handle_mouse_down(event.button, event.pos)
-            elif event.type == pygame.MOUSEBUTTONUP:
-                if not obstacle_ui.handle_event(event):
-                    camera.handle_mouse_up(event.button)
-            elif event.type == pygame.MOUSEMOTION:
-                obstacle_ui.handle_event(event)
-                camera.handle_mouse_motion(event.pos)
-            elif event.type == pygame.KEYDOWN:
-                # Consumed while a layout name is being typed (ESC/ENTER/
-                # BACKSPACE must not trigger the game's shortcuts).
-                obstacle_ui.handle_keydown(event)
-            elif event.type == pygame.TEXTINPUT:
-                obstacle_ui.handle_textinput(event)
-
-        keys = pygame.key.get_pressed()
-
-        # While a layout name is being typed, ALL game keyboard shortcuts are
-        # suspended (typing 'b' must not toggle the breadcrumb trail, 'r' must
-        # not teleport a new car, ESC must not freeze). When typing ends, the
-        # edge-detect flags are reset so a still-held key cannot fire.
-        _typing = obstacle_ui.text_input_active()
-        if getattr(main, '_was_typing', False) and not _typing:
-            for _attr in ('_last_tab', '_last_b', '_last_r', '_last_v',
-                          '_last_u', '_last_esc'):
-                if hasattr(main, _attr):
-                    delattr(main, _attr)
-        main._was_typing = _typing
-
-        # Zoom with +/- keys
-        if not _typing and (keys[pygame.K_EQUALS] or keys[pygame.K_PLUS]):
-            camera.zoom_in()
-        if not _typing and keys[pygame.K_MINUS]:
-            camera.zoom_out()
-
-        # Toggle driver mode with TAB
-        if _typing:
-            main._last_tab = keys[pygame.K_TAB]
-        elif keys[pygame.K_TAB] and not hasattr(main, '_last_tab'):
-            main._last_tab = False
-        if keys[pygame.K_TAB] and not main._last_tab and car is not None and not _typing:
-            if isinstance(car.driver, BicycleDriver):
-                car.driver = KeyboardDriver()
-            else:
-                car.driver = BicycleDriver()
-                car.snap_to_road(network)
-                car.target_speed = car.speed
-            print(f"Driving mode: {car.driver.get_name()}")
-        main._last_tab = keys[pygame.K_TAB]
-        
-        # Toggle breadcrumb trail with B
-        if _typing:
-            main._last_b = keys[pygame.K_b]
-        elif keys[pygame.K_b] and not hasattr(main, '_last_b'):
-            main._last_b = False
-        if keys[pygame.K_b] and not main._last_b and car is not None and not _typing:
-            car.trail_enabled = not car.trail_enabled
-            print(f"Breadcrumb trail: {'ON' if car.trail_enabled else 'OFF'}")
-        main._last_b = keys[pygame.K_b]
-        
-        # Random location with R (destroy old car, create new one)
-        if _typing:
-            main._last_r = keys[pygame.K_r]
-        elif keys[pygame.K_r] and not hasattr(main, '_last_r'):
-            main._last_r = False
-        if keys[pygame.K_r] and not main._last_r and not _typing:
-            car = _create_car()
-            camera.snap_to(car.x, car.y, network.world_width, network.world_height)
-            print(f"\n🎲 New car at segment {car.seg_idx}, "
-                  f"Pos ({car.x:.0f}, {car.y:.0f})\n")
-        main._last_r = keys[pygame.K_r]
-        
-        # Toggle physics validator with V
-        if _typing:
-            main._last_v = keys[pygame.K_v]
-        elif keys[pygame.K_v] and not hasattr(main, '_last_v'):
-            main._last_v = False
-        if keys[pygame.K_v] and not main._last_v and not _typing:
-            if validator.enabled:
-                validator.disable()
-            else:
-                validator.enable()
-        main._last_v = keys[pygame.K_v]
-        
-        # U-turn (Wenden) with 'U' - one-shot request to the nav
-        if _typing:
-            main._last_u = keys[pygame.K_u]
-        elif keys[pygame.K_u] and not hasattr(main, '_last_u'):
-            main._last_u = False
-        if keys[pygame.K_u] and not main._last_u and car is not None and not _typing:
-            if isinstance(car.driver, BicycleDriver):
-                car.driver.uturn_requested = True
-                print("\n🔄 U-turn (Wenden) requested\n")
-        main._last_u = keys[pygame.K_u]
-
-        # Snap camera to car with 'C' key
-        if not _typing and keys[pygame.K_c] and car is not None:
-            camera.snap_to(car.x, car.y, network.world_width, network.world_height)
-        
-        # ESC: toggle freeze (pause game loop, take screenshot).
-        # While typing a layout name, ESC cancels the input instead
-        # (consumed by obstacle_ui.handle_keydown above).
-        if _typing:
-            main._last_esc = keys[pygame.K_ESCAPE]
-            esc_pressed_now = False
-        else:
-            if keys[pygame.K_ESCAPE] and not hasattr(main, '_last_esc'):
-                main._last_esc = False
-            esc_pressed_now = keys[pygame.K_ESCAPE] and not main._last_esc
-        if esc_pressed_now:
-            frozen = not frozen
-            if frozen:
-                print("\n⏸️  ESC: Game frozen (press ESC to resume)\n")
-            else:
-                print("▶️  ESC: Game resumed\n")
-        main._last_esc = keys[pygame.K_ESCAPE]
-
-        # In smoke test, simulate driving inputs
+        # Key state: headless - nothing is pressed; the REST API drives the
+        # car (POST /control). The smoke test simulates inputs directly.
         if smoke_test_frames:
-            keys = _FakeKeys(accel=True, right=(frame > smoke_test_frames // 2))
+            keys = {KEY_UP: True,
+                    KEY_RIGHT: frame > smoke_test_frames // 2}
+        else:
+            keys = _NO_KEYS
         
         # Handle API commands (if API enabled)
         if api:
@@ -519,7 +375,13 @@ def main(smoke_test_frames: int = 0):
             
             # Label command (short HUD text, e.g. "2/3" for a test's map tile)
             if 'label' in commands:
-                renderer.hud_label = commands['label']
+                flags.hud_label = commands['label']
+
+            # Freeze / resume (replaces the old ESC key).
+            if 'freeze' in commands:
+                frozen = bool(commands['freeze'])
+                print("\n⏸️  API: simulation FROZEN" if frozen
+                      else "▶️  API: simulation resumed")
 
             # Test confirmation flags: green at the scenario start
             # (car position, immediate), red at its end given as
@@ -531,22 +393,22 @@ def main(smoke_test_frames: int = 0):
                 # Only update the keys that are present, so setting the
                 # end flag doesn't wipe the start flag (and vice versa).
                 if 'green' in fl:
-                    renderer.flag_green = fl['green']
+                    flags.flag_green = fl['green']
                 if 'red' in fl:
                     if fl['red'] is None:
-                        renderer.flag_red = None
-                        renderer.flag_red_pending = None
+                        flags.flag_red = None
+                        flags.flag_red_pending = None
                         if car is not None and car.bicycle_nav is not None:
                             car.bicycle_nav.clear_destination()
                     else:
                         seg_idx, prog = fl['red'][0], fl['red'][1]
-                        renderer.flag_red = None
-                        renderer.flag_red_pending = (seg_idx, prog)
+                        flags.flag_red = None
+                        flags.flag_red_pending = (seg_idx, prog)
                         # red_nav (default True): the flag becomes the car's
                         # navigation destination (park at it). Running turn
                         # tests send red_nav=False - the flag is a visual
                         # end-of-test marker only (docs/TESTING.md).
-                        renderer.flag_red_nav = bool(fl.get('red_nav', True))
+                        flags.flag_red_nav = bool(fl.get('red_nav', True))
 
             # Hazard lights (Warnblinkanlage): explicit on/off command.
             if 'hazard' in commands and car is not None \
@@ -699,9 +561,9 @@ def main(smoke_test_frames: int = 0):
         # position + travel heading come from the route's node order, so
         # "right of the road" is correct even for backward-traversed
         # segments.
-        if renderer.flag_red_pending and car is not None \
+        if flags.flag_red_pending and car is not None \
                 and car.bicycle_nav is not None:
-            _fseg, _fprog = renderer.flag_red_pending
+            _fseg, _fprog = flags.flag_red_pending
             if _fseg in getattr(car.bicycle_nav, '_route_seg_set', set()):
                 _pos = _flag_position_on_route(network, car.bicycle_nav,
                                                _fseg, _fprog)
@@ -711,7 +573,7 @@ def main(smoke_test_frames: int = 0):
                     # running turn test (flag_red_nav=False): then it is a
                     # visual end-of-test marker only - the car drives THROUGH
                     # it and the harness ends the test on the crossing.
-                    if renderer.flag_red_nav:
+                    if flags.flag_red_nav:
                         # Truncate the reference line at the centreline
                         # point so the car parks AT the flag (parking ramp +
                         # kerb drift + stop), not at whatever dead end the
@@ -730,81 +592,20 @@ def main(smoke_test_frames: int = 0):
                     _frad = math.radians(_fh)
                     _fright = (math.cos(_frad), -math.sin(_frad))
                     _foff = kerb_offset_m(network.segments[_fseg].width)
-                    renderer.flag_red = [
+                    flags.flag_red = [
                         _fx + _fright[0] * _foff,
                         _fy + _fright[1] * _foff,
                         _fh,
                     ]
-                    renderer.flag_red_pending = None
+                    flags.flag_red_pending = None
 
         _t_d = time.perf_counter()
         # Camera follow (only when moving and not frozen) - follows the
-        # INTERPOLATED position so road and car stay in sync on screen.
+        # INTERPOLATED position; the remote renderer mirrors this camera.
         if not frozen:
             camera.update(_rx, _ry, network.world_width, network.world_height,
                           follow=(car is not None and abs(car.speed) > 0.1))
 
-        # Render
-        screen.fill(BG_COLOR)  # solid grass-green background
-        renderer.draw(screen, car)
-        obstacle_ui.draw_world(screen)   # obstacles: above roads, below car/HUD
-        if car is not None:
-            car.draw(screen, camera)
-            renderer.draw_trail(screen, car)  # after sprite so buckets are visible
-        
-        # HUD: off-road warning LED (FREE mode, solid red with "OFF")
-        if free_off_road:
-            wx = WINDOW_WIDTH - 50
-            wy = WINDOW_HEIGHT - 90
-            pygame.draw.circle(surface=screen, color=(120, 0, 0), center=(wx, wy), radius=16)
-            pygame.draw.circle(surface=screen, color=(255, 30, 30), center=(wx, wy), radius=16, width=3)
-            screen.blit(renderer._hud_text("off_road", "OFF-ROAD", 12, (255, 80, 80)),
-                        (wx - 24, wy - 24))
-
-        # FROZEN overlay: while paused the driver logic (blinkers, turns)
-        # is skipped entirely, so a frozen game looks dead. Make it
-        # unmistakable on screen - previously the only hint was a console
-        # print, and players thought the controls were broken.
-        if frozen:
-            overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT),
-                                     pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 110))
-            screen.blit(overlay, (0, 0))
-            t1 = renderer._hud_text("frozen_big", "FROZEN", 48, (255, 255, 255))
-            t2 = renderer._hud_text("frozen_small", "press ESC to resume",
-                                    20, (255, 220, 120))
-            screen.blit(t1, ((WINDOW_WIDTH - t1.get_width()) // 2,
-                             WINDOW_HEIGHT // 2 - 40))
-            screen.blit(t2, ((WINDOW_WIDTH - t2.get_width()) // 2,
-                             WINDOW_HEIGHT // 2 + 20))
-
-        # Obstacle palette panel + drag ghost (topmost layer, next to the
-        # minimap; must stay visible above the frozen overlay so layouts can
-        # be edited while the simulation is paused).
-        obstacle_ui.draw_panel(screen)
-
-        # Quit button (top-left, topmost layer): click for an orderly
-        # shutdown - see _quit_rect above.
-        pygame.draw.rect(screen, (178, 58, 58), _quit_rect, border_radius=6)
-        pygame.draw.rect(screen, (235, 235, 235), _quit_rect,
-                         width=1, border_radius=6)
-        _qt = renderer._hud_text("quit_btn", "Quit", 18, (255, 255, 255))
-        screen.blit(_qt, (_quit_rect.centerx - _qt.get_width() // 2,
-                          _quit_rect.centery - _qt.get_height() // 2))
-
-        # HUD: wrong-side warning LED (blinks red when on opposing lane).
-        # In FREE mode this is the ONLY consequence - the process survives.
-        if on_wrong_side:
-            # Blink at ~3 Hz (on for 10 frames, off for 10 frames at 60 fps)
-            if frame % 20 < 15:
-                wx = WINDOW_WIDTH - 50
-                wy = WINDOW_HEIGHT - 50
-                pygame.draw.circle(surface=screen, color=(120, 0, 0), center=(wx, wy), radius=16)
-                pygame.draw.circle(surface=screen, color=(255, 30, 30), center=(wx, wy), radius=16, width=3)
-                screen.blit(renderer._hud_text("wrong_side", "WRONG SIDE", 12, (255, 80, 80)),
-                            (wx - 40, wy - 24))
-
-        pygame.display.flip()
         _t_e = time.perf_counter()
 
         # TEMP perf probe (remove after diagnosis)
@@ -828,11 +629,21 @@ def main(smoke_test_frames: int = 0):
                       f"pattern={''.join(str(min(s, 2)) for s in _sl[:48])}",
                       flush=True)
 
-        # On freeze: capture this frame and copy to clipboard
-        if esc_pressed_now and frozen:
-            copy_screenshot_to_clipboard(screen)
-        
-        # Update API state and screenshot (if API enabled)
+        # Sleep out the remainder of this frame's budget (see pacing note
+        # at the top of the loop). Plain time.sleep overshoots badly on
+        # this platform (a 16.7 ms sleep took 25 ms - timer quantization),
+        # which dragged the sim down to ~43 fps; so sleep only most of the
+        # remainder and busy-spin the last slice for exact pacing.
+        if not smoke_test_frames:
+            _rem = dt_fixed - (time.perf_counter() - _now)
+            if _rem > 0:
+                _SPIN_S = 0.012   # spin window: absorbs the sleep overshoot
+                if _rem > _SPIN_S:
+                    time.sleep(_rem - _SPIN_S)
+                while time.perf_counter() < _now + dt_fixed:
+                    pass
+
+        # Update API state (if API enabled)
         if api:
             if car is None:
                 # No car on the map yet (test maps don't auto-spawn):
@@ -848,14 +659,14 @@ def main(smoke_test_frames: int = 0):
                     # Test flags (green start / red end pennant) in world
                     # pixels, or None: the Godot renderer draws them.
                     'flags': {
-                        'green': list(renderer.flag_green)
-                        if renderer.flag_green else None,
-                        'red': list(renderer.flag_red)
-                        if renderer.flag_red else None,
+                        'green': list(flags.flag_green)
+                        if flags.flag_green else None,
+                        'red': list(flags.flag_red)
+                        if flags.flag_red else None,
                     },
                     # Short HUD label (e.g. "5/21") set via POST /label -
-                    # the remote renderer shows it like pygame does.
-                    'hud_label': renderer.hud_label,
+                    # the remote renderer shows it like pygame did.
+                    'hud_label': flags.hud_label,
                     'camera_x': camera.x,
                     'camera_y': camera.y,
                     'camera_zoom': camera.zoom,
@@ -917,35 +728,20 @@ def main(smoke_test_frames: int = 0):
                     'blinker_right': bool(getattr(car.driver, 'blinker_right', False)),
                     'lane_guard_stats': lane_guard.stats(car),
                     # (The breadcrumb trail is NOT exported here: it is a
-                    # pure visual and the remote renderer records it client-
-                    # side from the x/y/heading samples. pygame draws
-                    # car.trail locally.)
+                    # pure visual and the Godot frontend records it client-
+                    # side from the x/y/heading samples.)
                     'flags': {
-                        'green': list(renderer.flag_green)
-                        if renderer.flag_green else None,
-                        'red': list(renderer.flag_red)
-                        if renderer.flag_red else None,
+                        'green': list(flags.flag_green)
+                        if flags.flag_green else None,
+                        'red': list(flags.flag_red)
+                        if flags.flag_red else None,
                     },
                     # Short HUD label (e.g. "5/21") set via POST /label.
-                    'hud_label': renderer.hud_label,
+                    'hud_label': flags.hud_label,
                     'camera_x': camera.x,
                     'camera_y': camera.y,
                     'camera_zoom': camera.zoom,
                 })
-            
-            # Update screenshot (every 10 frames to reduce overhead)
-            if frame % 10 == 0 and not smoke_test_frames:
-                # Convert surface to PNG bytes
-                import io
-                png_io = io.BytesIO()
-                pygame.image.save(screen, png_io)
-                png_io.seek(0)
-                api.update_screenshot(png_io.read())
-
-        # Debug: dump framebuffer after a few frames
-        if "--dump" in sys.argv and frame == 30:
-            pygame.image.save(screen, "/tmp/car_frame.bmp")
-            print("Dumped frame to /tmp/car_frame.bmp")
 
     if smoke_test_frames:
         if car is not None:
@@ -954,28 +750,9 @@ def main(smoke_test_frames: int = 0):
         else:
             print(f"Smoke test OK: {frame} frames, no car on map, "
                   f"zoom={camera.zoom:.2f}")
-        pygame.quit()
         return
 
-    pygame.quit()
     sys.exit()
-
-
-class _FakeKeys:
-    """Simulates pygame.key.get_pressed() for smoke testing."""
-    def __init__(self, accel=False, brake=False, left=False, right=False):
-        self._pressed = set()
-        if accel:
-            self._pressed.add(pygame.K_UP)
-        if brake:
-            self._pressed.add(pygame.K_DOWN)
-        if left:
-            self._pressed.add(pygame.K_LEFT)
-        if right:
-            self._pressed.add(pygame.K_RIGHT)
-
-    def __getitem__(self, key):
-        return key in self._pressed
 
 
 if __name__ == "__main__":

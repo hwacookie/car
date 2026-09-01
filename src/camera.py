@@ -1,10 +1,9 @@
 # Camera / Viewport
-# Follows the car with smooth interpolation, supports zoom in/out,
-# and left-mouse drag to pan the map.
+# The sim's camera: follows the car with smooth interpolation. Headless
+# since M5 - there is no window; the remote renderer (Godot) mirrors
+# x/y/zoom from /state, so this object only holds and updates the view.
 
 from __future__ import annotations
-
-import pygame
 
 from . import config
 
@@ -71,36 +70,3 @@ class Camera:
 
     def zoom_out(self):
         self.zoom = max(self.zoom / config.ZOOM_STEP, config.MIN_ZOOM)
-
-    def handle_zoom(self, delta: float):
-        """Mouse wheel delta (>0 = zoom in, <0 = zoom out)."""
-        if delta > 0:
-            self.zoom_in()
-        elif delta < 0:
-            self.zoom_out()
-
-    # --- Mouse drag ---
-
-    def handle_mouse_down(self, button: int, pos: tuple[int, int]):
-        """Start dragging on left mouse button (button 1). The obstacle
-        palette gets first claim on LMB events; this only sees the presses
-        it declined (empty map area), so a plain click just starts and ends
-        a zero-length drag."""
-        if button == 1:  # left mouse button
-            self._dragging = True
-            self._drag_start_mouse = pos
-            self._drag_start_camera = (self.x, self.y)
-
-    def handle_mouse_up(self, button: int):
-        """Stop dragging."""
-        if button == 1:
-            self._dragging = False
-
-    def handle_mouse_motion(self, pos: tuple[int, int]):
-        """Drag the map by moving camera opposite to mouse movement."""
-        if self._dragging:
-            dx = pos[0] - self._drag_start_mouse[0]
-            dy = pos[1] - self._drag_start_mouse[1]
-            # Camera moves opposite to mouse drag (map follows cursor)
-            self.x = self._drag_start_camera[0] - dx / self.zoom
-            self.y = self._drag_start_camera[1] + dy / self.zoom  # +dy because screen Y is down

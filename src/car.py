@@ -4,16 +4,13 @@
 from __future__ import annotations
 
 import math
-import pygame
 
 from . import config
 
 
 class Car:
-    """A car with physics, state, and rendering. Controlled by a Driver."""
-    
-    # Class variable: cached sprite images
-    _sprite_cache = {}
+    """A car with physics and state. Controlled by a Driver.
+    (Rendering lives in the remote frontend since M5.)"""
 
     # Monotonic per-instance identity. NOT id(): CPython reuses addresses,
     # so a freshly created Car can land on the freed address of the one it
@@ -372,114 +369,3 @@ class Car:
         """
         bx, by = self.body_center()
         return network.is_car_on_road(bx, by, self.heading)
-    
-    # --- Rendering ---
-    
-    def draw(self, surface: pygame.Surface, camera):
-        """Draw the car sprite."""
-        # The sprite is the BODY, which sits ahead of the rear axle that
-        # (self.x, self.y) tracks - and at the INTERPOLATED render position
-        # so fixed-timestep substeps never show up as pixel jumps.
-        sx, sy = camera.world_to_screen(*self.render_body_center())
-        sx, sy = int(sx), int(sy)
-        scale = camera.zoom
-        
-        # Calculate desired size in screen pixels
-        # CAR_LENGTH and CAR_WIDTH are in meters
-        car_length_px = config.CAR_LENGTH * config.PIXELS_PER_METER * scale
-        car_width_px = config.CAR_WIDTH * config.PIXELS_PER_METER * scale
-        
-        # Load base sprite (high-res version)
-        base_sprite = self._get_base_sprite()
-        
-        # Scale sprite to match world dimensions
-        scaled_sprite = pygame.transform.scale(base_sprite, (int(car_width_px), int(car_length_px)))
-        
-        # Rotate sprite
-        rotated = pygame.transform.rotate(
-            scaled_sprite, -self.render_heading())
-        
-        # Center and draw
-        rect = rotated.get_rect(center=(sx, sy))
-        surface.blit(rotated, rect)
-        
-        # Draw dynamic lights on top (blinkers) - in BOTH modes: in FREE
-        # mode the human flicks Q/E and of course expects to see the light.
-        if self.driver and hasattr(self.driver, 'blinker_left'):
-            self._draw_blinkers(surface, sx, sy, scale)
-    
-    def _get_base_sprite(self) -> pygame.Surface:
-        """Load and cache the base car sprite (high-res version)."""
-        import os
-        from PIL import Image
-        
-        sprite_file = 'car_64x128.png'  # Use high-res version as base
-        
-        # Check cache
-        if sprite_file not in Car._sprite_cache:
-            # Load sprite using PIL (pygame doesn't have PNG support)
-            sprite_path = os.path.join(os.path.dirname(__file__), '..', 'assets', sprite_file)
-            if os.path.exists(sprite_path):
-                # Load with PIL
-                pil_image = Image.open(sprite_path).convert('RGBA')
-                # Convert PIL image to pygame surface
-                mode = pil_image.mode
-                size = pil_image.size
-                data = pil_image.tobytes()
-                surf = pygame.image.fromstring(data, size, mode)
-                Car._sprite_cache[sprite_file] = surf
-            else:
-                # Fallback: create simple colored rectangle if sprite not found
-                size = (64, 128)
-                surf = pygame.Surface(size, pygame.SRCALPHA)
-                pygame.draw.rect(surf, (180, 30, 30), surf.get_rect())
-                Car._sprite_cache[sprite_file] = surf
-        
-        return Car._sprite_cache[sprite_file]
-    
-    def _draw_blinkers(self, surface: pygame.Surface, sx: float, sy: float, scale: float):
-        """Draw the four CORNER blinker lights (orange, flashing).
-
-        One light at each body corner (front/rear x left/right). A normal
-        indicator lights its two corners; the hazard lights (Warnblinkanlage)
-        light all four in sync.
-        """
-        if not self.driver or not hasattr(self.driver, 'blinker_left'):
-            return
-
-        left = self.driver.blinker_left
-        right = self.driver.blinker_right
-        hazard = getattr(self.driver, 'hazard', False)
-        if not (left or right or hazard):
-            return
-
-        # Flash with 0.5s period (all corners in sync, like real hazards)
-        import time
-        if (time.time() % 0.5) > 0.25:
-            return
-
-        half_wid = (config.CAR_WIDTH / 2) * config.PIXELS_PER_METER * scale
-        fore = (config.CAR_LENGTH / 2) * 0.85 * config.PIXELS_PER_METER * scale
-        lat = half_wid * 0.75
-        rad = math.radians(self.render_heading())
-
-        for fore_sign in (+1, -1):          # front, rear
-            for side_sign, active in ((-1, left), (1, right)):
-                if hazard:
-                    active = True           # hazards: all four corners
-                if not active:
-                    continue
-                bx = sx + math.sin(rad) * fore_sign * fore \
-                       + math.cos(rad) * side_sign * lat
-                by = sy - math.cos(rad) * fore_sign * fore \
-                       + math.sin(rad) * side_sign * lat
-                # Scales with zoom like the sprite does, but sub-linearly
-                # and clamped: a real indicator is a small fraction of the
-                # body width. At zoom 1 the car is ~9 px long and the light
-                # stays a visible dot; at zoom 7 (62 px car) it's a proper
-                # corner light - not a blob covering half the body.
-                r = max(2, min(7, int(scale * 0.8)))
-                pygame.draw.circle(surface, (160, 90, 0),
-                                   (int(bx), int(by)), r + 3)
-                pygame.draw.circle(surface, (255, 180, 0),
-                                   (int(bx), int(by)), r)

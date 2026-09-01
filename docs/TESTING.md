@@ -35,27 +35,30 @@ python -m src.main --map basic --api
   for manual play but not useful for deterministic tests (no fixed,
   named start points).
 - `--api` starts a Flask server on `http://localhost:5000` in a
-  background thread, alongside the normal Pygame window/loop.
-- The game window and the API run **simultaneously** - a test script
-  hitting the API is really just remote-controlling (and reading state
-  from) the same live game a human would see on screen.
+  background thread.
+- Since M5 the sim is **always headless** - there is no pygame anywhere
+  in the package. The 60 Hz game loop paces itself with a hybrid
+  sleep+spin (plain `time.sleep` overshoots ~50% on this platform, which
+  would drag the sim to ~43 fps), and all visualization lives in the
+  Godot frontend (`/Users/hauke/prj/driving-game/`), which polls
+  `GET /state` at ~60 Hz. A test script hitting the API is really just
+  remote-controlling (and reading state from) the same live sim the
+  Godot window renders.
 
-### Headless vs. visible
+### Watching a run
 
-- **Default: visible.** Just omit `SDL_VIDEODRIVER` - the game window
-  opens normally and updates in real time while the test script drives
-  it via the API. This is genuinely useful for debugging: you can
-  literally watch the car take a turn while a test script asserts on
-  the exact same state.
-- **Use `SDL_VIDEODRIVER=dummy` ONLY when testing in a build system
-  (CI) or when the user explicitly asks for it.** Do not reach for it
-  by default on a developer machine:
-  ```bash
-  SDL_VIDEODRIVER=dummy python -m src.main --map basic --api
-  ```
+Start the sim, then start the Godot frontend in a second terminal:
 
-Either way, the API and test behavior are identical - `SDL_VIDEODRIVER`
-only affects whether Pygame renders to a real window.
+```bash
+python -m src.main --map basic --api
+# second terminal:
+/Applications/Godot_mono.app/Contents/MacOS/Godot --path /Users/hauke/prj/driving-game
+```
+
+The window shows the map, the car (sprite, blinkers, wheel breadcrumbs),
+the test flags and the HUD label - and mirrors the sim's camera. This is
+genuinely useful for debugging: you can literally watch the car take a
+turn while a test script asserts on the exact same state.
 
 ## 2. Run the test suite against it
 
@@ -84,9 +87,7 @@ This is the main test script. It:
    - **instant heading snaps** (>30° heading change in one frame - a
      physics bug, not a real turn)
    - whether the car actually changed to the expected next road segment
-4. Prints a pass/fail summary, and on failure saves a screenshot via
-   `GET /screenshot` to `/tmp/violation_<name>_<timestamp>.png` so you
-   can see exactly what went wrong.
+4. Prints a pass/fail summary.
 
 ### Selecting scenarios
 
@@ -101,7 +102,7 @@ python tests/test_turning.py --failfast           # stop at the first failure
 Numbering is preserved when filtering, so "TEST 7/18" always identifies the
 same scenario - the point being to jump straight back to one that failed.
 
-Test maps do NOT auto-spawn a car: the window opens with just the map
+Test maps do NOT auto-spawn a car: the sim starts with no car
 (`GET /state` reports `has_car: false`) and the suite's setup teleport
 creates the car at the scenario's start point before any driving. An
 explicit `--start <name>` still places a car at that named point (e.g.
@@ -130,17 +131,17 @@ The optional `[end_segment]` sets the red end flag at that segment's FIRST
 through it and the run ends on the crossing, exactly like the full
 suite's running turn tests. Without it the nav has no destination at all:
 the car just drives through. To watch a parking maneuver live in the
-window, run one of the parking-offset scenarios from the suite instead
+Godot window, run one of the parking-offset scenarios from the suite instead
 (`python tests/test_turning.py --tests park_6lane_right_lane`): only those
 set the flag as the nav's destination and trigger the full parking
 approach (including reverse-in where the geometry calls for it).
 
 ### Cockpit controller (`tools/controller.py`)
 
-The driver's cockpit is a **separate window** (its own process) that talks
-to the game over the same REST API - the game window stays a pure world
-view. It shows the dashboard (speed, lamps, OFF-ROAD / WRONG-SIDE warnings,
-fed by `GET /state`) plus one of two panels:
+The driver's cockpit is a **separate window** (its own process, its own
+pygame) that talks to the game over the same REST API - the Godot frontend
+stays a pure world view. It shows the dashboard (speed, lamps,
+OFF-ROAD / WRONG-SIDE warnings, fed by `GET /state`) plus one of two panels:
 
 ```bash
 python tools/controller.py                 # TEST mode (default): runs the suite
@@ -159,8 +160,8 @@ python tools/controller.py --drive         # DRIVE mode: manual driving console
 - **DRIVE mode** is a manual driving console for FREE mode: hold-buttons
   for steering/gas/brake plus one-shot blinker stalks, hazard and U-turn -
   mouse or keyboard (arrows/WASD, Q/E, H, U). `F` switches the game between
-  AI (BICYCLE) and manual (FREE), like TAB in the game window. Both panels
-  feed the same `POST /control` channel the test runner uses.
+  AI (BICYCLE) and manual (FREE) via `POST /toggle`. Both panels feed the
+  same `POST /control` channel the test runner uses.
 
 `python tests/test_turning.py` remains the headless/CI way to run the suite;
 the cockpit is the visible, interactive one.
@@ -300,9 +301,9 @@ curl -s http://localhost:5000/start_points | python3 -m json.tool
 ## 5. Showing which test is running in the HUD
 
 `tests/test_turning.py` also calls `POST /label` (see `docs/REST_API.md`)
-with the **current test number** (`"10/15"`), shown top-right of the game
-window below the minimap - purely a visual aid so a human watching the
-window can tell at a glance which scenario is currently being driven.
+with the **current test number** (`"10/15"`), shown in the Godot window
+- purely a visual aid so a human watching it can tell at a glance which
+scenario is currently being driven.
 Standalone runs (no suite context) fall back to the start point's map-tile
 number: `START_POINT_NUMBER` in `test_turning.py` maps each start point
 name to that number (1 = top-left tile of the minimap, counted left-to-right
@@ -317,9 +318,8 @@ above `START_POINT_NUMBER` for why).
   including corners and the roundabout ring), SAT collision geometry,
   stop-on-contact physics (full braking, no interpenetration, plus a
   high-speed approach with per-substep heading drift as regression for
-  the live pass-through bug), layout save/load and map scoping, the
-  `/obstacles` REST handlers via Flask's test client, and headless
-  palette drag handling. No game process needed:
+  the live pass-through bug), layout save/load and map scoping, and the
+  `/obstacles` REST handlers via Flask's test client. No game process needed:
   `.venv/bin/python -m pytest tests/test_obstacles.py -q`.
 - **`tests/test_road_network.py`** (headless pytest) - road network /
   smoothed geometry unit tests.
@@ -335,15 +335,15 @@ above `START_POINT_NUMBER` for why).
 
 This is the actual workflow used throughout this project's development:
 
-1. Start the game (visible, so you can watch): `python -m src.main --map basic --api`
+1. Start the sim + Godot frontend (see "Watching a run" above)
 2. Run one failing scenario: `python tests/test_turning.py --only <name> <direction> <speed>`
-3. Watch the window while it runs, and/or inspect the printed physics
+3. Watch the Godot window while it runs, and/or inspect the printed physics
    debug output (turn planning, arc validation, off-road/teleportation
    watchdog messages - see `PhysicsValidator`, `LaneGuard` and
    `BicycleNav` in `src/`).
-4. If it fails, the violation screenshot in `/tmp/` plus `GET /state`
-   polled by hand (`curl http://localhost:5000/state`) is usually enough
-   to pin down *where* and *at what exact frame* things went wrong.
+4. If it fails, `GET /state` polled by hand (`curl http://localhost:5000/state`)
+   is usually enough to pin down *where* and *at what exact frame* things
+   went wrong.
 5. Fix the code, restart the game process (state like cached geometry
    is built once at startup, so a code change needs a fresh process),
    and re-run the same `--only` scenario before moving on to the full
@@ -356,18 +356,9 @@ This is the actual workflow used throughout this project's development:
   quick.
 - `POST /reset` clears all control inputs (accelerate/brake/blinkers)
   back to `False`; `test_turning.py` calls this before every test.
-- Pressing **ESC** in a visible game window triggers an emergency stop
-  (sets speed to 0) - useful for humans, but during an automated test
-  run this can interact badly with an in-progress turn plan (a stale
-  plan targeting nonzero speed can raise a teleportation-watchdog
-  exception and kill the game process). Avoid touching the window's
-  keyboard focus while a test script is actively driving it.
-- **`GET /screenshot` is unreliable while the game window is not
-  frontmost on macOS.** When the window is occluded, SDL stops
-  presenting and the readback can come back as a black/partial frame
-  (stray pixel columns, missing roads) that looks like a rendering bug
-  but isn't - the on-screen window is fine. If you need to verify
-  pixels programmatically, run the game with `SDL_VIDEODRIVER=dummy`
-  (direct CPU-surface readback) instead of screenshotting an occluded
-  visible window.
+- **`POST /freeze {"frozen": true}`** pauses the simulation (replaces
+  the old ESC key). During an automated test run this can interact badly
+  with an in-progress turn plan (a stale plan targeting nonzero speed can
+  raise a teleportation-watchdog exception and kill the game process).
+  Avoid freezing while a test script is actively driving.
 </content>

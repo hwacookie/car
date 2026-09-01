@@ -131,18 +131,27 @@ Godot renders the existing world in **2D top-down with exact parity to
 pygame**; the AI driver stays inside the simulator. Zero behavior change,
 e2e stays green. Parity against the pygame output is the acceptance test.
 
-- **M1** — `GET /map` + Godot renders the static map (roads, markings,
-  junction dots, colors per current config)
-- **M2** — car appears and follows (state polling, interpolation, camera
-  follow/zoom/pan)
-- **M3** — free-mode driving from the Godot window via REST (also measures
-  real input latency for the Phase-2 decision)
-- **M4** — parity: minimap, HUD, test flags, obstacles + palette, freeze,
-  labels, trail
-- **M5** — pygame out: `renderer.py`/`camera.py`/`obstacle_ui.py` and the
-  drawing in `main.py` are removed; the simulator runs headless by default;
-  `docs/TESTING.md` workflow updated ("Godot window instead of pygame
-  window")
+- **M1** — DONE: `GET /map` + Godot renders the static map (roads,
+  markings, junction dots, colors per current config)
+- **M2** — DONE: car appears and follows (60 Hz state polling,
+  interpolation with 100 ms render delay, camera mirroring the sim's
+  camera, minimap)
+- **M3** — DONE (visual parity): car sprite + blinkers + wheel
+  breadcrumbs, test flags, HUD label, smooth rendering pipeline (double
+  HTTPRequest pipeline, 1 s-window sim-rate estimate, extrapolation).
+  NOTE: the original M3 scope "free-mode driving from the Godot window"
+  was deferred to AFTER M5 by decision.
+- **M4** — PARTIAL: minimap/HUD/flags/trail done; remaining: obstacles +
+  palette, freeze overlay
+- **M5** — DONE (user-reordered ahead of free driving): pygame is out of
+  the package. `renderer.py`, `obstacle_ui.py`, `road_surface.py` deleted;
+  the sim runs headless at a self-paced 60 Hz (hybrid sleep+spin pacing -
+  plain `time.sleep` overshoots ~50% on this platform); flag/HUD state
+  moved to a `TestFlags` object in `main.py`; `Camera` kept as pure state
+  (Godot mirrors it via `/state`); new `POST /freeze` replaces the ESC key;
+  `GET /screenshot` removed; `docs/TESTING.md` workflow updated.
+  **Next: M3-free** — free-mode driving from the Godot window via REST
+  (also measures real input latency for the Phase-2 decision)
 
 ### Phase 2 — planning outside (goal state)
 

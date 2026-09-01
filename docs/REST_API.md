@@ -6,7 +6,7 @@ The game includes an optional REST API for remote control and automated testing.
 - Control the car programmatically
 - Monitor game state in real-time
 - Automate testing scenarios
-- Capture screenshots
+- Freeze / resume the simulation
 - Toggle features remotely
 
 ## Starting the API
@@ -136,12 +136,16 @@ Content-Type: application/json
 }
 ```
 
-### Get Screenshot
+### Freeze / Resume
 ```bash
-GET /screenshot
+POST /freeze
+Content-Type: application/json
+
+{"frozen": true}   # or false to resume
 ```
 
-Returns PNG image of current frame.
+Pauses the simulation (replaces the old ESC key in the pygame window).
+`GET /state` reports `"frozen": true` while paused.
 
 ### Wait for Condition
 ```bash
@@ -247,8 +251,9 @@ curl -X POST http://localhost:5000/toggle \
   -H "Content-Type: application/json" \
   -d '{"breadcrumbs": true}'
 
-# Get screenshot
-curl http://localhost:5000/screenshot -o frame.png
+# Freeze the simulation (e.g. to inspect state)
+curl -X POST http://localhost:5000/freeze \
+  -H "Content-Type: application/json" -d '{"frozen": true}'
 ```
 
 ## Automated Testing
@@ -302,33 +307,24 @@ for i in range(600):  # 10 seconds at 60 FPS
 # Analyze positions, speeds, etc.
 ```
 
-### 3. Visual Regression Testing
+### 3. State Snapshots
 
-```python
-# Drive to known location
-requests.post(f"{API}/teleport", json={"segment": 42, "progress": 0.5})
-
-# Capture screenshot
-response = requests.get(f"{API}/screenshot")
-with open('expected.png', 'wb') as f:
-    f.write(response.content)
-
-# Compare with reference image
-```
+Since M5 the sim is headless - there is no server-side rendering to
+screenshot. Visual verification happens in the Godot frontend; for
+automated checks, snapshot `GET /state` (position, heading, segment,
+flags) instead of pixels.
 
 ## Architecture
 
 The API runs in a **separate thread** from the game loop:
 - **Thread-safe** state sharing via `threading.Lock`
-- **Non-blocking** - game continues at 60 FPS
-- **Low overhead** - screenshot updates every 10 frames only
+- **Non-blocking** - game continues at 60 FPS (headless, self-paced)
 
 Game loop flow:
-1. Handle API commands (teleport, toggle)
-2. Merge API control inputs with keyboard
-3. Update car physics
+1. Handle API commands (teleport, toggle, freeze, flags, label)
+2. Update car physics (fixed timestep, accumulator)
+3. Update camera
 4. Update API state
-5. Update screenshot (every 10 frames)
 
 ## Security Note
 

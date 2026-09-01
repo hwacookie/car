@@ -641,20 +641,6 @@ class TurnTester:
         response = requests.get(f"{API_URL}/start_points")
         return response.json()
     
-    def save_violation_screenshot(self, test_name: str, state: dict):
-        """Save screenshot when violation detected."""
-        try:
-            response = requests.get(f"{API_URL}/screenshot")
-            if response.status_code == 200:
-                filename = f"/tmp/violation_{test_name}_{int(time.time())}.png"
-                with open(filename, 'wb') as f:
-                    f.write(response.content)
-                print(f"      📷 Screenshot saved: {filename}")
-                return filename
-        except Exception as e:
-            print(f"      ⚠️  Screenshot failed: {e}")
-        return None
-    
     def _drive_to_segment_end_and_stop(self, target_segment: int, start_time: float,
                                         max_extra_time: float = 25.0,
                                         abort_check: "callable | None" = None):
@@ -1201,8 +1187,6 @@ class TurnTester:
                 print(f"      Distance: {moved_m:.1f}m (max plausible: {max_plausible_m:.1f}m "
                       f"over {poll_dt:.3f}s)")
                 print(f"      Speed: {violation_details['speed_kmh']:.0f} km/h")
-                screenshot = self.save_violation_screenshot(f"{direction}_teleport", state)
-                violation_details['screenshot'] = screenshot
                 break
             last_poll_pos = (state['x'], state['y'])
             last_poll_speed_kmh = state['speed_kmh']
@@ -1256,10 +1240,7 @@ class TurnTester:
                 print(f"      Change: {heading_diff:.1f}° (max allowed: 30°)")
                 print(f"      Position: ({violation_details['position'][0]:.0f}, {violation_details['position'][1]:.0f})")
                 print(f"      Speed: {violation_details['speed_kmh']:.0f} km/h")
-                
-                # Save screenshot
-                screenshot = self.save_violation_screenshot(f"{direction}_snap", state)
-                violation_details['screenshot'] = screenshot
+
                 
                 break
             
@@ -1289,10 +1270,7 @@ class TurnTester:
                 print(f"      Heading: {violation_details['heading']:.1f}°")
                 print(f"      Speed: {violation_details['speed_kmh']:.0f} km/h")
                 print(f"      Segment: {violation_details['segment']}")
-                
-                # Save screenshot
-                screenshot = self.save_violation_screenshot(f"{direction}_offroad", state)
-                violation_details['screenshot'] = screenshot
+
                 
                 break
             
@@ -1320,10 +1298,7 @@ class TurnTester:
                 print(f"      Heading: {state['heading']:.1f}°")
                 print(f"      Speed: {state['speed_kmh']:.0f} km/h")
                 print(f"      Segment: {state['segment']}")
-                
-                # Save screenshot
-                screenshot = self.save_violation_screenshot(f"{direction}_wrongside", state)
-                violation_details['screenshot'] = screenshot
+
                 
                 break
             
