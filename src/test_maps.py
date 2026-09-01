@@ -503,40 +503,28 @@ def build_basic_test_map() -> RoadNetwork:
     # on that branch passes OVER the other branch.
     ox, oy = origin(1, 3)
     px, py = ox + 250, oy + 250            # the crossing point P
-    # Left lobe (bulges west): b1..b6 around the oval, pinch at P.
-    b.node("fig8_p1", px, py)              # NE-SW branch node (bridge)
-    b.node("fig8_p2", px, py)              # NW-SE branch node (ground)
-    b.node("fig8_b1", px - 60,  py - 70)   # SW arm end (below-left of P)
-    b.node("fig8_b2", px - 120, py - 130)  # lobe bottom
-    b.node("fig8_b3", px - 210, py - 90)
-    b.node("fig8_b4", px - 240, py)        # leftmost point
-    b.node("fig8_b5", px - 210, py + 90)
-    b.node("fig8_b6", px - 120, py + 130)  # lobe top (NW arm start)
-    # Right lobe (bulges east): point-symmetric about P.
-    b.node("fig8_r1", px + 60,  py - 70)   # SE arm end (below-right of P)
-    b.node("fig8_r2", px + 120, py - 130)  # lobe bottom
-    b.node("fig8_r3", px + 210, py - 90)
-    b.node("fig8_r4", px + 240, py)        # rightmost point
-    b.node("fig8_r5", px + 210, py + 90)
-    b.node("fig8_r6", px + 120, py + 130)  # lobe top (NE arm start)
-    # The full cycle: p1 -> left lobe -> p2 -> right lobe -> p1.
-    # (The four bridge segments are added below; the rest here.)
-    for n1, n2 in [("fig8_b2", "fig8_b3"), ("fig8_b3", "fig8_b4"),
-                   ("fig8_b4", "fig8_b5"), ("fig8_b5", "fig8_b6"),
-                   ("fig8_r2", "fig8_r3"), ("fig8_r3", "fig8_r4"),
-                   ("fig8_r4", "fig8_r5")]:
-        b.road(n1, n2)
-    # The NE-SW branch through p1 is the BRIDGE: one segment before
-    # (r5->r6), the two crossing segments (r6->p1, p1->b1), one after
-    # (b1->b2).
-    for n1, n2 in [("fig8_r5", "fig8_r6"), ("fig8_r6", "fig8_p1"),
-                   ("fig8_p1", "fig8_b1"), ("fig8_b1", "fig8_b2")]:
-        b.road(n1, n2, level=1)
-    # The NW-SE branch through p2 stays on the ground.
-    for n1, n2 in [("fig8_b6", "fig8_p2"), ("fig8_p2", "fig8_r1"),
-                   ("fig8_r1", "fig8_r2")]:
-        b.road(n1, n2)
-    b.start("fig8", "fig8_b4", facing="fig8_b5")   # leftmost point, heading north
+    # The loop is a sampled LEMNISCATE (Gerono curve): x = cos t,
+    # y = sin t * cos t - smooth everywhere, crosses itself at exactly
+    # one point with a 90-degree angle. 48 samples keep every chord
+    # short enough that the spline stays smooth. The two crossing
+    # passages are separate nodes n6 (t=90deg) and n18 (t=270deg) at
+    # the SAME point P - both degree 2, so no junction logic is needed,
+    # yet the whole figure-8 is one connected cycle.
+    import math as _math
+    N_FIG8 = 48
+    for i in range(N_FIG8):
+        t = 2 * _math.pi * i / N_FIG8
+        b.node(f"fig8_n{i}",
+               round(px + 245 * _math.cos(t), 1),
+               round(py + 230 * _math.sin(t) * _math.cos(t), 1))
+    # The full cycle: n_i -> n_{i+1} (and n47 -> n0). The crossing
+    # point P is at n12 (t=90deg) and n36 (t=270deg). Segments 10..13
+    # (n10->n11 ... n13->n14) form the NE-SW branch through n12 =
+    # the BRIDGE: the two crossing pieces plus one segment each side.
+    for i in range(N_FIG8):
+        b.road(f"fig8_n{i}", f"fig8_n{(i + 1) % N_FIG8}",
+               level=1 if i in (10, 11, 12, 13) else 0)
+    b.start("fig8", "fig8_n24", facing="fig8_n25")   # leftmost point, heading north
 
     # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
     # A W-shaped zig-zag road: right-down, left-down, right-down.
