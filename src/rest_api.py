@@ -99,6 +99,19 @@ class GameAPI:
                 for ext, holes in groups:
                     roads.append({'exterior': m(ext),
                                   'holes': [m(h) for h in holes]})
+
+            # Paved-edge rings: the UNIONED paved polygon (unary_union), so
+            # shared/interior buffer edges inside junctions are gone — only
+            # the true outer perimeter + island holes remain. Renderers draw
+            # a fixed 2 px white line along every ring (pygame parity,
+            # always on since 2026-08-31).
+            paved = net.get_paved_polygon()
+            paved_polys = (paved.geoms if paved.geom_type == "MultiPolygon"
+                           else [paved])
+            paved_edge_rings = []
+            for p in paved_polys:
+                for ring in (p.exterior, *p.interiors):
+                    paved_edge_rings.append(m(list(ring.coords)))
             junctions = [{'id': nid,
                           'x': round(xy[0] / pppm, 2),
                           'y': round(xy[1] / pppm, 2)}
@@ -118,6 +131,15 @@ class GameAPI:
                 'road_color': list(config.ROAD_COLOR),
                 'bg_color': list(config.BG_COLOR),
                 'roads': roads,
+                # Raw segment list (metres) for screen-space consumers like
+                # the minimap, which draws each road as a line with a 1 px
+                # floor so every road stays visible at any map scale.
+                # NOTE: segment coords are world PIXELS (x pppm) — convert
+                # to metres like every other export.
+                'segments': [[round(s.x1 / pppm, 2), round(s.y1 / pppm, 2),
+                              round(s.x2 / pppm, 2), round(s.y2 / pppm, 2),
+                              s.width] for s in net.segments],
+                'paved_edge_rings': paved_edge_rings,
                 'centerlines': [m(c) for c in net.get_marking_centerlines()],
                 'lane_markings': [
                     {'style': style, 'width_m': width_m, 'pts': m(coords)}

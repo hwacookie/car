@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import pygame
 
 from . import config
@@ -44,12 +42,6 @@ class Renderer:
         # (park at it). False: visual-only marker - running turn tests end
         # when the car PASSES the flag, no parking involved (docs/TESTING.md).
         self.flag_red_nav: bool = True
-        # Debug overlay (G key / POST /toggle paved_edge): white outline of
-        # the exact paved-area polygon that defines off-road checks. The
-        # state persists across restarts (data/debug_overlays.json) so a
-        # game restart never silently turns it back off.
-        self.paved_edge_visible = self._load_overlay_state().get("paved_edge",
-                                                                 False)
         from collections import OrderedDict
         self._tiles: "OrderedDict[tuple, pygame.Surface]" = OrderedDict()
         self._tile_polys: list | None = None
@@ -64,33 +56,6 @@ class Renderer:
         # Note: pygame.font is broken on some platforms (SDL_ttf import
         # issue). All text rendering goes through PIL instead — see
         # _text_surface() below.
-
-    @staticmethod
-    def _overlay_state_path() -> str:
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(root, "data", "debug_overlays.json")
-
-    @classmethod
-    def _load_overlay_state(cls) -> dict:
-        try:
-            with open(cls._overlay_state_path()) as f:
-                state = json.load(f)
-                return state if isinstance(state, dict) else {}
-        except Exception:
-            return {}
-
-    def set_paved_edge(self, visible: bool):
-        """Toggle the paved-edge overlay and persist the choice."""
-        self.paved_edge_visible = bool(visible)
-        try:
-            path = self._overlay_state_path()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            state = self._load_overlay_state()
-            state["paved_edge"] = self.paved_edge_visible
-            with open(path, "w") as f:
-                json.dump(state, f)
-        except Exception:
-            pass
 
     @classmethod
     def _get_pil_font(cls, size: int):
@@ -183,14 +148,13 @@ class Renderer:
         pygame.draw.polygon(surface, fill, [(sx, sy), s1, s2, sa])
         pygame.draw.polygon(surface, outline, [(sx, sy), s1, s2, sa], 2)
     def draw_paved_edge(self, surface: pygame.Surface):
-        """Debug overlay: the WHITE outline of the exact paved-area polygon
-        that defines BOTH the rendered road surface and the off-road check
-        (RoadNetwork.get_paved_polygon). If this line does not sit on the
-        visible asphalt edge somewhere, our perception of the road boundary
-        disagrees with what is drawn. Rings are cached once (the network is
-        static) and culled by bounding box per frame."""
-        if not self.paved_edge_visible:
-            return
+        """The WHITE outline of the exact paved-area polygon that defines
+        BOTH the rendered road surface and the off-road check
+        (RoadNetwork.get_paved_polygon) — always drawn (user decision
+        2026-08-31: no more G-key toggle), so the visible asphalt edge and
+        the game's road-boundary perception can never silently diverge.
+        Fixed 2 screen px wide, like all pygame lines. Rings are cached
+        once (the network is static) and culled by bounding box per frame."""
         poly = self.network.get_paved_polygon()
         if getattr(self, "_paved_edge_cache", None) is None:
             import numpy as np

@@ -381,14 +381,30 @@ class RoadNetwork:
         from the exact same per-color polygons used for rendering.
         Cached - the road network never changes at runtime."""
         if getattr(self, "_paved_polygon_cache", None) is None:
-            from shapely.geometry import Polygon
+            from shapely.geometry import MultiPolygon, Polygon
             from shapely.ops import unary_union
             polys = [
                 Polygon(ext, holes)
                 for _color, exteriors in self.get_road_polygons_by_color()
                 for ext, holes in exteriors
             ]
-            self._paved_polygon_cache = unary_union(polys) if polys else Polygon()
+            unioned = unary_union(polys) if polys else Polygon()
+            # unary_union leaves zero-area SLIVER rings at junctions
+            # (degenerate rings whose vertices collapse onto a line, as
+            # outer parts AND as holes). Invisible as fill, but the
+            # paved-edge outline draws every ring - including these - as
+            # floating line fragments in both frontends. Drop degenerate
+            # outer parts and degenerate holes alike.
+            def _clean(poly):
+                holes = [h for h in poly.interiors if Polygon(h).area >= 1.0]
+                return Polygon(poly.exterior, holes)
+
+            geoms = (list(unioned.geoms) if unioned.geom_type == "MultiPolygon"
+                     else [unioned])
+            kept = [_clean(g) for g in geoms if g.area >= 1.0]
+            self._paved_polygon_cache = (
+                MultiPolygon(kept) if len(kept) > 1
+                else (kept[0] if kept else Polygon()))
         return self._paved_polygon_cache
 
     def spawn_path_point(self, seg_idx: int, node_xy: tuple[float, float],
@@ -1077,7 +1093,8 @@ def _build_road_polygons(network: "RoadNetwork"):
         for coords in all_coords:
             smooth_line = LineString(coords)
             buffered_parts.append(
-                smooth_line.buffer(half_w_px, cap_style="round", join_style="round", resolution=8)
+                # EXPERIMENT: square ends (cap_style was "round")
+                smooth_line.buffer(half_w_px, cap_style="flat", join_style="round", resolution=8)
             )
         buffered = unary_union(buffered_parts)
 
@@ -1152,8 +1169,9 @@ def _build_multiway_junction_fillets(network: "RoadNetwork", pppm: float):
                 (node_x + reach * bx, node_y + reach * by),
             ]
             smooth = _round_polyline_corners(virtual_line, corner_radius_px)
+            # EXPERIMENT: square ends (cap_style was "round")
             buffered = LineString(smooth).buffer(
-                half_w_px, cap_style="round", join_style="round", resolution=8
+                half_w_px, cap_style="flat", join_style="round", resolution=8
             )
             color = config.ROAD_TYPES.get(seg_a.highway, {}).get("color", (150, 150, 150))
             polys = buffered.geoms if hasattr(buffered, "geoms") else [buffered]

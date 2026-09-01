@@ -439,19 +439,6 @@ def main(smoke_test_frames: int = 0):
                 validator.enable()
         main._last_v = keys[pygame.K_v]
         
-        # Paved-edge debug outline with G: white line along the exact
-        # paved-area polygon that defines the off-road check, so you can
-        # see where the game THINKS the road edge is (vs. what is drawn).
-        if _typing:
-            main._last_g = keys[pygame.K_g]
-        elif keys[pygame.K_g] and not hasattr(main, '_last_g'):
-            main._last_g = False
-        if keys[pygame.K_g] and not main._last_g and not _typing:
-            renderer.set_paved_edge(not renderer.paved_edge_visible)
-            print(f"Paved edge outline: "
-                  f"{'ON' if renderer.paved_edge_visible else 'OFF'}")
-        main._last_g = keys[pygame.K_g]
-        
         # U-turn (Wenden) with 'U' - one-shot request to the nav
         if _typing:
             main._last_u = keys[pygame.K_u]
@@ -518,10 +505,6 @@ def main(smoke_test_frames: int = 0):
                         validator.enable()
                     else:
                         validator.disable()
-                if 'paved_edge' in toggle_params:
-                    renderer.set_paved_edge(bool(toggle_params['paved_edge']))
-                    print(f"API: Paved edge outline "
-                          f"{'ON' if renderer.paved_edge_visible else 'OFF'}")
                 if 'mode' in toggle_params and car is not None:
                     mode = toggle_params['mode']
                     if mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
