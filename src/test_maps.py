@@ -525,6 +525,14 @@ def build_basic_test_map() -> RoadNetwork:
         b.road(f"fig8_n{i}", f"fig8_n{(i + 1) % N_FIG8}",
                level=1 if i in (10, 11, 12, 13) else 0)
     b.start("fig8", "fig8_n24", facing="fig8_n25")   # leftmost point, heading north
+    # ~19 m before the crossing on the GROUND branch (t=262.5deg): spawns
+    # right before the car dives under the bridge deck.
+    b.start("fig8_under", "fig8_n35", facing="fig8_n36")
+    # Both at the crossing point P itself: n36 is the GROUND branch node
+    # (car renders UNDER the deck - hidden), n12 the ELEVATED one (car on
+    # top of the deck - visible). A/B pair for the occlusion check.
+    b.start("fig8_deck", "fig8_n36", facing="fig8_n37")
+    b.start("fig8_bridge", "fig8_n12", facing="fig8_n13")
 
     # --- Tile (4,0): WWW zig-zag (sharp corners → smoothed by Catmull-Rom)
     # A W-shaped zig-zag road: right-down, left-down, right-down.
