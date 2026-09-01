@@ -274,13 +274,15 @@ def main(smoke_test_frames: int = 0):
         api = GameAPI()
         api.start(port=api_port)
         api.set_obstacles(obstacle_mgr, network)
-        # Publish named start points (synthetic test maps only; empty for OSM data)
-        api.update_state({
-            'start_points': {
-                name: {'x': x, 'y': y, 'heading': h, 'segment': seg,
-                       'forward': fwd, 'lateral_offset_m': off}
-                for name, (x, y, h, seg, fwd, off) in network.start_points.items()
-            }
+        # Publish named start points (synthetic test maps only; empty for
+        # OSM data). Kept OUT of /state: static map data belongs on its own
+        # endpoint, and merging it into game_state made /state serve just
+        # {"start_points": ...} during the startup window (Flask up, first
+        # frame not yet published) - see GameAPI.start_points.
+        api.set_start_points({
+            name: {'x': x, 'y': y, 'heading': h, 'segment': seg,
+                   'forward': fwd, 'lateral_offset_m': off}
+            for name, (x, y, h, seg, fwd, off) in network.start_points.items()
         })
     elif not smoke_test_frames:
         print("\n💡 Tip: Run with --api to enable REST API for remote control")

@@ -21,6 +21,12 @@ class GameAPI:
         # Shared state (thread-safe with lock)
         self.lock = Lock()
         self.game_state: Dict[str, Any] = {}
+        # Named start points live OUTSIDE game_state on purpose: they are
+        # static map data, and merging them into game_state made /state
+        # serve {"start_points": ...} alone during the startup window
+        # (Flask up, first frame not yet published) - and it tacked a ~5 KB
+        # blob onto every 60 Hz /state response.
+        self.start_points: Dict[str, Any] = {}
         self.control_input: Dict[str, bool] = {
             'accelerate': False,
             'brake': False,
@@ -263,7 +269,7 @@ class GameAPI:
             Empty if the currently loaded map defines none (e.g. real OSM data).
             """
             with self.lock:
-                return jsonify(self.game_state.get('start_points', {}))
+                return jsonify(self.start_points)
         
         @self.app.route('/toggle', methods=['POST'])
         def toggle():
@@ -394,6 +400,11 @@ class GameAPI:
         """Update game state (called from game loop)."""
         with self.lock:
             self.game_state.update(state)
+
+    def set_start_points(self, points: Dict[str, Any]):
+        """Publish the map's named start points (served by /start_points)."""
+        with self.lock:
+            self.start_points = points
     
     def get_control(self) -> Dict[str, bool]:
         """Get current control inputs (called from game loop)."""
