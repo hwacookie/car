@@ -843,6 +843,17 @@ def main(smoke_test_frames: int = 0):
                     'validator_enabled': validator.enabled,
                     # Per-car counters: no car -> nothing logged yet.
                     'validator_violations': 0,
+                    # Test flags (green start / red end pennant) in world
+                    # pixels, or None: the Godot renderer draws them.
+                    'flags': {
+                        'green': list(renderer.flag_green)
+                        if renderer.flag_green else None,
+                        'red': list(renderer.flag_red)
+                        if renderer.flag_red else None,
+                    },
+                    # Short HUD label (e.g. "5/21") set via POST /label -
+                    # the remote renderer shows it like pygame does.
+                    'hud_label': renderer.hud_label,
                     'camera_x': camera.x,
                     'camera_y': camera.y,
                     'camera_zoom': camera.zoom,
@@ -903,6 +914,18 @@ def main(smoke_test_frames: int = 0):
                     'blinker_left': bool(getattr(car.driver, 'blinker_left', False)),
                     'blinker_right': bool(getattr(car.driver, 'blinker_right', False)),
                     'lane_guard_stats': lane_guard.stats(car),
+                    # (The breadcrumb trail is NOT exported here: it is a
+                    # pure visual and the remote renderer records it client-
+                    # side from the x/y/heading samples. pygame draws
+                    # car.trail locally.)
+                    'flags': {
+                        'green': list(renderer.flag_green)
+                        if renderer.flag_green else None,
+                        'red': list(renderer.flag_red)
+                        if renderer.flag_red else None,
+                    },
+                    # Short HUD label (e.g. "5/21") set via POST /label.
+                    'hud_label': renderer.hud_label,
                     'camera_x': camera.x,
                     'camera_y': camera.y,
                     'camera_zoom': camera.zoom,
