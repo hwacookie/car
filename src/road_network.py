@@ -378,17 +378,19 @@ class RoadNetwork:
             self._road_polygons_cache = _build_road_polygons(self)
         return self._road_polygons_cache
 
-    def get_elevated_polygons(self):
-        """Buffered road surface of every segment with level >= 1 (bridge).
+    def _elevated_geometry(self):
+        """Buffered surfaces of every segment with level >= 1 (bridge).
 
-        Returns [(exterior_coords, [hole_coords, ...]), ...] in world
-        PIXELS. Uses the SAME smoothed spline + buffer parameters as the
-        ground roads so the bridge deck matches the carriageway under it
-        exactly (no sliver of ground road poking out from under the edge).
-        Renderers draw these on top of the ground, with their own styling,
+        Returns a cached (deck_union, roadway_union) shapely pair in
+        world PIXELS. Both are buffered from the SAME smoothed spline +
+        buffer parameters as the ground roads so the deck matches the
+        carriageway under it exactly (no sliver of ground road poking
+        out from under the edge): the roadway is the carriageway itself
+        (asphalt), the deck widens it by BRIDGE_SIDEWALK_M on each side
+        (concrete). Renderers draw the deck, then the roadway on top,
         and keep cars at lower levels below them in z-order. Cached -
         the network never changes at runtime."""
-        if getattr(self, "_elevated_polygons_cache", None) is None:
+        if getattr(self, "_elevated_geom_cache", None) is None:
             from shapely.geometry import LineString
             from shapely.ops import unary_union
             from .smooth_geometry import (SmoothCurve, SmoothedNetwork,
@@ -445,7 +447,8 @@ class RoadNetwork:
                 adj.setdefault(seg.start_node, set()).add(seg.end_node)
                 adj.setdefault(seg.end_node, set()).add(seg.start_node)
 
-            parts = []
+            deck_parts = []
+            road_parts = []
             centerlines: list[list[tuple[float, float]]] = []
             for ids, nodes, width in chains:
                 ext = list(nodes)
@@ -469,7 +472,14 @@ class RoadNetwork:
                 n = max(2, int((s1 - s0) / (0.5 * pppm)) + 1)
                 pts = [curve.point_at(s0 + (s1 - s0) * i / (n - 1))
                        for i in range(n)]
-                parts.append(LineString(pts).buffer(
+                line = LineString(pts)
+                # two surfaces from the same spline: the full deck
+                # (carriageway + BRIDGE_SIDEWALK_M per side, concrete)
+                # and the carriageway itself (asphalt, exact ground size).
+                deck_parts.append(line.buffer(
+                    half_w_px + config.BRIDGE_SIDEWALK_M * pppm,
+                    cap_style="flat", join_style="round", resolution=8))
+                road_parts.append(line.buffer(
                     half_w_px, cap_style="flat", join_style="round",
                     resolution=8))
                 # the deck's own centreline (renderers draw it ABOVE the
@@ -477,16 +487,54 @@ class RoadNetwork:
                 centerlines.append(pts)
 
             self._elevated_centerlines_cache: list[list[tuple[float, float]]] = centerlines
-            if parts:
-                unioned = unary_union(parts)
-                polys = unioned.geoms if hasattr(unioned, "geoms") else [unioned]
-                self._elevated_polygons_cache = [
-                    (list(p.exterior.coords),
-                     [list(r.coords) for r in p.interiors])
-                    for p in polys if not p.is_empty]
+            if deck_parts:
+                self._elevated_geom_cache = (unary_union(deck_parts),
+                                             unary_union(road_parts))
             else:
-                self._elevated_polygons_cache = []
-        return self._elevated_polygons_cache
+                self._elevated_geom_cache = (None, None)
+        return self._elevated_geom_cache
+
+    @staticmethod
+    def _rings(geom):
+        """[(exterior_coords, [hole_coords, ...]), ...] of a shapely set."""
+        if geom is None or getattr(geom, "is_empty", False):
+            return []
+        polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+        return [(list(p.exterior.coords),
+                 [list(r.coords) for r in p.interiors])
+                for p in polys if not p.is_empty]
+
+    def get_elevated_polygons(self):
+        """Full bridge DECKS incl. sidewalks (world PIXELS): the buffered
+        carriageway widened by BRIDGE_SIDEWALK_M on each side. Renderers
+        draw these as concrete, with the carriageway surface
+        (get_elevated_roadway_polygons) on top."""
+        return self._rings(self._elevated_geometry()[0])
+
+    def get_elevated_roadway_polygons(self):
+        """The asphalt CARRIAGEWAY of every bridge (world PIXELS) - the
+        same surface the ground road under it has, so the deck matches
+        exactly. Renderers draw this on top of the deck/sidewalk."""
+        return self._rings(self._elevated_geometry()[1])
+
+    def get_elevated_edge_rings(self):
+        """White boundary-line rings for the decks (world PIXELS): the
+        carriageway offset inward by EDGE_LINE_INSET_M, so a 15 cm tarmac
+        shoulder stays outside the line - same rule as ground roads."""
+        road = self._elevated_geometry()[1]
+        if road is None or getattr(road, "is_empty", False):
+            return []
+        # (geometry is in world PIXELS - scale the inset!)
+        road = road.buffer(-config.EDGE_LINE_INSET_M * config.PIXELS_PER_METER,
+                           join_style="round")
+        polys = road.geoms if hasattr(road, "geoms") else [road]
+        rings = []
+        for p in polys:
+            if p.is_empty:
+                continue
+            for ring in (p.exterior, *p.interiors):
+                rings.append(list(ring.coords))
+        return rings
 
     def get_elevated_centerlines(self):
         """Centreline polylines (world PIXELS) of the elevated decks -

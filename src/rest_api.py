@@ -104,8 +104,12 @@ class GameAPI:
             # shared/interior buffer edges inside junctions are gone — only
             # the true outer perimeter + island holes remain. Renderers draw
             # a fixed 2 px white line along every ring (pygame parity,
-            # always on since 2026-08-31).
-            paved = net.get_paved_polygon()
+            # always on since 2026-08-31). The rings are offset INWARD by
+            # EDGE_LINE_INSET_M so a 15 cm tarmac shoulder stays outside
+            # the white line (user decision; ALL roads).
+            # (get_paved_polygon is in world PIXELS - scale the inset!)
+            paved = net.get_paved_polygon().buffer(
+                -config.EDGE_LINE_INSET_M * pppm, join_style="round")
             paved_polys = (paved.geoms if paved.geom_type == "MultiPolygon"
                            else [paved])
             paved_edge_rings = []
@@ -143,12 +147,22 @@ class GameAPI:
                               round(s.x2 / pppm, 2), round(s.y2 / pppm, 2),
                               s.width, s.level] for s in net.segments],
                 # Bridge decks: buffered smoothed surface of all level>=1
-                # segments (metres). Drawn on top of the ground roads with
-                # a heavier edge; cars at lower levels pass underneath.
+                # segments (metres). elevated_roads = full deck incl. the
+                # 1 m sidewalk per side (draw concrete); elevated_roadways
+                # = the asphalt carriageway on top (same size as the ground
+                # road under it); elevated_edge_rings = white boundary line
+                # with the same 15 cm inset as ground roads. Cars at lower
+                # levels pass underneath.
                 'elevated_roads': [
                     {'exterior': m(ext), 'holes': [m(h) for h in holes]}
                     for ext, holes in net.get_elevated_polygons()
                 ],
+                'elevated_roadways': [
+                    {'exterior': m(ext), 'holes': [m(h) for h in holes]}
+                    for ext, holes in net.get_elevated_roadway_polygons()
+                ],
+                'elevated_edge_rings': [m(r)
+                                        for r in net.get_elevated_edge_rings()],
                 # Deck centrelines (metres): draw as dashes ABOVE the
                 # deck - the ground-level centreline is covered by it.
                 'elevated_centerlines': [m(cl)

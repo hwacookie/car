@@ -153,9 +153,14 @@ class Renderer:
         (RoadNetwork.get_paved_polygon) — always drawn (user decision
         2026-08-31: no more G-key toggle), so the visible asphalt edge and
         the game's road-boundary perception can never silently diverge.
-        Fixed 2 screen px wide, like all pygame lines. Rings are cached
-        once (the network is static) and culled by bounding box per frame."""
-        poly = self.network.get_paved_polygon()
+        Fixed 2 screen px wide, like all pygame lines. The rings are
+        offset INWARD by EDGE_LINE_INSET_M so a 15 cm tarmac shoulder
+        stays outside the line (same rule as the /map export). Rings are
+        cached once (the network is static) and culled per frame."""
+        # (get_paved_polygon is in world PIXELS - scale the inset!)
+        poly = self.network.get_paved_polygon().buffer(
+            -config.EDGE_LINE_INSET_M * config.PIXELS_PER_METER,
+            join_style="round")
         if getattr(self, "_paved_edge_cache", None) is None:
             import numpy as np
             polys = (poly.geoms if poly.geom_type == "MultiPolygon"

@@ -223,6 +223,14 @@ CENTERLINE_MIN_WIDTH_M = 7.0
 # diameter, rendered in world space so it scales with zoom (1 px floor so
 # it stays visible at low zoom - user decision).
 JUNCTION_DOT_RADIUS_M = 0.15
+# The white boundary line is drawn this far INWARD from the true paved
+# edge (user decision): a 15 cm tarmac shoulder stays outside the line.
+# Applies to ALL roads, ground and elevated. The off-road check keeps
+# using the full paved polygon - the shoulder is still "on road".
+EDGE_LINE_INSET_M = 0.15
+# Elevated decks (bridges) carry a sidewalk this wide on each side of
+# the carriageway (visual only - cars drive on the carriageway).
+BRIDGE_SIDEWALK_M = 1.0
 # Marking dash patterns (METRES). Shared by the pygame renderer and the
 # GET /map export (docs/GODOT_FRONTEND.md) so external renderers draw the
 # same pattern from one source of truth.
