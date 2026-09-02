@@ -148,6 +148,21 @@ see deleted `tinted_car_sprite`), committed as PNGs in `assets/`.
 - [x] Commit both repos locally (car/ `0e89887`, driving-game/ `dcba360`);
       push after user says "tested"
 
+## Step 6 — Multi-car stress scenario (`fig8_stress`)
+
+- [x] `POST /teleport {"segment": N, "progress": p}` - spawn on an
+      arbitrary segment (chord placement), used by the stress test
+- [x] Scenario in tests/test_turning.py: phases 2/6/10/14/18 cars on the
+      figure-8, 30 s each; per-phase jitter sum stored in
+      turning_results.json (`fig8_stress|<N>cars` → `jitters`,
+      `worst_jump_m`)
+- [x] **Fixed the command-ordering bug this exposed**: the per-key command
+      queue applied all teleports before any same-frame `/cars` clear, so a
+      "clear then spawn" burst lost its order. Now ONE global FIFO of
+      `(key, payload)` (rest_api.py) applied in strict arrival order
+      (main.py). e2e suite 22/22 afterwards.
+- [x] Result: 0 jitters up to 18 cars, sim holds exactly 60 fps
+
 ## Explicitly OUT of scope (later decisions)
 
 - Car–car collision physics (SAT exists for static obstacles; reusing it

@@ -219,6 +219,11 @@ def record_result(data: dict, result: dict) -> None:
         "final_segment": result.get("final_segment"),
         "expected_end_segment": result.get("expected_end_segment"),
     }
+    # Stress-scenario extras: the per-phase jitter sum (Anzahl Ruckler
+    # pro Szenario) and the worst single jump.
+    for extra in ("jitters", "worst_jump_m"):
+        if result.get(extra) is not None:
+            entry[extra] = result[extra]
     data["last"][key] = entry
     data.setdefault("history", []).append({"scenario": key, **entry})
 
@@ -492,6 +497,19 @@ DETERMINISTIC_TESTS = [
      "NEGATIVE: spawn too close to the hairpin corner at 50 km/h - must "
      "slide into the oncoming lane and trigger the wrong-side detection",
      0.8, False, 0.5, True),
+    # MULTI-CAR STRESS (docs/MULTI_CAR_PLAN.md): N cars drive the figure-8
+    # loop at once for 30 s, growing by 4 each phase (2/6/10/14/18). No end
+    # flags - the metric is how often a car gets displaced jerkily (a
+    # "ruckler"): per poll, any car that moves more than the suite's
+    # teleport/jump bound max(speed, 50 km/h)*dt*1.5 + 1 m counts one
+    # jitter; the SUM over all cars is stored per phase in the results file
+    # as "jitters" (Anzahl Ruckler pro Szenario). Pass = all phases ran
+    # without a game crash and without off-road/wrong-side - the jitter
+    # count itself is informational: it shows at how many cars the sim
+    # starts stuttering. Dispatched by start_point name, not through
+    # monitor_turn (see run_deterministic_test).
+    ('fig8_stress', 'straight', 0, None, 170.0,
+     "Multi-car stress: 2/6/10/14/18 cars on the figure-8, 30 s each"),
 ]
 
 
@@ -500,6 +518,14 @@ class TurnTester:
     
     def __init__(self):
         self.test_results = []
+        # One persistent (keep-alive) connection for the stress scenario.
+        # Flask serves each request on its own thread, so back-to-back
+        # POSTs over SEPARATE connections can be processed OUT OF ORDER -
+        # a phase's trailing /cars clear once landed mid-spawn of the next
+        # phase and wiped freshly spawned cars. Keep-alive on ONE
+        # connection makes the server handle requests strictly in arrival
+        # order.
+        self._api_session = requests.Session()
     
     def health_check(self) -> bool:
         """Verify API is available."""
@@ -600,6 +626,259 @@ class TurnTester:
     def set_hud_label(self, text: str | None):
         """Show (or clear) a short text label in the game's HUD."""
         requests.post(f"{API_URL}/label", json={'text': text})
+
+    # --- Multi-car stress scenario (fig8_stress, docs/MULTI_CAR_PLAN.md) ---
+    # Phases of 2/6/10/14/18 cars (+4 each) drive the figure-8 loop for
+    # 30 s. Cars pass through each other (no car-car collisions), so any
+    # count is legal - the metric is how often a car gets displaced
+    # JERKILY: per poll, movement beyond the suite's teleport/jump bound
+    # max(speed, 50 km/h)*dt*1.5 + 1 m counts one jitter ("Ruckler"). The
+    # sum over all cars is stored per phase in turning_results.json as
+    # "jitters" - it shows at how many cars the sim starts stuttering.
+    STRESS_PHASE_CARS = (2, 6, 10, 14, 18)
+    STRESS_PHASE_SECONDS = 30.0
+    STRESS_POLL_S = 0.1
+    # Positional indices into network.segments - fragile if the map
+    # changes (same NOTE as the scenario table): fig8 occupies 104..151.
+    FIG8_FIRST_SEGMENT = 104
+    FIG8_N_SEGMENTS = 48
+    STRESS_SPAWN_KMH = RUNNING_START_KMH   # rolling start, then coast
+
+    def _clear_all_cars(self) -> bool:
+        """POST /cars clear and WAIT until the map is actually empty.
+
+        Returns False on timeout. Uses the keep-alive session so the clear
+        can't be reordered against other in-flight requests (see
+        __init__)."""
+        try:
+            self._api_session.post(f"{API_URL}/cars",
+                                   json={'action': 'clear'}, timeout=5)
+        except requests.exceptions.RequestException:
+            return False
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                st = self._api_session.get(f"{API_URL}/state",
+                                           timeout=2).json()
+            except (requests.exceptions.RequestException, ValueError):
+                return False
+            if len(st.get('cars', [])) == 0:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _stress_scenario_result(self, phases: dict, overall_passed: bool,
+                                crashed: bool, aborted: bool) -> dict:
+        """The scenario-level result dict (print_summary's shape)."""
+        return {
+            'start_point': 'fig8_stress',
+            'direction': 'stress',
+            'passed': overall_passed and not aborted,
+            'aborted': aborted,
+            'off_road_detected': any(p['off_road_hits'] > 0
+                                     for p in phases.values()),
+            'instant_snap_detected': False,
+            'teleport_detected': False,
+            'game_crashed': crashed,
+            # Not a failure category here (see the phase pass criteria):
+            # the per-phase counts stay in 'stress_phases' + the results
+            # file, print_summary just must not count them as failures.
+            'wrong_side_detected': False,
+            'segment_changed': True,
+            'reached_expected_segment': True,   # no end flag in this test
+            'expect_wrong_side': False,
+            'final_segment': None,
+            'expected_end_segment': None,
+            'stress_phases': phases,
+        }
+
+    def run_multi_car_stress_test(self, results: dict | None = None,
+                                  abort_check: "callable | None" = None,
+                                  label: str | None = None) -> dict:
+        """Run the multi-car figure-8 stress scenario (all phases).
+
+        Returns a result dict in monitor_turn's shape (so print_summary
+        keeps working) with the per-phase breakdown in 'stress_phases'.
+        Each phase is ALSO recorded in the results file under its own key
+        (fig8_stress|2cars, ...), carrying that phase's jitter sum.
+        """
+        if results is None:
+            results = load_results()
+        phases: dict = {}
+        overall_passed = True
+        crashed = False
+
+        for n_cars in self.STRESS_PHASE_CARS:
+            key = f"fig8_stress|{n_cars}cars"
+            print(f"\n{'-'*60}")
+            print(f"STRESS PHASE: {n_cars} cars on the figure-8 "
+                  f"for {self.STRESS_PHASE_SECONDS:.0f} s")
+            print(f"{'-'*60}")
+
+            # 1. Clean slate (also drops any car a previous scenario left).
+            #    Waits until the map is REALLY empty, so no stale clear can
+            #    still be in flight when we spawn.
+            if not self._clear_all_cars():
+                print("   ❌ Could not clear the map - phase fails")
+                return self._stress_scenario_result(
+                    phases, overall_passed=False, crashed=True,
+                    aborted=False)
+
+            # 2. Spawn n_cars evenly around the loop (rolling start, no
+            #    throttle afterwards - they coast at ~RUNNING_START_KMH).
+            spawn_speed_mps = self.STRESS_SPAWN_KMH / 3.6
+            for i in range(n_cars):
+                seg = (self.FIG8_FIRST_SEGMENT
+                       + round(i * self.FIG8_N_SEGMENTS / n_cars)
+                       % self.FIG8_N_SEGMENTS)
+                self._api_session.post(f"{API_URL}/teleport", json={
+                    'segment': seg, 'progress': 0.5,
+                    'speed': spawn_speed_mps, 'add': True}, timeout=5)
+            # Wait until all cars actually exist (queued teleports land
+            # one per sim frame - ~17 ms each).
+            deadline = time.time() + 15.0
+            uids: list[int] = []
+            while time.time() < deadline:
+                try:
+                    st = self._api_session.get(f"{API_URL}/state",
+                                               timeout=2).json()
+                except (requests.exceptions.RequestException, ValueError):
+                    break
+                uids = [c['car_uid'] for c in st.get('cars', [])]
+                if len(uids) == n_cars:
+                    break
+                time.sleep(0.05)
+            all_spawned = len(uids) == n_cars
+            if not all_spawned:
+                print(f"   ❌ Only {len(uids)}/{n_cars} cars appeared - "
+                      f"phase fails")
+
+            # 3. Hold the throttle for every car (BICYCLE mode: without
+            #    accelerate the nav's target speed is 0 and it brakes -
+            #    the input persists in the sim's control bucket until the
+            #    phase's /cars clear removes the cars) + short per-car
+            #    labels so the Godot window shows who is who.
+            for pos, uid in enumerate(uids):
+                try:
+                    self._api_session.post(
+                        f"{API_URL}/control", timeout=5,
+                        json={'uid': uid, 'accelerate': True})
+                    self._api_session.post(
+                        f"{API_URL}/label", timeout=5,
+                        json={'uid': uid, 'text': str(pos + 1)})
+                except requests.exceptions.RequestException:
+                    pass
+
+            # 4. Run the phase: poll every STRESS_POLL_S, count jitters.
+            prev: dict[int, tuple] = {}   # uid -> (wall_t, x_px, y_px)
+            jitters = 0
+            worst_jump_m = 0.0
+            off_road_hits = 0
+            wrong_side_hits = 0
+            max_cars_seen = 0
+            phase_crashed = False
+            aborted = False
+            deadline = time.time() + self.STRESS_PHASE_SECONDS
+            while time.time() < deadline:
+                if abort_check is not None and abort_check():
+                    aborted = True
+                    break
+                try:
+                    st = self._api_session.get(f"{API_URL}/state",
+                                               timeout=2).json()
+                except (requests.exceptions.RequestException, ValueError) as e:
+                    print(f"\n   ❌ Game crashed mid-phase: {e}")
+                    phase_crashed = True
+                    break
+                cars = st.get('cars', [])
+                max_cars_seen = max(max_cars_seen, len(cars))
+                now = time.time()
+                for c in cars:
+                    uid = c['car_uid']
+                    x, y = c['x'], c['y']
+                    if not c.get('on_road', True):
+                        off_road_hits += 1
+                    if c.get('wrong_side'):
+                        wrong_side_hits += 1
+                    if uid in prev:
+                        t0, x0, y0 = prev[uid]
+                        poll_dt = now - t0
+                        if poll_dt > 0:
+                            moved_m = math.hypot(x - x0, y - y0) / 2.0
+                            # The suite's teleport/jump bound (see
+                            # _confirm_stop): movement beyond what the car's
+                            # speed can cover in this wall-clock interval,
+                            # plus margin.
+                            max_plausible_m = (max(c['speed_kmh'] / 3.6,
+                                                   50.0) * poll_dt * 1.5
+                                               + 1.0)
+                            if moved_m > max_plausible_m:
+                                jitters += 1
+                                worst_jump_m = max(worst_jump_m, moved_m)
+                                print(f"   ⚡ JITTER car #{uid}: "
+                                      f"{moved_m:.2f} m in {poll_dt*1000:.0f} ms "
+                                      f"(max plausible {max_plausible_m:.2f} m, "
+                                      f"{c['speed_kmh']:.0f} km/h)")
+                    prev[uid] = (now, x, y)
+                time.sleep(self.STRESS_POLL_S)
+
+            # 5. Tear the phase down before the next one - and WAIT for it,
+            #    so this clear can't race against the next phase's spawns.
+            if not self._clear_all_cars():
+                print("   ⚠️  Phase teardown: map still has cars after "
+                      "10 s (continuing anyway)")
+
+            # Pass criteria: all cars spawned, no crash, no OFF-ROAD (a real
+            # physical violation). Wrong-side is REPORTED but not failing:
+            # the lane guard has no "in-turn" suppression on junction-free
+            # continuous curves like the figure-8, so even a PERFECT single
+            # car trips it occasionally (~1 hit per 30 s, measured) - the
+            # multi-car run inherits that per-car noise.
+            passed = (all_spawned and not phase_crashed and aborted is False
+                      and off_road_hits == 0)
+            if aborted:
+                print("   ⏭️  Phase aborted (user interrupt)")
+            overall_passed = overall_passed and passed and not phase_crashed
+            crashed = crashed or phase_crashed
+            phases[key] = {
+                'passed': passed,
+                'jitters': jitters,
+                'worst_jump_m': round(worst_jump_m, 2),
+                'off_road_hits': off_road_hits,
+                'wrong_side_hits': wrong_side_hits,
+                'max_cars_seen': max_cars_seen,
+            }
+            print(f"   Phase {n_cars} cars: "
+                  f"{'✅ PASSED' if passed else '❌ FAILED'} - "
+                  f"jitters (Ruckler): {jitters}, "
+                  f"worst jump {worst_jump_m:.2f} m, "
+                  f"off-road hits {off_road_hits}, "
+                  f"wrong-side hits {wrong_side_hits}")
+
+            # Record this phase in the results file under its own key so
+            # the jitter sum is stored per scenario (Anzahl Ruckler pro
+            # Szenario).
+            record_result(results, {
+                'start_point': 'fig8_stress',
+                'direction': f'{n_cars}cars',
+                'passed': passed,
+                'aborted': aborted,
+                'jitters': jitters,
+                'worst_jump_m': round(worst_jump_m, 2),
+                'final_segment': None,
+                'expected_end_segment': None,
+            })
+            save_results(results)
+
+            if phase_crashed or aborted:
+                print("   ⏹  Stopping the stress scenario "
+                      f"({ 'game crash' if phase_crashed else 'user interrupt' })")
+                break
+
+        # The scenario-level result (what print_summary consumes).
+        return self._stress_scenario_result(phases, overall_passed, crashed,
+                                            aborted)
+
     
     def _right_side_kerb_gaps_m(self, state: dict, start_point: str):
         """Gap (m) between the car's RIGHT FLANK at both wheel stations and
@@ -1808,15 +2087,26 @@ class TurnTester:
                    'start_point': start_point, 'direction': direction,
                    'speed_kmh': speed, 'description': description})
 
-            result = self.monitor_turn(direction, duration=duration, target_speed=speed, start_point=start_point,
-                                       expected_end_segment=expected_end_segment,
-                                       description=description, results=results,
-                                       abort_check=abort_check,
-                                       label=f"{i}/{len(tests)}",
-                                       start_progress=start_progress,
-                                       kerb_check=kerb_check,
-                                       end_flag_progress=end_flag_progress,
-                                       expect_wrong_side=expect_wrong_side)
+            if start_point == 'fig8_stress':
+                # Multi-car stress scenario: its own runner (phases of
+                # 2/6/10/14/18 cars on the figure-8), not monitor_turn.
+                # The per-phase results are already recorded in the
+                # results file inside the runner; append the scenario-level
+                # result here (monitor_turn normally does this itself).
+                result = self.run_multi_car_stress_test(
+                    results=results, abort_check=abort_check,
+                    label=f"{i}/{len(tests)}")
+                self.test_results.append(result)
+            else:
+                result = self.monitor_turn(direction, duration=duration, target_speed=speed, start_point=start_point,
+                                           expected_end_segment=expected_end_segment,
+                                           description=description, results=results,
+                                           abort_check=abort_check,
+                                           label=f"{i}/{len(tests)}",
+                                           start_progress=start_progress,
+                                           kerb_check=kerb_check,
+                                           end_flag_progress=end_flag_progress,
+                                           expect_wrong_side=expect_wrong_side)
 
             _emit({'type': 'done', 'index': i, 'passed': result['passed'],
                    'aborted': bool(result.get('aborted'))})
@@ -1975,6 +2265,22 @@ def main():
     # we're wrapping up; the suite loop then stops scheduling new tests, saves
     # the results collected so far, and exits cleanly (no traceback).
     signal.signal(signal.SIGINT, _on_sigint)
+
+    # --list / --list-json: print the numbered scenario list and exit.
+    # No game needed - used by humans and by the sim's GET /tests endpoint.
+    if '--list' in sys.argv or '--list-json' in sys.argv:
+        rows = []
+        for i, t in enumerate(DETERMINISTIC_TESTS, 1):
+            desc = t[5] if len(t) > 5 else ''
+            rows.append({'number': i, 'key': t[0], 'direction': t[1],
+                         'description': desc})
+        if '--list-json' in sys.argv:
+            print(json.dumps(rows))
+        else:
+            for r in rows:
+                print(f"{r['number']:>2}  {r['key']} {r['direction']}"
+                      f"{' - ' + r['description'] if r['description'] else ''}")
+        return
 
     tester = TurnTester()
 

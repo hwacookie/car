@@ -213,6 +213,35 @@ def main(smoke_test_frames: int = 0):
         car.color = CAR_COLORS[(car.uid - 1) % len(CAR_COLORS)]
         return car
 
+    def _create_car_at_segment(seg_idx: int, progress: float = 0.5):
+        """Create a car at `progress` (0..1) along segment `seg_idx`,
+        driving start_node -> end_node in the normal driving position.
+
+        Chord-based placement: exact on smooth tracks where the chords hug
+        the rounded path (the figure-8's 48 short segments), but do NOT use
+        it for sharp-corner segments - see _spawn_position's note on why
+        chord spawns sit off-pavement near hairpins. Used by POST /teleport
+        {"segment": N} (stress tests, dev)."""
+        seg = network.segments[seg_idx]
+        x = seg.x1 + (seg.x2 - seg.x1) * progress
+        y = seg.y1 + (seg.y2 - seg.y1) * progress
+        h = math.degrees(math.atan2(seg.x2 - seg.x1, seg.y2 - seg.y1)) % 360.0
+        # Same right-lane-centre offset _spawn_position uses for named start
+        # points; the nav holds this line (lane_offset_override_m).
+        offset_m = lane_base_offset_m(seg.width, seg.lanes,
+                                      seg.parking_lane_width, seg.oneway)
+        rad = math.radians(h)
+        x += math.cos(rad) * offset_m * PIXELS_PER_METER
+        y -= math.sin(rad) * offset_m * PIXELS_PER_METER
+        car = Car(x, y, h, seg_idx, BicycleDriver())
+        car.progress = progress
+        car.forward = True
+        car.lane_offset_override_m = offset_m
+        # Breadcrumbs on like every other spawn.
+        car.trail_enabled = True
+        car.color = CAR_COLORS[(car.uid - 1) % len(CAR_COLORS)]
+        return car
+
     # --- Car(s) with AI driver (multi-car, docs/MULTI_CAR_PLAN.md) ---
     # All live cars in one dict; _follow_uid is the PRIMARY car - the sim
     # camera follows it and the legacy top-level /state fields describe it,
@@ -375,140 +404,153 @@ def main(smoke_test_frames: int = 0):
         # kill the whole simulation (multi-car test runs).
         if api:
             commands = api.get_commands()
-            try:
-                # Teleport command: default REPLACES the current car(s)
-                # (legacy behavior - e2e suite, cockpit); "add": true ADDS
-                # a fresh car alongside them (parallel test runs,
-                # docs/MULTI_CAR_PLAN.md).
-                for tp in commands.get('teleport', []):
-                    start_point = (tp or {}).get('start_point') or None
-                    if not (tp or {}).get('add'):
-                        for _uid in list(cars):
-                            _remove_car(_uid)
-                    new_car = _create_car(start_point,
-                                          progress=(tp or {}).get('progress'))
-                    # Optional rolling start (m/s): the running turn tests
-                    # spawn already moving instead of accelerating from a
-                    # standstill.
-                    if tp.get('speed') is not None:
-                        new_car.speed = float(tp['speed'])
-                    cars[new_car.uid] = new_car
-                    car_flags[new_car.uid] = TestFlags()
-                    # Unaddressed flags/label (legacy clients that set them
-                    # before any car existed) are adopted by the new car.
-                    if None in car_flags:
-                        car_flags[new_car.uid] = car_flags.pop(None)
-                    _follow_uid = new_car.uid
-                    camera.snap_to(new_car.x, new_car.y,
-                                   network.world_width, network.world_height)
-                    print(f"\n🔄 {'Added' if tp.get('add') else 'New'} car "
-                          f"#{new_car.uid} ({new_car.color}) at segment "
-                          f"{new_car.seg_idx}, heading {new_car.heading:.1f}°"
-                          f"{' (rolling start)' if tp.get('speed') is not None else ''}\n")
-
-                # Multi-car cleanup (POST /cars): clear all / remove one.
-                for cc in commands.get('cars', []):
-                    cc = cc or {}
-                    action = cc.get('action')
-                    if action == 'clear':
-                        for _uid in list(cars):
-                            _remove_car(_uid)
-                        print("API: all cars removed")
-                    elif action == 'remove' and cc.get('uid') is not None:
-                        _remove_car(int(cc['uid']))
-
-                # Toggle command (per-car part resolves an optional uid;
-                # omit = primary car; "validator" stays global)
-                for toggle_params in commands.get('toggle', []):
-                    toggle_params = toggle_params or {}
-                    _tuid = toggle_params.get('uid') or _follow_uid
-                    if _tuid not in cars:
-                        _tuid = _follow_uid
-                    tcar = cars.get(_tuid) if _tuid is not None else None
-                    if 'breadcrumbs' in toggle_params and tcar is not None:
-                        tcar.trail_enabled = toggle_params['breadcrumbs']
-                        print(f"API: Breadcrumbs "
-                              f"{'ON' if tcar.trail_enabled else 'OFF'} (car #{_tuid})")
-                    if 'validator' in toggle_params:
-                        if toggle_params['validator']:
-                            validator.enable()
+            # [(key, payload), ...] in GLOBAL arrival order - a
+            # 'clear then spawn' burst must apply the clear FIRST
+            # even when both land within one frame batch.
+            for _ckey, _cpayload in commands:
+                try:
+                    # Teleport command: default REPLACES the current car(s)
+                    # (legacy behavior - e2e suite, cockpit); "add": true ADDS
+                    # a fresh car alongside them (parallel test runs,
+                    # docs/MULTI_CAR_PLAN.md).
+                    if _ckey == 'teleport':
+                        tp = _cpayload or {}
+                        if 'segment' in tp:
+                            # Arbitrary-segment spawn (stress tests, dev):
+                            # chord placement along the segment.
+                            new_car = _create_car_at_segment(
+                                int(tp['segment']),
+                                float(tp.get('progress', 0.5)))
                         else:
-                            validator.disable()
-                    if 'mode' in toggle_params and tcar is not None:
-                        mode = toggle_params['mode']
-                        if mode == 'bicycle' and not isinstance(tcar.driver, BicycleDriver):
-                            tcar.driver = BicycleDriver()
-                            tcar.bicycle_nav = None
-                            print(f"API: Switched to BICYCLE mode (car #{_tuid})")
-                        elif mode == 'free' and not isinstance(tcar.driver, KeyboardDriver):
-                            tcar.driver = KeyboardDriver()
-                            print(f"API: Switched to FREE mode (car #{_tuid})")
+                            start_point = tp.get('start_point') or None
+                            if not tp.get('add'):
+                                for _uid in list(cars):
+                                    _remove_car(_uid)
+                            new_car = _create_car(start_point,
+                                                  progress=tp.get('progress'))
+                        # Optional rolling start (m/s): the running turn tests
+                        # spawn already moving instead of accelerating from a
+                        # standstill.
+                        if tp.get('speed') is not None:
+                            new_car.speed = float(tp['speed'])
+                        cars[new_car.uid] = new_car
+                        car_flags[new_car.uid] = TestFlags()
+                        # Unaddressed flags/label (legacy clients that set them
+                        # before any car existed) are adopted by the new car.
+                        if None in car_flags:
+                            car_flags[new_car.uid] = car_flags.pop(None)
+                        _follow_uid = new_car.uid
+                        camera.snap_to(new_car.x, new_car.y,
+                                       network.world_width, network.world_height)
+                        print(f"\n🔄 {'Added' if tp.get('add') else 'New'} car "
+                              f"#{new_car.uid} ({new_car.color}) at segment "
+                              f"{new_car.seg_idx}, heading {new_car.heading:.1f}°"
+                              f"{' (rolling start)' if tp.get('speed') is not None else ''}\n")
 
-                # Label command (short per-car HUD text, e.g. "2/3").
-                for ld in commands.get('label', []):
-                    ld = ld or {}
-                    _luid = ld.get('uid') or _follow_uid
-                    if _luid is None or _luid not in cars:
-                        _luid = None     # unaddressed: adopted at next spawn
-                    car_flags.setdefault(_luid, TestFlags()).hud_label = \
-                        ld.get('text')
+                    # Multi-car cleanup (POST /cars): clear all / remove one.
+                    elif _ckey == 'cars':
+                        cc = _cpayload or {}
+                        action = cc.get('action')
+                        if action == 'clear':
+                            for _uid in list(cars):
+                                _remove_car(_uid)
+                            print("API: all cars removed")
+                        elif action == 'remove' and cc.get('uid') is not None:
+                            _remove_car(int(cc['uid']))
 
-                # Freeze / resume (replaces the old ESC key): several
-                # queued freezes resolve to the LAST one.
-                if commands.get('freeze'):
-                    frozen = bool(commands['freeze'][-1])
-                    print("\n⏸️  API: simulation FROZEN" if frozen
-                          else "▶️  API: simulation resumed")
+                    # Toggle command (per-car part resolves an optional uid;
+                    # omit = primary car; "validator" stays global)
+                    elif _ckey == 'toggle':
+                        toggle_params = _cpayload or {}
+                        _tuid = toggle_params.get('uid') or _follow_uid
+                        if _tuid not in cars:
+                            _tuid = _follow_uid
+                        tcar = cars.get(_tuid) if _tuid is not None else None
+                        if 'breadcrumbs' in toggle_params and tcar is not None:
+                            tcar.trail_enabled = toggle_params['breadcrumbs']
+                            print(f"API: Breadcrumbs "
+                                  f"{'ON' if tcar.trail_enabled else 'OFF'} (car #{_tuid})")
+                        if 'validator' in toggle_params:
+                            if toggle_params['validator']:
+                                validator.enable()
+                            else:
+                                validator.disable()
+                        if 'mode' in toggle_params and tcar is not None:
+                            mode = toggle_params['mode']
+                            if mode == 'bicycle' and not isinstance(tcar.driver, BicycleDriver):
+                                tcar.driver = BicycleDriver()
+                                tcar.bicycle_nav = None
+                                print(f"API: Switched to BICYCLE mode (car #{_tuid})")
+                            elif mode == 'free' and not isinstance(tcar.driver, KeyboardDriver):
+                                tcar.driver = KeyboardDriver()
+                                print(f"API: Switched to FREE mode (car #{_tuid})")
 
-                # Test confirmation flags (PER CAR): green at the scenario
-                # start (car position, immediate), red at its end given as
-                # [segment, progress] - resolved to a map position by the
-                # main loop once THAT car's route covers that segment, so
-                # it is visible from the START of the test. Optional "uid"
-                # addresses a specific car; omit = primary (legacy clients).
-                for fl in commands.get('flags', []):
-                    if not isinstance(fl, dict):
-                        continue
-                    _fuid = fl.get('uid') or _follow_uid
-                    if _fuid is None or _fuid not in cars:
-                        _fuid = None     # unaddressed: adopted at next spawn
-                    tf = car_flags.setdefault(_fuid, TestFlags())
-                    fcar = cars.get(_fuid) if _fuid is not None else None
-                    # Only update the keys that are present, so setting the
-                    # end flag doesn't wipe the start flag (and vice versa).
-                    if 'green' in fl:
-                        tf.flag_green = fl['green']
-                    if 'red' in fl:
-                        if fl['red'] is None:
-                            tf.flag_red = None
-                            tf.flag_red_pending = None
-                            if fcar is not None and fcar.bicycle_nav is not None:
-                                fcar.bicycle_nav.clear_destination()
-                        else:
-                            seg_idx, prog = fl['red'][0], fl['red'][1]
-                            tf.flag_red = None
-                            tf.flag_red_pending = (seg_idx, prog)
-                            # red_nav (default True): the flag becomes the
-                            # car's navigation destination (park at it).
-                            # Running turn tests send red_nav=False - the
-                            # flag is a visual end-of-test marker only
-                            # (docs/TESTING.md).
-                            tf.flag_red_nav = bool(fl.get('red_nav', True))
+                    # Label command (short per-car HUD text, e.g. "2/3").
+                    elif _ckey == 'label':
+                        ld = _cpayload or {}
+                        _luid = ld.get('uid') or _follow_uid
+                        if _luid is None or _luid not in cars:
+                            _luid = None     # unaddressed: adopted at next spawn
+                        car_flags.setdefault(_luid, TestFlags()).hud_label = \
+                            ld.get('text')
 
-                # Hazard lights (Warnblinkanlage): explicit on/off command,
-                # per-car via uid (omit = primary).
-                for hz in commands.get('hazard', []):
-                    hz = hz or {}
-                    _huid = hz.get('uid') or _follow_uid
-                    hcar = cars.get(_huid) if _huid is not None else None
-                    if hcar is not None and isinstance(hcar.driver, BicycleDriver):
-                        hcar.driver.set_hazard(
-                            bool(hz.get('on')),
-                            reason="manual (REST API)" if hz.get('on')
-                                   else "manual off (REST API)")
-            except Exception as e:
-                print(f"⚠️  API command error (skipped, sim continues): {e!r}",
-                      flush=True)
+                    # Freeze / resume (replaces the old ESC key): several
+                    # queued freezes resolve to the LAST one.
+                    elif _ckey == 'freeze':
+                        frozen = bool((_cpayload or {}).get('frozen'))
+                        print("\n⏸️  API: simulation FROZEN" if frozen
+                              else "▶️  API: simulation resumed")
+
+                    # Test confirmation flags (PER CAR): green at the scenario
+                    # start (car position, immediate), red at its end given as
+                    # [segment, progress] - resolved to a map position by the
+                    # main loop once THAT car's route covers that segment, so
+                    # it is visible from the START of the test. Optional "uid"
+                    # addresses a specific car; omit = primary (legacy clients).
+                    elif _ckey == 'flags':
+                        fl = _cpayload or {}
+                        if not isinstance(fl, dict):
+                            continue
+                        _fuid = fl.get('uid') or _follow_uid
+                        if _fuid is None or _fuid not in cars:
+                            _fuid = None     # unaddressed: adopted at next spawn
+                        tf = car_flags.setdefault(_fuid, TestFlags())
+                        fcar = cars.get(_fuid) if _fuid is not None else None
+                        # Only update the keys that are present, so setting the
+                        # end flag doesn't wipe the start flag (and vice versa).
+                        if 'green' in fl:
+                            tf.flag_green = fl['green']
+                        if 'red' in fl:
+                            if fl['red'] is None:
+                                tf.flag_red = None
+                                tf.flag_red_pending = None
+                                if fcar is not None and fcar.bicycle_nav is not None:
+                                    fcar.bicycle_nav.clear_destination()
+                            else:
+                                seg_idx, prog = fl['red'][0], fl['red'][1]
+                                tf.flag_red = None
+                                tf.flag_red_pending = (seg_idx, prog)
+                                # red_nav (default True): the flag becomes the
+                                # car's navigation destination (park at it).
+                                # Running turn tests send red_nav=False - the
+                                # flag is a visual end-of-test marker only
+                                # (docs/TESTING.md).
+                                tf.flag_red_nav = bool(fl.get('red_nav', True))
+
+                    # Hazard lights (Warnblinkanlage): explicit on/off command,
+                    # per-car via uid (omit = primary).
+                    elif _ckey == 'hazard':
+                        hz = _cpayload or {}
+                        _huid = hz.get('uid') or _follow_uid
+                        hcar = cars.get(_huid) if _huid is not None else None
+                        if hcar is not None and isinstance(hcar.driver, BicycleDriver):
+                            hcar.driver.set_hazard(
+                                bool(hz.get('on')),
+                                reason="manual (REST API)" if hz.get('on')
+                                       else "manual off (REST API)")
+                except Exception as e:
+                    print(f"⚠️  API command error (skipped, sim continues): {e!r}",
+                          flush=True)
 
         # --- Per-car control input (driver + API merge), once per frame;
         # the fixed-timestep substeps below reuse it (as before). ---

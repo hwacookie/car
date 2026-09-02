@@ -3,7 +3,11 @@
 
 from flask import Flask, jsonify, request
 from threading import Thread, Lock
+import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Dict, Any
 
 from . import config
@@ -39,19 +43,52 @@ class GameAPI:
         # to a LIST of payloads: with several clients posting in parallel
         # (multi-car test runs), overwriting the slot between two game-loop
         # frames silently dropped the earlier command - so enqueue instead.
-        self.commands: Dict[str, list] = {}
+        # Command queue: a SINGLE global FIFO of (key, payload) tuples in
+        # strict arrival order. Per-key lists used to preserve order WITHIN
+        # a key but not ACROSS keys - the game loop applied every teleport
+        # before any /cars clear that had arrived first in the same frame,
+        # so a "clear then spawn" burst lost its ordering (the stress test
+        # watched freshly spawned cars get wiped by their own pre-clear).
+        self.commands: list = []
         
         # Obstacle system (docs/OBSTACLES.md): wired in by the game via
         # set_obstacles(). Placement/removal goes through the SAME logic as
         # the palette UI.
         self.obstacle_manager = None
         self.obstacle_network = None
-        
+
+        # External test runner: the test scenarios live OUTSIDE the sim -
+        # tests/test_turning.py drives this very API. POST /run_test
+        # launches it as a subprocess (one run at a time).
+        self._repo_root = Path(__file__).resolve().parent.parent
+        self._runner_path = self._repo_root / 'tests' / 'test_turning.py'
+        self.test_run: Dict[str, Any] | None = None
+        self._test_list_cache: tuple = (None, 0.0)
+
         self._setup_routes()
     
     def _enqueue(self, key: str, payload: Any):
-        """Append a command payload (call with self.lock held)."""
-        self.commands.setdefault(key, []).append(payload)
+        """Append a (key, payload) command (call with self.lock held)."""
+        self.commands.append((key, payload))
+
+    def _get_test_list(self) -> list | None:
+        """Numbered scenario list from the runner (--list-json), cached 5 min.
+
+        Returns None if the runner can't be reached (fresh cache is still
+        served in that case)."""
+        data, ts = self._test_list_cache
+        if data is not None and time.time() - ts <= 300:
+            return data
+        try:
+            out = subprocess.run(
+                [sys.executable, str(self._runner_path), '--list-json'],
+                cwd=str(self._repo_root), capture_output=True,
+                text=True, timeout=30)
+            rows = json.loads(out.stdout.strip().splitlines()[-1])
+            self._test_list_cache = (rows, time.time())
+            return rows
+        except Exception:
+            return data   # stale beats nothing
     
     def _setup_routes(self):
         """Setup all API endpoints."""
@@ -373,7 +410,84 @@ class GameAPI:
             with self.lock:
                 self._enqueue('cars', data)
             return jsonify({'ok': True, 'command': 'cars', 'params': data})
-        
+
+        @self.app.route('/tests', methods=['GET'])
+        def test_list():
+            """Numbered list of all deterministic scenarios.
+
+            Returns [{number, key, direction, description}, ...] - the
+            numbers are what POST /run_test accepts (and what the suite
+            prints as "TEST i/N")."""
+            rows = self._get_test_list()
+            if rows is None:
+                return jsonify({'error': 'could not list tests'}), 500
+            return jsonify(rows)
+
+        @self.app.route('/run_test', methods=['POST'])
+        def run_test():
+            """Start a scenario by NUMBER in the external test runner.
+
+            Body: {"number": 17} - numbers come from GET /tests. The sim
+            launches `tests/test_turning.py --tests <number>` as its own
+            process (the tests live outside the sim; the runner drives it
+            through this API). One run at a time: 409 while one is in
+            progress. Output goes to a log file under tests/.
+            """
+            data = request.get_json(silent=True) or {}
+            number = data.get('number')
+            if isinstance(number, bool) or not isinstance(number, int) \
+                    or number < 1:
+                return jsonify(
+                    {'error': 'body must be {"number": <int >= 1>}'}), 400
+            rows = self._get_test_list()
+            if rows is not None and \
+                    number > len(rows):
+                return jsonify({
+                    'error': f'no test {number} (1..{len(rows)})'}), 404
+            log_file = (self._repo_root / 'tests' /
+                        f"run_test_{number}_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}.log")
+            with self.lock:
+                tr = self.test_run
+                if tr is not None and tr['proc'].poll() is None:
+                    return jsonify({
+                        'error': (f"test #{tr['number']} is still running "
+                                  f"(pid {tr['pid']})")}), 409
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, str(self._runner_path),
+                         '--tests', str(number)],
+                        cwd=str(self._repo_root),
+                        stdout=open(log_file, 'ab'),
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True)
+                except OSError as e:
+                    return jsonify({'error': f'launch failed: {e}'}), 500
+                self.test_run = {
+                    'number': number, 'pid': proc.pid, 'proc': proc,
+                    'started_at': time.time(),
+                    'log_file': str(log_file)}
+            return jsonify({'ok': True, 'number': number, 'pid': proc.pid,
+                            'log_file': str(log_file)})
+
+        @self.app.route('/run_test', methods=['GET'])
+        def run_test_status():
+            """Status of the current/last test run (for the frontend UI)."""
+            with self.lock:
+                tr = self.test_run
+                if tr is None:
+                    return jsonify({'running': False})
+                rc = tr['proc'].poll()
+                return jsonify({
+                    'running': rc is None,
+                    'number': tr['number'],
+                    'pid': tr['pid'],
+                    'started_at': tr['started_at'],
+                    'finished_at': (time.time() if rc is not None
+                                    else None),
+                    'returncode': rc,
+                    'log_file': tr['log_file']})
+
         @self.app.route('/obstacles', methods=['GET'])
         def obstacles_list():
             """List placed obstacles.
@@ -465,15 +579,15 @@ class GameAPI:
             elif is_primary and None in self.control_input:
                 self.control_input[None][key] = False
     
-    def get_commands(self) -> Dict[str, list]:
+    def get_commands(self) -> list:
         """Get and clear pending commands (called from game loop).
 
-        Returns {key: [payload, ...]} - payloads in arrival order; the
-        game loop applies each one (later ones override earlier state,
-        e.g. two freezes resolve to the last)."""
+        Returns [(key, payload), ...] in GLOBAL arrival order; the game
+        loop applies them one by one in that order (later ones override
+        earlier state, e.g. two freezes resolve to the last)."""
         with self.lock:
-            commands = dict(self.commands)
-            self.commands.clear()
+            commands = self.commands
+            self.commands = []
             return commands
     
     def start(self, port: int = 5000, host: str = '127.0.0.1'):

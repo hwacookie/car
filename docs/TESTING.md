@@ -371,6 +371,26 @@ The sequential suite in §2 is unchanged: it teleports without `add`
 (replace) and reads the top-level `/state` fields, which always describe
 the primary car.
 
+### The multi-car stress scenario (`fig8_stress`)
+
+`python tests/test_turning.py --tests fig8_stress` runs a performance
+probe (not a driving-correctness scenario): phases of **2 → 6 → 10 → 14 →
+18 cars** on the figure-8, 30 s each. Cars are spawned evenly around the
+loop via `POST /teleport {"segment": N, "progress": 0.5, "speed": 8.3,
+"add": true}`, hold the throttle (`/control accelerate` per uid), then
+coast. Between phases the map is cleared and waited-for-empty.
+
+Per phase it stores in `tests/turning_results.json` (key
+`fig8_stress|<N>cars`) the **jitter sum** (`jitters`, "Anzahl Ruckler pro
+Szenario") - position jumps beyond what the car's speed can cover between
+10 Hz polls, plus margin - and `worst_jump_m`. Pass criteria: all cars
+spawned, no crash, no off-road. Wrong-side is reported but not failing
+(the lane guard has no in-turn suppression on the junction-free figure-8,
+so even a perfect single car trips it occasionally).
+
+First run (2026-09-02): **0 jitters in every phase up to 18 cars**, sim
+held exactly 60 fps throughout.
+
 ## Notes / gotchas
 
 - The game process must be restarted after any code change - there's no

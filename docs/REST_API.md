@@ -136,12 +136,22 @@ Content-Type: application/json
 # Named start point, mid-segment, rolling start - and ADD alongside the
 # existing cars instead of replacing them (parallel test runs):
 {"start_point": "www_entry", "progress": 0.5, "speed": 8.3, "add": true}
+
+# Arbitrary segment (stress tests / dev): chord placement along the
+# segment's centreline, offset to the right-lane centre:
+{"segment": 128, "progress": 0.5, "speed": 8.3, "add": true}
 ```
 Default behavior is REPLACE: all current cars are removed and one fresh
 car appears (the e2e suite and cockpit rely on this). With
 `"add": true` a new car joins the existing ones - each teleport spawns a
 new uid, and the sim camera + primary-car state switch to the newest.
 Named start points come from `GET /start_points` (synthetic test maps).
+
+**Command ordering:** all command endpoints (`/teleport`, `/cars`,
+`/control`, `/flags`, `/label`, `/toggle`, `/freeze`, `/hazard`) feed ONE
+global FIFO in the sim - commands apply in strict arrival order, even
+when several land within the same 16.7 ms frame (a `clear` followed by
+teleports is never applied before them).
 
 ### Manage Cars (multi-car)
 ```bash
@@ -208,6 +218,33 @@ Content-Type: application/json
 
 Pauses the simulation (replaces the old ESC key in the pygame window).
 `GET /state` reports `"frozen": true` while paused.
+
+### Run a Test by Number
+
+The test scenarios live OUTSIDE the sim - `tests/test_turning.py` is an
+external program that drives this very API. These endpoints let a frontend
+(e.g. the Godot window's "Run Test" button) start one by number:
+
+```bash
+GET /tests
+# -> [{number, key, direction, description}, ...]
+#    numbers are stable: they are what the suite prints as "TEST i/N"
+
+POST /run_test
+Content-Type: application/json
+
+{"number": 22}   # launch `tests/test_turning.py --tests 22` in its own process
+# -> {ok, number, pid, log_file}   (409 while a run is in progress,
+#                                   404 for an unknown number)
+
+GET /run_test
+# -> {running, number, pid, started_at, finished_at, returncode, log_file}
+```
+
+The sim spawns the runner as a detached subprocess (one at a time); its
+stdout goes to a timestamped log under `tests/`. The runner talks back
+through this API like any other client, so the running test is fully
+visible in the frontend.
 
 ### Wait for Condition
 ```bash
