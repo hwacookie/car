@@ -76,12 +76,34 @@ the e2e suite waits for on reverse-in scenarios, because a back-in park
 deliberately crosses the end flag to stage the reverse (see
 `docs/TESTING.md` §3).
 
+**Multi-car (docs/MULTI_CAR_PLAN.md):** several cars can be on the map
+at once. The top-level fields above always describe the PRIMARY car -
+the most recently spawned one, which the sim camera follows - so
+single-car clients keep working unchanged. ALL cars are additionally
+exported in a `cars` array (empty when no car is on the map); the Godot
+frontend prefers that array:
+```json
+"cars": [
+  {"car_uid": 1, "x": ..., "y": ..., "heading": ..., "speed_kmh": ...,
+   "level": 0, "segment": 42, "progress": 0.65, "on_road": true,
+   "wrong_side": false, "blinker_left": false, "blinker_right": true,
+   "hazard": false, "color": "red",
+   "flags": {"green": [x, y, h] | null, "red": [x, y, h] | null},
+   "hud_label": "1/21" | null}
+]
+```
+`color` is the car's display color: `red` (player), then `blue`,
+`yellow`, `white` - assigned deterministically as
+`CAR_COLORS[(uid-1) % 4]`. Each car carries its OWN test flags and HUD
+label.
+
 ### Send Control Inputs
 ```bash
 POST /control
 Content-Type: application/json
 
 {
+  "uid": 2,              # optional; omit = primary (followed) car
   "accelerate": true,
   "brake": false,
   "steer_left": false,
@@ -92,6 +114,9 @@ Content-Type: application/json
 ```
 
 All fields are optional. Only specified fields are updated.
+`"hazard": true|false` is a one-shot command (both on and off explicit).
+With several cars, address them by `uid`; without it the input goes to
+the primary car.
 
 ### Reset Controls
 ```bash
@@ -105,24 +130,60 @@ Sets all control inputs to `false`.
 POST /teleport
 Content-Type: application/json
 
-# Random location
+# Random location (replaces the current car(s))
 {"random": true}
 
-# Specific location (TODO)
-{"segment": 42, "progress": 0.5}
+# Named start point, mid-segment, rolling start - and ADD alongside the
+# existing cars instead of replacing them (parallel test runs):
+{"start_point": "www_entry", "progress": 0.5, "speed": 8.3, "add": true}
 ```
+Default behavior is REPLACE: all current cars are removed and one fresh
+car appears (the e2e suite and cockpit rely on this). With
+`"add": true` a new car joins the existing ones - each teleport spawns a
+new uid, and the sim camera + primary-car state switch to the newest.
+Named start points come from `GET /start_points` (synthetic test maps).
+
+### Manage Cars (multi-car)
+```bash
+POST /cars
+Content-Type: application/json
+
+{"action": "clear"}              # remove all cars
+{"action": "remove", "uid": 3}   # remove one car
+```
+Cleanup for parallel test runs (clear between rounds) and dev.
 
 ### Set HUD Label
 ```bash
 POST /label
 Content-Type: application/json
 
-{"text": "4"}
+{"uid": 2, "text": "4"}
 ```
-Shows (or, with `{"text": null}` / `{}`, clears) a short text label in
-the game's HUD, just below the minimap. Purely a visual aid - e.g.
-`tests/test_turning.py` uses it to show which map tile/scenario the
-currently running test is on.
+Shows (or, with `{"text": null}` / `{}`, clears) a short text label for
+one car - the big HUD readout below the minimap (primary car's label)
+and a small per-car label above its nose. `uid` is optional; omit =
+primary car. Purely a visual aid - e.g. `tests/test_turning.py` uses it
+to show which map tile/scenario the currently running test is on.
+
+### Set Test Flags (per car)
+```bash
+POST /flags
+Content-Type: application/json
+
+{
+  "uid": 2,                                   # optional; omit = primary
+  "green": [x, y, heading_deg] | null,        # start pennant (world px)
+  "red": [segment_idx, progress] | null,      # end marker, resolved by the sim
+  "red_nav": true                             # true: red flag = parking destination
+}
+```
+The green flag is a world position (usually the car's spawn). The red
+flag is given as segment + progress; the sim resolves it to a map
+position once THAT car's route covers the segment. With `red_nav`
+defaulting to true the red flag becomes the car's navigation destination
+(parking); running turn tests send `red_nav: false` (visual marker only).
+See `docs/TESTING.md`.
 
 ### Toggle Features
 ```bash
@@ -130,6 +191,7 @@ POST /toggle
 Content-Type: application/json
 
 {
+  "uid": 2,            # optional; omit = primary car (breadcrumbs/mode only)
   "breadcrumbs": true,
   "validator": false,
   "mode": "bicycle"  # or "free"

@@ -9,6 +9,11 @@ from typing import Dict, Any
 from . import config
 from .obstacles import PlacementError
 
+# The sustained control keys (POST /control). One-shot commands (hazard,
+# uturn consumption) are handled separately - see GameAPI.get_control_for.
+CONTROL_KEYS = ('accelerate', 'brake', 'steer_left', 'steer_right',
+                'blinker_left', 'blinker_right', 'uturn')
+
 
 class GameAPI:
     """REST API for controlling the game and reading state."""
@@ -26,16 +31,15 @@ class GameAPI:
         # (Flask up, first frame not yet published) - and it tacked a ~5 KB
         # blob onto every 60 Hz /state response.
         self.start_points: Dict[str, Any] = {}
-        self.control_input: Dict[str, bool] = {
-            'accelerate': False,
-            'brake': False,
-            'steer_left': False,
-            'steer_right': False,
-            'blinker_left': False,
-            'blinker_right': False,
-            'uturn': False,
-        }
-        self.commands: Dict[str, Any] = {}  # For one-shot commands (teleport, etc.)
+        # Control inputs per car (multi-car, docs/MULTI_CAR_PLAN.md):
+        # key = car uid; key None = "unaddressed" - legacy clients that
+        # don't send a uid, applied to the primary (followed) car only.
+        self.control_input: Dict[Any, Dict[str, bool]] = {}
+        # Pending one-shot commands (teleport, flags, ...). Each key maps
+        # to a LIST of payloads: with several clients posting in parallel
+        # (multi-car test runs), overwriting the slot between two game-loop
+        # frames silently dropped the earlier command - so enqueue instead.
+        self.commands: Dict[str, list] = {}
         
         # Obstacle system (docs/OBSTACLES.md): wired in by the game via
         # set_obstacles(). Placement/removal goes through the SAME logic as
@@ -44,6 +48,10 @@ class GameAPI:
         self.obstacle_network = None
         
         self._setup_routes()
+    
+    def _enqueue(self, key: str, payload: Any):
+        """Append a command payload (call with self.lock held)."""
+        self.commands.setdefault(key, []).append(payload)
     
     def _setup_routes(self):
         """Setup all API endpoints."""
@@ -193,9 +201,10 @@ class GameAPI:
         
         @self.app.route('/control', methods=['POST'])
         def control():
-            """Send control inputs to car.
+            """Send control inputs to a car.
             
             Body: {
+                "uid": int   (optional; omit = primary/followed car),
                 "accelerate": bool,
                 "brake": bool,
                 "steer_left": bool,
@@ -208,15 +217,21 @@ class GameAPI:
             }
             """
             data = request.get_json()
+            uid = data.pop('uid', None)
+            if uid is not None:
+                uid = int(uid)
             with self.lock:
-                for key in self.control_input.keys():
+                bucket = self.control_input.setdefault(
+                    uid, GameAPI._empty_control())
+                for key in CONTROL_KEYS:
                     if key in data:
-                        self.control_input[key] = bool(data[key])
+                        bucket[key] = bool(data[key])
                 # Hazard is a one-shot command (both on AND off are explicit),
                 # so it goes through the commands channel, not control_input.
                 if 'hazard' in data:
-                    self.commands['hazard'] = bool(data['hazard'])
-            return jsonify({'ok': True, 'control': self.control_input})
+                    self._enqueue('hazard', {'on': bool(data['hazard']),
+                                             'uid': uid})
+            return jsonify({'ok': True, 'control': bucket})
         
         @self.app.route('/teleport', methods=['POST'])
         def teleport():
@@ -228,15 +243,16 @@ class GameAPI:
             """
             data = request.get_json()
             with self.lock:
-                self.commands['teleport'] = data
+                self._enqueue('teleport', data)
             return jsonify({'ok': True, 'command': 'teleport', 'params': data})
         
         @self.app.route('/flags', methods=['POST'])
         def flags():
-            """Set/clear the test start/end flags (visual confirmation
+            """Set/clear a car's test start/end flags (visual confirmation
             markers drawn on the map, to the RIGHT of the road).
 
-            Body: {"green": [x, y, heading_deg] | null,
+            Body: {"uid": int | null   (optional; omit = primary car),
+                   "green": [x, y, heading_deg] | null,
                    "red": [segment_idx, progress] | null}
             Green is a world position (usually the car's); red is the
             expected END as segment index + progress along it - the game
@@ -246,7 +262,7 @@ class GameAPI:
             """
             data = request.get_json(silent=True) or {}
             with self.lock:
-                self.commands['flags'] = data
+                self._enqueue('flags', data)
             return jsonify({'ok': True, 'command': 'flags', 'params': data})
 
         @self.app.route('/label', methods=['POST'])
@@ -254,11 +270,14 @@ class GameAPI:
             """Set (or clear) a short text label shown in the HUD - handy for
             test scripts to show which test/map-tile is currently running.
             
-            Body: {"text": "2/3"} or {"text": null} / {} to clear.
+            Body: {"uid": int | null  (optional; omit = primary car),
+                   "text": "2/3"} or {"text": null} / {} to clear.
             """
             data = request.get_json(silent=True) or {}
             with self.lock:
-                self.commands['label'] = data.get('text')
+                # Rides through as-is; the game loop resolves the uid
+                # against its per-car TestFlags (docs/MULTI_CAR_PLAN.md).
+                self._enqueue('label', data)
             return jsonify({'ok': True, 'command': 'label', 'params': data})
         
         @self.app.route('/start_points', methods=['GET'])
@@ -274,14 +293,16 @@ class GameAPI:
             """Toggle features.
             
             Body: {
+                "uid": int   (optional; omit = primary/followed car),
                 "breadcrumbs": bool,
                 "validator": bool,
                 "mode": "bicycle" | "free"
             }
-            """
+            Note: "validator" is global (physics validator); "breadcrumbs"
+            and "mode" are per-car when a uid is given."""
             data = request.get_json()
             with self.lock:
-                self.commands['toggle'] = data
+                self._enqueue('toggle', data)
             return jsonify({'ok': True, 'command': 'toggle', 'params': data})
 
         @self.app.route('/freeze', methods=['POST'])
@@ -292,7 +313,7 @@ class GameAPI:
             """
             data = request.get_json()
             with self.lock:
-                self.commands['freeze'] = bool(data.get('frozen', True))
+                self._enqueue('freeze', bool(data.get('frozen', True)))
             return jsonify({'ok': True, 'command': 'freeze'})
 
         @self.app.route('/wait', methods=['POST'])
@@ -334,11 +355,24 @@ class GameAPI:
         
         @self.app.route('/reset', methods=['POST'])
         def reset():
-            """Reset control inputs to default (all false)."""
+            """Reset control inputs to default (all false, all cars)."""
             with self.lock:
-                for key in self.control_input.keys():
-                    self.control_input[key] = False
-            return jsonify({'ok': True, 'control': self.control_input})
+                for bucket in self.control_input.values():
+                    for key in CONTROL_KEYS:
+                        bucket[key] = False
+            return jsonify({'ok': True})
+        
+        @self.app.route('/cars', methods=['POST'])
+        def cars_command():
+            """Manage the car set (multi-car, docs/MULTI_CAR_PLAN.md).
+
+            Body: {"action": "clear"}              -> remove all cars
+                  {"action": "remove", "uid": N}   -> remove one car
+            """
+            data = request.get_json(silent=True) or {}
+            with self.lock:
+                self._enqueue('cars', data)
+            return jsonify({'ok': True, 'command': 'cars', 'params': data})
         
         @self.app.route('/obstacles', methods=['GET'])
         def obstacles_list():
@@ -401,22 +435,44 @@ class GameAPI:
         with self.lock:
             self.start_points = points
     
-    def get_control(self) -> Dict[str, bool]:
-        """Get current control inputs (called from game loop)."""
+    @staticmethod
+    def _empty_control() -> Dict[str, bool]:
+        return {key: False for key in CONTROL_KEYS}
+
+    def get_control_for(self, uid: int, is_primary: bool = False) -> Dict[str, bool]:
+        """Control inputs for one car (called from the game loop).
+
+        Resolution: an explicit bucket for `uid` wins; otherwise the
+        unaddressed (None) bucket applies to the PRIMARY car only - that
+        is how legacy clients (no uid in POST /control) still reach the
+        followed car."""
         with self.lock:
-            return self.control_input.copy()
+            bucket = self.control_input.get(uid)
+            if bucket is None and is_primary:
+                bucket = self.control_input.get(None)
+            if bucket is None:
+                return GameAPI._empty_control()
+            return dict(bucket)
     
-    def clear_control(self, key: str):
+    def clear_control(self, key: str, uid: int | None = None,
+                      is_primary: bool = False):
         """Clear a single control flag (one-shot semantics, e.g. a blinker
-        that was applied and should not re-trigger on the next frame)."""
+        that was applied and should not re-trigger on the next frame).
+        Same bucket resolution as get_control_for."""
         with self.lock:
-            if key in self.control_input:
-                self.control_input[key] = False
+            if uid is not None and uid in self.control_input:
+                self.control_input[uid][key] = False
+            elif is_primary and None in self.control_input:
+                self.control_input[None][key] = False
     
-    def get_commands(self) -> Dict[str, Any]:
-        """Get and clear pending commands (called from game loop)."""
+    def get_commands(self) -> Dict[str, list]:
+        """Get and clear pending commands (called from game loop).
+
+        Returns {key: [payload, ...]} - payloads in arrival order; the
+        game loop applies each one (later ones override earlier state,
+        e.g. two freezes resolve to the last)."""
         with self.lock:
-            commands = self.commands.copy()
+            commands = dict(self.commands)
             self.commands.clear()
             return commands
     

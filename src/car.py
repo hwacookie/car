@@ -23,6 +23,10 @@ class Car:
         """x, y in world pixels. heading in degrees (0 = up/north)."""
         Car._next_uid += 1
         self.uid = Car._next_uid
+        # Display color (multi-car, docs/MULTI_CAR_PLAN.md): the main loop
+        # assigns it deterministically from the uid; "red" is the player
+        # default for cars created outside that loop.
+        self.color = "red"
         # Position and orientation
         self.x = x
         self.y = y

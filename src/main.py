@@ -55,6 +55,14 @@ def _distance_to_junction(car, network) -> float:
     return ((1.0 - car.progress) if car.forward else car.progress) * seg.length
 
 
+def _flags_payload(tf):
+    """/state export of one car's pennants (world px + heading, or None)."""
+    return {
+        'green': list(tf.flag_green) if tf and tf.flag_green else None,
+        'red': list(tf.flag_red) if tf and tf.flag_red else None,
+    }
+
+
 def _flag_position_on_route(network, nav, seg_idx: int,
                             progress: float) -> list | None:
     """World position + travel heading at `progress` along segment `seg_idx`,
@@ -200,15 +208,38 @@ def main(smoke_test_frames: int = 0):
         # Breadcrumbs on from the start: the tyre tracks are the main way
         # to see what the car actually did on its way here.
         car.trail_enabled = True
+        # Multi-car color (docs/MULTI_CAR_PLAN.md): deterministic per uid,
+        # red first, then the old pygame obstacle palette colors.
+        car.color = CAR_COLORS[(car.uid - 1) % len(CAR_COLORS)]
         return car
 
-    # --- Car with AI driver ---
+    # --- Car(s) with AI driver (multi-car, docs/MULTI_CAR_PLAN.md) ---
+    # All live cars in one dict; _follow_uid is the PRIMARY car - the sim
+    # camera follows it and the legacy top-level /state fields describe it,
+    # so single-car consumers (e2e suite, cockpit) keep working unchanged.
     # Synthetic test maps do NOT auto-spawn a car: the e2e suite teleports
     # its own car in (POST /teleport), and an idle AI car driving around
     # before the first teleport is noise that makes every run less
     # reproducible. On a test map, --start <name> focuses the CAMERA on
     # that start point (the suite's car then appears exactly there); real
     # OSM data keeps its random spawn.
+    cars: dict[int, Car] = {}                 # uid -> car
+    car_flags: dict[int | None, TestFlags] = {}   # uid -> pennants/label;
+                                                 # key None = unaddressed
+                                                 # (legacy clients without a
+                                                 # uid; adopted by the next
+                                                 # spawned car)
+    _follow_uid = None
+
+    def _remove_car(uid):
+        """Remove one car + its flags; re-point the follow at the newest
+        remaining car if the followed one goes."""
+        nonlocal _follow_uid
+        cars.pop(uid, None)
+        car_flags.pop(uid, None)
+        if _follow_uid == uid:
+            _follow_uid = max(cars) if cars else None
+
     start_name = None
     if "--start" in sys.argv:
         idx = sys.argv.index("--start")
@@ -233,7 +264,11 @@ def main(smoke_test_frames: int = 0):
             print("No car spawned (test map - the e2e suite teleports one in; "
                   "use --start <name> to focus the camera, or POST /teleport)")
     else:
-        car = _create_car(start_name)   # real OSM data: random spawn as before
+        # Real OSM data: random spawn as before.
+        car = _create_car(start_name)
+        cars[car.uid] = car
+        car_flags[car.uid] = TestFlags()
+        _follow_uid = car.uid
         if start_name:
             print(f"Spawn: '{start_name}' (deterministic; --start <name> to change)")
     print("Navigation model: BICYCLE (kinematic, free particle)")
@@ -286,7 +321,6 @@ def main(smoke_test_frames: int = 0):
             camera.x, camera.y = focus_point
         else:
             camera.x, camera.y = network.world_width / 2, network.world_height / 2
-    flags = TestFlags()   # pennants + HUD label (exported via /state)
 
     # --- Game loop (headless, paced at 60 Hz) ---
     frame = 0
@@ -295,7 +329,7 @@ def main(smoke_test_frames: int = 0):
     dt_fixed = 1 / 60
     _last_frame_wall = time.perf_counter()
     _physics_accum = 0.0
-    _prev_render = None   # (x, y, heading) before the last physics substep
+    _prev_render = {}     # uid -> (x, y, heading) before the last substep
     while running:
         frame += 1
         if smoke_test_frames and frame > smoke_test_frames:
@@ -334,129 +368,196 @@ def main(smoke_test_frames: int = 0):
         else:
             keys = _NO_KEYS
         
-        # Handle API commands (if API enabled)
+        # Handle API commands (if API enabled). Commands arrive as QUEUES
+        # (key -> [payload, ...]) so parallel clients can't overwrite each
+        # other between frames; payloads apply in arrival order. Any bad
+        # payload is logged and skipped - one broken client must never
+        # kill the whole simulation (multi-car test runs).
         if api:
             commands = api.get_commands()
-            
-            # Replace-car command (destroy old car, create fresh one)
-            if 'teleport' in commands:
-                tp = commands['teleport']
-                start_point = tp.get('start_point') or None
-                car = _create_car(start_point, progress=tp.get('progress'))
-                # Optional rolling start (m/s): the running turn tests spawn
-                # already moving instead of accelerating from a standstill.
-                if tp.get('speed') is not None:
-                    car.speed = float(tp['speed'])
-                camera.snap_to(car.x, car.y, network.world_width, network.world_height)
-                print(f"\n🔄 New car at segment {car.seg_idx}, "
-                      f"heading {car.heading:.1f}°"
-                      f"{' (rolling start)' if tp.get('speed') is not None else ''}\n")
-            
-            # Toggle command
-            if 'toggle' in commands:
-                toggle_params = commands['toggle']
-                if 'breadcrumbs' in toggle_params and car is not None:
-                    car.trail_enabled = toggle_params['breadcrumbs']
-                    print(f"API: Breadcrumbs {'ON' if car.trail_enabled else 'OFF'}")
-                if 'validator' in toggle_params:
-                    if toggle_params['validator']:
-                        validator.enable()
-                    else:
-                        validator.disable()
-                if 'mode' in toggle_params and car is not None:
-                    mode = toggle_params['mode']
-                    if mode == 'bicycle' and not isinstance(car.driver, BicycleDriver):
-                        car.driver = BicycleDriver()
-                        car.bicycle_nav = None
-                        print("API: Switched to BICYCLE mode")
-                    elif mode == 'free' and not isinstance(car.driver, KeyboardDriver):
-                        car.driver = KeyboardDriver()
-                        print("API: Switched to FREE mode")
-            
-            # Label command (short HUD text, e.g. "2/3" for a test's map tile)
-            if 'label' in commands:
-                flags.hud_label = commands['label']
+            try:
+                # Teleport command: default REPLACES the current car(s)
+                # (legacy behavior - e2e suite, cockpit); "add": true ADDS
+                # a fresh car alongside them (parallel test runs,
+                # docs/MULTI_CAR_PLAN.md).
+                for tp in commands.get('teleport', []):
+                    start_point = (tp or {}).get('start_point') or None
+                    if not (tp or {}).get('add'):
+                        for _uid in list(cars):
+                            _remove_car(_uid)
+                    new_car = _create_car(start_point,
+                                          progress=(tp or {}).get('progress'))
+                    # Optional rolling start (m/s): the running turn tests
+                    # spawn already moving instead of accelerating from a
+                    # standstill.
+                    if tp.get('speed') is not None:
+                        new_car.speed = float(tp['speed'])
+                    cars[new_car.uid] = new_car
+                    car_flags[new_car.uid] = TestFlags()
+                    # Unaddressed flags/label (legacy clients that set them
+                    # before any car existed) are adopted by the new car.
+                    if None in car_flags:
+                        car_flags[new_car.uid] = car_flags.pop(None)
+                    _follow_uid = new_car.uid
+                    camera.snap_to(new_car.x, new_car.y,
+                                   network.world_width, network.world_height)
+                    print(f"\n🔄 {'Added' if tp.get('add') else 'New'} car "
+                          f"#{new_car.uid} ({new_car.color}) at segment "
+                          f"{new_car.seg_idx}, heading {new_car.heading:.1f}°"
+                          f"{' (rolling start)' if tp.get('speed') is not None else ''}\n")
 
-            # Freeze / resume (replaces the old ESC key).
-            if 'freeze' in commands:
-                frozen = bool(commands['freeze'])
-                print("\n⏸️  API: simulation FROZEN" if frozen
-                      else "▶️  API: simulation resumed")
+                # Multi-car cleanup (POST /cars): clear all / remove one.
+                for cc in commands.get('cars', []):
+                    cc = cc or {}
+                    action = cc.get('action')
+                    if action == 'clear':
+                        for _uid in list(cars):
+                            _remove_car(_uid)
+                        print("API: all cars removed")
+                    elif action == 'remove' and cc.get('uid') is not None:
+                        _remove_car(int(cc['uid']))
 
-            # Test confirmation flags: green at the scenario start
-            # (car position, immediate), red at its end given as
-            # [segment, progress] - resolved to a map position by the main
-            # loop once the route covers that segment, so it is visible
-            # from the START of the test.
-            if 'flags' in commands and isinstance(commands['flags'], dict):
-                fl = commands['flags']
-                # Only update the keys that are present, so setting the
-                # end flag doesn't wipe the start flag (and vice versa).
-                if 'green' in fl:
-                    flags.flag_green = fl['green']
-                if 'red' in fl:
-                    if fl['red'] is None:
-                        flags.flag_red = None
-                        flags.flag_red_pending = None
-                        if car is not None and car.bicycle_nav is not None:
-                            car.bicycle_nav.clear_destination()
-                    else:
-                        seg_idx, prog = fl['red'][0], fl['red'][1]
-                        flags.flag_red = None
-                        flags.flag_red_pending = (seg_idx, prog)
-                        # red_nav (default True): the flag becomes the car's
-                        # navigation destination (park at it). Running turn
-                        # tests send red_nav=False - the flag is a visual
-                        # end-of-test marker only (docs/TESTING.md).
-                        flags.flag_red_nav = bool(fl.get('red_nav', True))
+                # Toggle command (per-car part resolves an optional uid;
+                # omit = primary car; "validator" stays global)
+                for toggle_params in commands.get('toggle', []):
+                    toggle_params = toggle_params or {}
+                    _tuid = toggle_params.get('uid') or _follow_uid
+                    if _tuid not in cars:
+                        _tuid = _follow_uid
+                    tcar = cars.get(_tuid) if _tuid is not None else None
+                    if 'breadcrumbs' in toggle_params and tcar is not None:
+                        tcar.trail_enabled = toggle_params['breadcrumbs']
+                        print(f"API: Breadcrumbs "
+                              f"{'ON' if tcar.trail_enabled else 'OFF'} (car #{_tuid})")
+                    if 'validator' in toggle_params:
+                        if toggle_params['validator']:
+                            validator.enable()
+                        else:
+                            validator.disable()
+                    if 'mode' in toggle_params and tcar is not None:
+                        mode = toggle_params['mode']
+                        if mode == 'bicycle' and not isinstance(tcar.driver, BicycleDriver):
+                            tcar.driver = BicycleDriver()
+                            tcar.bicycle_nav = None
+                            print(f"API: Switched to BICYCLE mode (car #{_tuid})")
+                        elif mode == 'free' and not isinstance(tcar.driver, KeyboardDriver):
+                            tcar.driver = KeyboardDriver()
+                            print(f"API: Switched to FREE mode (car #{_tuid})")
 
-            # Hazard lights (Warnblinkanlage): explicit on/off command.
-            if 'hazard' in commands and car is not None \
-                    and isinstance(car.driver, BicycleDriver):
-                car.driver.set_hazard(
-                    bool(commands['hazard']),
-                    reason="manual (REST API)" if commands['hazard']
-                           else "manual off (REST API)")
+                # Label command (short per-car HUD text, e.g. "2/3").
+                for ld in commands.get('label', []):
+                    ld = ld or {}
+                    _luid = ld.get('uid') or _follow_uid
+                    if _luid is None or _luid not in cars:
+                        _luid = None     # unaddressed: adopted at next spawn
+                    car_flags.setdefault(_luid, TestFlags()).hud_label = \
+                        ld.get('text')
 
-        # Skip physics when frozen (or while no car is on the map yet)
-        if not frozen and car is not None:
-            # Get control input from driver (keyboard or API)
-            control_input = car.driver.get_control(car, network, dt, keys)
-        
-        # Merge API control inputs (if API enabled)
-        if api and car is not None:
-            api_control = api.get_control()
-            # API control overrides keyboard for specific keys
-            if api_control['accelerate']:
-                control_input['accelerate'] = True
-            if api_control['brake']:
-                control_input['brake'] = True
-            if api_control['steer_left']:
-                control_input['steer_left'] = True
-            if api_control['steer_right']:
-                control_input['steer_right'] = True
-            if api_control['blinker_left']:
-                control_input['blinker_left'] = True
-            if api_control['blinker_right']:
-                control_input['blinker_right'] = True
-            
-            # BicycleDriver's turn choice comes from `pending_turn`.
-            # API blinkers are ONE-SHOT commands (like flicking a real
-            # indicator): apply them once, then consume the flag so they
-            # don't re-trigger every frame. The driver's own blinker state
-            # persists afterwards and is cleared by the car itself via the
-            # mechanical auto-off (steered in + steered back = off).
-            if hasattr(car.driver, 'signal_turn'):
-                if api_control['blinker_left']:
-                    car.driver.signal_turn('left')
-                    api.clear_control('blinker_left')
-                elif api_control['blinker_right']:
-                    car.driver.signal_turn('right')
-                    api.clear_control('blinker_right')
-            # U-turn (Wenden) is a one-shot command, like a blinker.
-            if api_control.get('uturn') and hasattr(car.driver, 'uturn_requested'):
-                car.driver.uturn_requested = True
-                api.clear_control('uturn')
+                # Freeze / resume (replaces the old ESC key): several
+                # queued freezes resolve to the LAST one.
+                if commands.get('freeze'):
+                    frozen = bool(commands['freeze'][-1])
+                    print("\n⏸️  API: simulation FROZEN" if frozen
+                          else "▶️  API: simulation resumed")
+
+                # Test confirmation flags (PER CAR): green at the scenario
+                # start (car position, immediate), red at its end given as
+                # [segment, progress] - resolved to a map position by the
+                # main loop once THAT car's route covers that segment, so
+                # it is visible from the START of the test. Optional "uid"
+                # addresses a specific car; omit = primary (legacy clients).
+                for fl in commands.get('flags', []):
+                    if not isinstance(fl, dict):
+                        continue
+                    _fuid = fl.get('uid') or _follow_uid
+                    if _fuid is None or _fuid not in cars:
+                        _fuid = None     # unaddressed: adopted at next spawn
+                    tf = car_flags.setdefault(_fuid, TestFlags())
+                    fcar = cars.get(_fuid) if _fuid is not None else None
+                    # Only update the keys that are present, so setting the
+                    # end flag doesn't wipe the start flag (and vice versa).
+                    if 'green' in fl:
+                        tf.flag_green = fl['green']
+                    if 'red' in fl:
+                        if fl['red'] is None:
+                            tf.flag_red = None
+                            tf.flag_red_pending = None
+                            if fcar is not None and fcar.bicycle_nav is not None:
+                                fcar.bicycle_nav.clear_destination()
+                        else:
+                            seg_idx, prog = fl['red'][0], fl['red'][1]
+                            tf.flag_red = None
+                            tf.flag_red_pending = (seg_idx, prog)
+                            # red_nav (default True): the flag becomes the
+                            # car's navigation destination (park at it).
+                            # Running turn tests send red_nav=False - the
+                            # flag is a visual end-of-test marker only
+                            # (docs/TESTING.md).
+                            tf.flag_red_nav = bool(fl.get('red_nav', True))
+
+                # Hazard lights (Warnblinkanlage): explicit on/off command,
+                # per-car via uid (omit = primary).
+                for hz in commands.get('hazard', []):
+                    hz = hz or {}
+                    _huid = hz.get('uid') or _follow_uid
+                    hcar = cars.get(_huid) if _huid is not None else None
+                    if hcar is not None and isinstance(hcar.driver, BicycleDriver):
+                        hcar.driver.set_hazard(
+                            bool(hz.get('on')),
+                            reason="manual (REST API)" if hz.get('on')
+                                   else "manual off (REST API)")
+            except Exception as e:
+                print(f"⚠️  API command error (skipped, sim continues): {e!r}",
+                      flush=True)
+
+        # --- Per-car control input (driver + API merge), once per frame;
+        # the fixed-timestep substeps below reuse it (as before). ---
+        car_control = {}
+        if not frozen and cars:
+            for c in cars.values():
+                # Get control input from driver (keyboard or API)
+                ci = c.driver.get_control(c, network, dt, keys)
+                if api:
+                    is_primary = (c.uid == _follow_uid)
+                    api_control = api.get_control_for(c.uid,
+                                                      is_primary=is_primary)
+                    # API control overrides keyboard for specific keys
+                    if api_control['accelerate']:
+                        ci['accelerate'] = True
+                    if api_control['brake']:
+                        ci['brake'] = True
+                    if api_control['steer_left']:
+                        ci['steer_left'] = True
+                    if api_control['steer_right']:
+                        ci['steer_right'] = True
+                    if api_control['blinker_left']:
+                        ci['blinker_left'] = True
+                    if api_control['blinker_right']:
+                        ci['blinker_right'] = True
+
+                    # BicycleDriver's turn choice comes from `pending_turn`.
+                    # API blinkers are ONE-SHOT commands (like flicking a
+                    # real indicator): apply them once, then consume the
+                    # flag so they don't re-trigger every frame. The
+                    # driver's own blinker state persists afterwards and is
+                    # cleared by the car itself via the mechanical auto-off
+                    # (steered in + steered back = off).
+                    if hasattr(c.driver, 'signal_turn'):
+                        if api_control['blinker_left']:
+                            c.driver.signal_turn('left')
+                            api.clear_control('blinker_left', c.uid,
+                                              is_primary=is_primary)
+                        elif api_control['blinker_right']:
+                            c.driver.signal_turn('right')
+                            api.clear_control('blinker_right', c.uid,
+                                              is_primary=is_primary)
+                    # U-turn (Wenden) is a one-shot command, like a blinker.
+                    if api_control.get('uturn') \
+                            and hasattr(c.driver, 'uturn_requested'):
+                        c.driver.uturn_requested = True
+                        api.clear_control('uturn', c.uid,
+                                          is_primary=is_primary)
+                car_control[c.uid] = ci
         
         # --- Physics: FIXED-timestep substeps (only when not frozen) ----
         # Integrate at exactly dt_fixed (1/60 s) no matter how long the
@@ -467,9 +568,8 @@ def main(smoke_test_frames: int = 0):
         # Fixed steps make the live game deterministic: if a scenario is
         # clean in a headless run, it is clean here.
         _t_a = time.perf_counter()
-        on_wrong_side = False
-        free_off_road = False
-        if frozen or car is None:
+        per_car_state = {}   # uid -> frame outputs (wrong side etc.) for /state
+        if frozen or not cars:
             _physics_accum = 0.0          # don't simulate the pause / empty map
             _steps_this_frame = 0
         else:
@@ -480,92 +580,101 @@ def main(smoke_test_frames: int = 0):
             while _physics_accum >= dt_fixed:
                 _physics_accum -= dt_fixed
                 _steps_this_frame += 1
-                _prev_render = (car.x, car.y, car.heading)
-                _pre_x, _pre_y, _pre_h = car.x, car.y, car.heading
-                car.update(dt_fixed, network, control_input)
-                # (Blinker auto-cancel is mechanical - the driver watches
-                # the steering angle itself: steered in + steered back =
-                # off. No segment-change hook needed.)
-                # Stop-on-contact with obstacles (ALL modes; docs/OBSTACLES.md):
-                # brake at full A_BRAKE and clamp so the body box never
-                # interpenetrates an obstacle - the car rests against it.
-                in_contact = obstacle_mgr.apply_contact_stop(
-                    car, dt_fixed, _pre_x, _pre_y, _pre_h)
-                # Physics validation (independent check). While in contact
-                # the motion is externally constrained by a solid object, so
-                # the validator suspends the turning-radius invariant for
-                # that frame - jump/snap/off-road checks keep running.
-                validator.check(car, dt_fixed, network, in_contact=in_contact)
-                # Lane guard: wrong-side driving (skipped during active
-                # turns - lateral offset from the incoming centreline is
-                # expected; and for the whole U-turn, where crossing the
-                # centreline is INTENDED, spec §5).
-                in_turn = hasattr(car.bicycle_nav, '_s') \
-                    and car.bicycle_nav._s is not None \
-                    and car.bicycle_nav._in_turn_blend_zone(car.bicycle_nav._s)
-                uturn_now = car.bicycle_nav is not None and \
-                            getattr(car.bicycle_nav, 'uturn_active', False)
-                on_wrong_side = False
-                if not in_turn and not uturn_now:
-                    # Warning only - NEVER fatal here (no crash, no freeze):
-                    # the guard prints once per crossing and /state reports
-                    # 'wrong_side' + cumulative lane-guard stats; FAILING a
-                    # run is the e2e suite's job (docs/TESTING.md §3). In
-                    # FREE mode the same flag drives the red LED + label.
-                    on_wrong_side = lane_guard.check(car, dt_fixed, network)
-                # Off-road check (FREE mode only): stop the car + warning
-                free_off_road = False
-                if car.driver.get_name() == "FREE":
-                    free_off_road = not car.is_on_road(network)
-                    if free_off_road:
-                        car.speed = 0
-                    # Map edge check
-                    bounds = network.bounds
-                    if car.x < 0 or car.x > bounds[2] \
-                            or car.y < 0 or car.y > bounds[3]:
-                        car.speed = 0
-                        car.x = max(0, min(bounds[2], car.x))
-                        car.y = max(0, min(bounds[3], car.y))
+                # ALL cars step together in the same substep (shared
+                # accumulator): every car advances exactly dt_fixed per
+                # substep, so a multi-car run is deterministic like the
+                # single-car one.
+                for c in cars.values():
+                    _prev_render[c.uid] = (c.x, c.y, c.heading)
+                    _pre_x, _pre_y, _pre_h = c.x, c.y, c.heading
+                    c.update(dt_fixed, network, car_control.get(c.uid, {}))
+                    # (Blinker auto-cancel is mechanical - the driver
+                    # watches the steering angle itself: steered in +
+                    # steered back = off. No segment-change hook needed.)
+                    # Stop-on-contact with obstacles (ALL modes;
+                    # docs/OBSTACLES.md): brake at full A_BRAKE and clamp
+                    # so the body box never interpenetrates an obstacle -
+                    # the car rests against it.
+                    in_contact = obstacle_mgr.apply_contact_stop(
+                        c, dt_fixed, _pre_x, _pre_y, _pre_h)
+                    # Physics validation (independent check). While in
+                    # contact the motion is externally constrained by a
+                    # solid object, so the validator suspends the
+                    # turning-radius invariant for that frame -
+                    # jump/snap/off-road checks keep running.
+                    validator.check(c, dt_fixed, network,
+                                    in_contact=in_contact)
+                    # Lane guard: wrong-side driving (skipped during active
+                    # turns - lateral offset from the incoming centreline is
+                    # expected; and for the whole U-turn, where crossing the
+                    # centreline is INTENDED, spec §5).
+                    in_turn = hasattr(c.bicycle_nav, '_s') \
+                        and c.bicycle_nav._s is not None \
+                        and c.bicycle_nav._in_turn_blend_zone(c.bicycle_nav._s)
+                    uturn_now = c.bicycle_nav is not None and \
+                                getattr(c.bicycle_nav, 'uturn_active', False)
+                    on_wrong_side = False
+                    if not in_turn and not uturn_now:
+                        # Warning only - NEVER fatal here (no crash, no
+                        # freeze): the guard prints once per crossing and
+                        # /state reports 'wrong_side' + cumulative
+                        # lane-guard stats; FAILING a run is the e2e suite's
+                        # job (docs/TESTING.md §3). In FREE mode the same
+                        # flag drives the red LED + label.
+                        on_wrong_side = lane_guard.check(c, dt_fixed, network)
+                    # Off-road check (FREE mode only): stop the car + warning
+                    free_off_road = False
+                    if c.driver.get_name() == "FREE":
+                        free_off_road = not c.is_on_road(network)
+                        if free_off_road:
+                            c.speed = 0
+                        # Map edge check
+                        bounds = network.bounds
+                        if c.x < 0 or c.x > bounds[2] \
+                                or c.y < 0 or c.y > bounds[3]:
+                            c.speed = 0
+                            c.x = max(0, min(bounds[2], c.x))
+                            c.y = max(0, min(bounds[3], c.y))
+                    per_car_state[c.uid] = {
+                        'on_wrong_side': on_wrong_side,
+                        'free_off_road': free_off_road,
+                    }
         _t_b = time.perf_counter()
         _t_c = _t_b   # validate+guard now run inside the physics phase
 
-        # --- Render interpolation (fix-your-timestep) ----
+        # --- Camera follow position (fix-your-timestep interpolation) ----
         # Physics advanced in fixed dt_fixed substeps above; a rendered
-        # frame can contain 0 or 2 of them. Draw the car at lerp(prev,
-        # curr, alpha) so its on-screen motion is smooth every frame
-        # instead of freezing/hopping when the step count quantises.
-        if car is None or frozen:
-            if car is not None:
-                car._render_state = None
+        # frame can contain 0 or 2 of them. Follow the FOLLOWED car's
+        # interpolated position so the mirrored camera stays smooth every
+        # frame instead of freezing/hopping when the step count quantises.
+        followed = cars.get(_follow_uid) if _follow_uid is not None else None
+        if frozen or followed is None:
             _rx, _ry = camera.x, camera.y   # no car / paused: hold the view
-        elif _prev_render is not None:
-            px, py, ph = _prev_render
-            cx, cy, ch = car.x, car.y, car.heading
+        elif followed.uid in _prev_render:
+            px, py, ph = _prev_render[followed.uid]
+            cx, cy, ch = followed.x, followed.y, followed.heading
             if (cx - px) ** 2 + (cy - py) ** 2 > 100.0:
                 # Teleport / snap: no lerping across the jump.
-                car._render_state = (cx, cy, ch)
+                _rx, _ry = cx, cy
             else:
                 alpha = _physics_accum / dt_fixed
-                dh = (ch - ph + 540.0) % 360.0 - 180.0
-                car._render_state = (
-                    px + (cx - px) * alpha,
-                    py + (cy - py) * alpha,
-                    (ph + dh * alpha) % 360.0,
-                )
-            _rx, _ry = car._render_state[:2]
+                _rx = px + (cx - px) * alpha
+                _ry = py + (cy - py) * alpha
         else:
-            _rx, _ry = car.x, car.y
+            _rx, _ry = followed.x, followed.y
 
-        # Resolve the pending RED end flag once the current route covers
-        # that segment (it may lie beyond the initial route horizon):
-        # position + travel heading come from the route's node order, so
-        # "right of the road" is correct even for backward-traversed
-        # segments.
-        if flags.flag_red_pending and car is not None \
-                and car.bicycle_nav is not None:
-            _fseg, _fprog = flags.flag_red_pending
-            if _fseg in getattr(car.bicycle_nav, '_route_seg_set', set()):
-                _pos = _flag_position_on_route(network, car.bicycle_nav,
+        # Resolve each car's pending RED end flag once ITS route covers that
+        # segment (it may lie beyond the initial route horizon): position +
+        # travel heading come from the route's node order, so "right of the
+        # road" is correct even for backward-traversed segments.
+        for c in list(cars.values()):
+            tf = car_flags.get(c.uid)
+            if tf is None or not tf.flag_red_pending \
+                    or c.bicycle_nav is None:
+                continue
+            _fseg, _fprog = tf.flag_red_pending
+            if _fseg in getattr(c.bicycle_nav, '_route_seg_set', set()):
+                _pos = _flag_position_on_route(network, c.bicycle_nav,
                                                _fseg, _fprog)
                 if _pos:
                     _fx, _fy, _fh = _pos
@@ -573,38 +682,40 @@ def main(smoke_test_frames: int = 0):
                     # running turn test (flag_red_nav=False): then it is a
                     # visual end-of-test marker only - the car drives THROUGH
                     # it and the harness ends the test on the crossing.
-                    if flags.flag_red_nav:
+                    if tf.flag_red_nav:
                         # Truncate the reference line at the centreline
                         # point so the car parks AT the flag (parking ramp +
                         # kerb drift + stop), not at whatever dead end the
                         # route happens to reach beyond it.
-                        print(f"[FLAGDBG] dest set seg={_fseg} prog={_fprog} "
-                              f"px=({_fx:.0f},{_fy:.0f})")
-                        car.bicycle_nav.set_destination(_fx, _fy)
-                    else:
-                        print(f"[FLAGDBG] visual-only flag seg={_fseg} "
+                        print(f"[FLAGDBG] car #{c.uid} dest set seg={_fseg} "
                               f"prog={_fprog} px=({_fx:.0f},{_fy:.0f})")
+                        c.bicycle_nav.set_destination(_fx, _fy)
+                    else:
+                        print(f"[FLAGDBG] car #{c.uid} visual-only flag "
+                              f"seg={_fseg} prog={_fprog} "
+                              f"px=({_fx:.0f},{_fy:.0f})")
                     # The route point sits on the segment CENTRELINE; shift
                     # it onto the right kerb (the same offset the car uses)
-                    # so _draw_flag's 3 m grass offset lands the pennant
+                    # so the renderer's 3 m grass offset lands the pennant
                     # fully off the carriageway - like the green flag, which
                     # is placed from the car's own kerb-side position.
                     _frad = math.radians(_fh)
                     _fright = (math.cos(_frad), -math.sin(_frad))
                     _foff = kerb_offset_m(network.segments[_fseg].width)
-                    flags.flag_red = [
+                    tf.flag_red = [
                         _fx + _fright[0] * _foff,
                         _fy + _fright[1] * _foff,
                         _fh,
                     ]
-                    flags.flag_red_pending = None
+                    tf.flag_red_pending = None
 
         _t_d = time.perf_counter()
         # Camera follow (only when moving and not frozen) - follows the
         # INTERPOLATED position; the remote renderer mirrors this camera.
         if not frozen:
             camera.update(_rx, _ry, network.world_width, network.world_height,
-                          follow=(car is not None and abs(car.speed) > 0.1))
+                          follow=(followed is not None
+                                  and abs(followed.speed) > 0.1))
 
         _t_e = time.perf_counter()
 
@@ -645,7 +756,37 @@ def main(smoke_test_frames: int = 0):
 
         # Update API state (if API enabled)
         if api:
-            if car is None:
+            # Multi-car (docs/MULTI_CAR_PLAN.md): the top-level fields keep
+            # describing the PRIMARY (followed) car - legacy consumers (e2e
+            # suite, cockpit) are untouched - while `cars` carries ALL cars;
+            # the Godot frontend prefers that array.
+            _tf_p = car_flags.get(followed.uid) if followed is not None \
+                else None
+            cars_payload = []
+            for c in cars.values():
+                _pcs = per_car_state.get(c.uid, {})
+                cars_payload.append({
+                    'car_uid': c.uid,
+                    'x': c.x,
+                    'y': c.y,
+                    'heading': c.heading,
+                    'speed_kmh': c.speed * 3.6,
+                    'level': network.segments[c.seg_idx].level,
+                    'segment': c.seg_idx,
+                    'progress': c.progress,
+                    'on_road': c.is_on_road(network),
+                    'wrong_side': _pcs.get('on_wrong_side', False),
+                    'blinker_left': bool(
+                        getattr(c.driver, 'blinker_left', False)),
+                    'blinker_right': bool(
+                        getattr(c.driver, 'blinker_right', False)),
+                    'hazard': bool(getattr(c.driver, 'hazard', False)),
+                    'color': c.color,
+                    'flags': _flags_payload(car_flags.get(c.uid)),
+                    'hud_label': car_flags[c.uid].hud_label
+                        if c.uid in car_flags else None,
+                })
+            if followed is None:
                 # No car on the map yet (test maps don't auto-spawn):
                 # report that, keep camera info current.
                 api.update_state({
@@ -658,24 +799,22 @@ def main(smoke_test_frames: int = 0):
                     'validator_violations': 0,
                     # Test flags (green start / red end pennant) in world
                     # pixels, or None: the Godot renderer draws them.
-                    'flags': {
-                        'green': list(flags.flag_green)
-                        if flags.flag_green else None,
-                        'red': list(flags.flag_red)
-                        if flags.flag_red else None,
-                    },
+                    'flags': {'green': None, 'red': None},
                     # Short HUD label (e.g. "5/21") set via POST /label -
                     # the remote renderer shows it like pygame did.
-                    'hud_label': flags.hud_label,
+                    'hud_label': None,
                     'camera_x': camera.x,
                     'camera_y': camera.y,
                     'camera_zoom': camera.zoom,
+                    'cars': cars_payload,
                 })
             else:
+                car = followed
                 # Parking state lives on the nav, not the driver (reading
                 # car.driver yields None and silently disables the e2e
                 # suite's reverse-in gate).
                 _nav = getattr(car, 'bicycle_nav', None)
+                _pcs = per_car_state.get(car.uid, {})
                 api.update_state({
                     'frame': frame,
                     'time': frame * dt_fixed if smoke_test_frames else frame / 60.0,
@@ -704,7 +843,7 @@ def main(smoke_test_frames: int = 0):
                     # Dashboard lamps for the cockpit controller (tools/controller.py)
                     'braking': bool(getattr(car, '_braking', False)),
                     'accelerating': bool(getattr(car, '_accelerating', False)),
-                    'wrong_side': on_wrong_side,
+                    'wrong_side': _pcs.get('on_wrong_side', False),
                     'driver': car.driver.get_name(),
                     # Parking state for the e2e suite: a reverse-in park
                     # deliberately crosses the flag to stage the back-in, so
@@ -724,29 +863,33 @@ def main(smoke_test_frames: int = 0):
                     'hazard': bool(getattr(car.driver, 'hazard', False)),
                     'hazard_reason': getattr(car.driver, 'hazard_reason', ''),
                     'frozen': frozen,
-                    'blinker_left': bool(getattr(car.driver, 'blinker_left', False)),
-                    'blinker_right': bool(getattr(car.driver, 'blinker_right', False)),
+                    'blinker_left': bool(
+                        getattr(car.driver, 'blinker_left', False)),
+                    'blinker_right': bool(
+                        getattr(car.driver, 'blinker_right', False)),
                     'lane_guard_stats': lane_guard.stats(car),
+                    # Multi-car: display color + the full car list (the
+                    # Godot frontend prefers `cars` over these fields).
+                    'color': car.color,
+                    'cars': cars_payload,
                     # (The breadcrumb trail is NOT exported here: it is a
                     # pure visual and the Godot frontend records it client-
                     # side from the x/y/heading samples.)
-                    'flags': {
-                        'green': list(flags.flag_green)
-                        if flags.flag_green else None,
-                        'red': list(flags.flag_red)
-                        if flags.flag_red else None,
-                    },
+                    'flags': _flags_payload(_tf_p),
                     # Short HUD label (e.g. "5/21") set via POST /label.
-                    'hud_label': flags.hud_label,
+                    'hud_label': _tf_p.hud_label if _tf_p else None,
                     'camera_x': camera.x,
                     'camera_y': camera.y,
                     'camera_zoom': camera.zoom,
                 })
 
     if smoke_test_frames:
-        if car is not None:
-            print(f"Smoke test OK: {frame} frames, car at ({car.x:.0f}, {car.y:.0f}), "
-                  f"speed={car.speed:.1f} m/s, zoom={camera.zoom:.2f}")
+        if cars:
+            _sc = cars[_follow_uid] if _follow_uid in cars else next(
+                iter(cars.values()))
+            print(f"Smoke test OK: {frame} frames, {len(cars)} car(s), "
+                  f"primary #{_sc.uid} at ({_sc.x:.0f}, {_sc.y:.0f}), "
+                  f"speed={_sc.speed:.1f} m/s, zoom={camera.zoom:.2f}")
         else:
             print(f"Smoke test OK: {frame} frames, no car on map, "
                   f"zoom={camera.zoom:.2f}")

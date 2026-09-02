@@ -349,6 +349,28 @@ This is the actual workflow used throughout this project's development:
    and re-run the same `--only` scenario before moving on to the full
    suite.
 
+## 8. Parallel test runs (multiple cars)
+
+The sim supports several cars at once (docs/MULTI_CAR_PLAN.md), so
+scenarios can run in parallel instead of sequentially:
+
+- `POST /teleport {"start_point": ..., "add": true}` spawns a car
+  ALONGSIDE the existing ones (default without `add` is replace - what
+  this sequential suite uses).
+- Every per-car endpoint takes an optional `"uid"`: `/control`,
+  `/flags`, `/label`, `/toggle` (omit = primary car, i.e. the most
+  recently spawned one).
+- Each car carries its own test flags + HUD label in `/state.cars[]`; the
+  Godot frontend draws per-car pennants, labels and colors (red, blue,
+  yellow, white by uid).
+- `POST /cars {"action": "clear"}` removes all cars between rounds.
+- Cars pass through each other (no car–car collisions yet - a later
+  decision).
+
+The sequential suite in §2 is unchanged: it teleports without `add`
+(replace) and reads the top-level `/state` fields, which always describe
+the primary car.
+
 ## Notes / gotchas
 
 - The game process must be restarted after any code change - there's no

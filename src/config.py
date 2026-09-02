@@ -80,6 +80,10 @@ STEER_LOCK_TIME_S = 0.35
 REVERSE_MAX_SPEED_M = 30.0 / 3.6   # ~8.33 m/s
 CAR_LENGTH = 4.4        # meters
 CAR_WIDTH = 1.8         # meters
+# Multi-car colors (docs/MULTI_CAR_PLAN.md): car N gets CAR_COLORS[(N-1) % 4].
+# Red is the player color; blue/yellow/white are the old pygame obstacle
+# palette - clearly distinguishable from red and each other.
+CAR_COLORS = ("red", "blue", "yellow", "white")
 
 # --- Axle geometry ---
 # The kinematic bicycle model integrates the REAR AXLE: the rear wheels
