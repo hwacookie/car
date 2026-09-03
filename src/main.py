@@ -358,6 +358,13 @@ def main(smoke_test_frames: int = 0):
     dt_fixed = 1 / 60
     _last_frame_wall = time.perf_counter()
     _physics_accum = 0.0
+    # SIM CLOCK = total physics substeps executed (NOT the frame counter).
+    # A slow wall-clock frame runs 2 substeps in one iteration; if the
+    # exported clock only advanced per iteration, position and time would
+    # decouple (the car moves 2x while time advances 1x -> every client
+    # interpolating on sim time sees a periodic forward jump). Tying the
+    # clock to the substeps keeps them consistent by construction.
+    _sim_steps_total = 0
     _prev_render = {}     # uid -> (x, y, heading) before the last substep
     while running:
         frame += 1
@@ -622,6 +629,7 @@ def main(smoke_test_frames: int = 0):
             while _physics_accum >= dt_fixed:
                 _physics_accum -= dt_fixed
                 _steps_this_frame += 1
+                _sim_steps_total += 1
                 # ALL cars step together in the same substep (shared
                 # accumulator): every car advances exactly dt_fixed per
                 # substep, so a multi-car run is deterministic like the
@@ -833,7 +841,7 @@ def main(smoke_test_frames: int = 0):
                 # report that, keep camera info current.
                 api.update_state({
                     'frame': frame,
-                    'time': frame * dt_fixed if smoke_test_frames else frame / 60.0,
+                    'time': _sim_steps_total * dt_fixed,
                     'has_car': False,
                     'frozen': frozen,
                     'validator_enabled': validator.enabled,
@@ -859,7 +867,7 @@ def main(smoke_test_frames: int = 0):
                 _pcs = per_car_state.get(car.uid, {})
                 api.update_state({
                     'frame': frame,
-                    'time': frame * dt_fixed if smoke_test_frames else frame / 60.0,
+                    'time': _sim_steps_total * dt_fixed,
                     'has_car': True,
                     # Monotonic per-car identity: the teleport ack. has_car
                     # alone can't confirm a NEW car - it is already True

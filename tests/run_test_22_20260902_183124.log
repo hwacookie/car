@@ -1,0 +1,72 @@
+✅ API health check passed
+
+============================================================
+DETERMINISTIC TURN TESTING (synthetic 'basic' map)
+============================================================
+
+46 named start points available on this map.
+
+Each test will:
+  1. Teleport to a KNOWN start point (exact position + heading)
+  2. Accelerate to target speed
+  3. Activate turn signal (or none, for 'straight')
+  4. Monitor turn execution
+  5. Check for off-road violations and instant heading snaps
+
+============================================================
+
+📄 Results file: /Users/hauke/prj/car/tests/turning_results.json
+   (each scenario's outcome is saved there; next run shows its last result)
+
+▶  Running 1 of 22 scenarios: 22
+
+
+############################################################
+# TEST 22/22: 'fig8_stress' -> STRAIGHT @ 0 km/h
+############################################################
+
+------------------------------------------------------------
+STRESS PHASE: 2 cars on the figure-8 for 30 s
+------------------------------------------------------------
+   Phase 2 cars: ✅ PASSED - jitters (Ruckler): 0, worst jump 0.00 m, off-road hits 0, wrong-side hits 1
+
+------------------------------------------------------------
+STRESS PHASE: 6 cars on the figure-8 for 30 s
+------------------------------------------------------------
+   Phase 6 cars: ✅ PASSED - jitters (Ruckler): 0, worst jump 0.00 m, off-road hits 0, wrong-side hits 15
+
+------------------------------------------------------------
+STRESS PHASE: 10 cars on the figure-8 for 30 s
+------------------------------------------------------------
+   Phase 10 cars: ✅ PASSED - jitters (Ruckler): 0, worst jump 0.00 m, off-road hits 0, wrong-side hits 5
+
+------------------------------------------------------------
+STRESS PHASE: 14 cars on the figure-8 for 30 s
+------------------------------------------------------------
+   Phase 14 cars: ✅ PASSED - jitters (Ruckler): 0, worst jump 0.00 m, off-road hits 0, wrong-side hits 4
+
+------------------------------------------------------------
+STRESS PHASE: 18 cars on the figure-8 for 30 s
+------------------------------------------------------------
+   Phase 18 cars: ✅ PASSED - jitters (Ruckler): 0, worst jump 0.00 m, off-road hits 0, wrong-side hits 6
+
+============================================================
+FINAL SUMMARY
+============================================================
+
+Total tests: 1
+  ✅ Passed: 1
+  ✅ Passed: no off-road violations
+  ✅ Passed: no instant snaps
+  ✅ Passed: no teleport/jump
+  ✅ Passed: no game crashes
+  ✅ Passed: no wrong-side driving
+  ✅ Passed: no runs past the end flag
+  ✅ Passed: no wrong end segments
+  ✅ Passed: no timeouts
+  ✅ Passed: no missed end flags
+
+============================================================
+🎉 ALL TESTS PASSED! Smooth turns, no violations.
+============================================================
+
