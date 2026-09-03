@@ -771,7 +771,7 @@ def main(smoke_test_frames: int = 0):
 
         # TEMP perf probe (remove after diagnosis)
         if not smoke_test_frames and frame % 120 == 0:
-            print(f"[PERF] f={frame} tick={frame_ms:.0f}ms "
+            print(f"[PERF] wall={time.time()*1000:.0f} f={frame} tick={frame_ms:.0f}ms "
                   f"update={(_t_b - _t_a) * 1000:.1f} validate={(_t_c - _t_b) * 1000:.1f} "
                   f"guard={(_t_d - _t_c) * 1000:.1f} render={(_t_e - _t_d) * 1000:.1f}",
                   flush=True)
