@@ -763,9 +763,17 @@ def main(smoke_test_frames: int = 0):
         # Camera follow (only when moving and not frozen) - follows the
         # INTERPOLATED position; the remote renderer mirrors this camera.
         if not frozen:
+            # Advance the follow-lag per PHYSICS STEP, not per frame:
+            # alpha = 1-(1-f)**steps keeps the camera's sim-time rate
+            # uniform when a frame contains two substeps. A fixed
+            # per-frame alpha moved the camera only half as far per unit
+            # sim time on those frames -> car-cam offset sawtooth of
+            # ~v/60 (visible wobble at max zoom, scales with speed).
+            _cam_alpha = 1.0 - (1.0 - camera.lerp_factor) ** _steps_this_frame
             camera.update(_rx, _ry, network.world_width, network.world_height,
                           follow=(followed is not None
-                                  and abs(followed.speed) > 0.1))
+                                  and abs(followed.speed) > 0.1),
+                          alpha=_cam_alpha)
 
         _t_e = time.perf_counter()
 

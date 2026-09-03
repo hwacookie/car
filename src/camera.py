@@ -23,13 +23,21 @@ class Camera:
         self._drag_start_camera = (0.0, 0.0)
 
     def update(self, target_x: float, target_y: float, world_w: float, world_h: float,
-               follow: bool = True):
+               follow: bool = True, alpha: float | None = None):
         """Smoothly move camera toward target, clamped to world bounds.
         Only follows if not manually dragging and follow=True.
+
+        `alpha` overrides lerp_factor for this call. The main loop passes
+        1-(1-lerp_factor)**steps so the lag advances per PHYSICS STEP
+        (sim time), not per frame: with a fixed per-frame alpha, a frame
+        containing two substeps advanced the camera only half as far per
+        unit sim time, sawtoothing the car-cam offset by ~v/60 on every
+        double-step frame (visible wobble at max zoom).
         """
         if not self._dragging and follow:
-            self.x += (target_x - self.x) * self.lerp_factor
-            self.y += (target_y - self.y) * self.lerp_factor
+            a = self.lerp_factor if alpha is None else alpha
+            self.x += (target_x - self.x) * a
+            self.y += (target_y - self.y) * a
 
         # Clamp so camera never shows outside the world.
         # If the world is smaller than the viewport along an axis, the
