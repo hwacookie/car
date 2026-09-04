@@ -570,11 +570,83 @@ def _auto_base_profile(props, S, lo=None, hi=None):
     return out
 
 
+# --- Route-geometry memoization ---------------------------------------
+# solve_line is expensive (25 ms steady-state, ~250 ms cold) but its
+# result depends only on the route GEOMETRY + nominal profile - never on
+# the car. On a fixed map the set of distinct route windows is small
+# (fig8: ~48 nine-segment windows), so after warm-up every rebuild is a
+# cache hit and the per-car steady-state tax (~30 ms every ~10 s) drops
+# to tens of microseconds. Spawn bursts collapse too: 576 cars x 250 ms
+# = ~2.5 min of one-shot work becomes one solve per distinct window.
+# Callers may mutate the returned lists freely - the cache hands out
+# copies (the stored originals are owned by the cache).
+_SOLVE_CACHE: dict = {}
+_SOLVE_CACHE_MAX = 1024
+_solve_stats = {'hits': 0, 'misses': 0}
+
+
+def cache_stats() -> dict:
+    """{'hits': n, 'misses': m, 'size': k} - for perf diagnostics."""
+    return {'hits': _solve_stats['hits'], 'misses': _solve_stats['misses'],
+            'size': len(_SOLVE_CACHE)}
+
+
+def clear_cache() -> None:
+    _SOLVE_CACHE.clear()
+    _solve_stats['hits'] = 0
+    _solve_stats['misses'] = 0
+
+
+def _solve_cache_key(rounded, ds: float,
+                     base_offset: float | None, auto_base: bool,
+                     merge_from_m: float | None,
+                     merge_s0: float, merge_s1: float) -> tuple:
+    # Quantize geometry to ~0.5 mm (world px). The rounded polyline is
+    # deterministic per map; quantizing only guards against float drift
+    # between rebuild paths that should produce identical geometry.
+    pts = tuple((int(round(px * 2048.0)), int(round(py * 2048.0)))
+                for px, py in rounded)
+    return (pts, ds,
+            None if base_offset is None else round(base_offset, 3),
+            auto_base,
+            None if merge_from_m is None else round(merge_from_m, 3),
+            round(merge_s0, 3), round(merge_s1, 3))
+
+
 def solve_line(network, rounded, route_seg_idx, ds=SAMPLE_M,
                base_offset: float | None = None,
                auto_base: bool = False,
                merge_from_m: float | None = None,
                merge_s0: float = 0.0, merge_s1: float = 0.0):
+    """The fastest legal line for a route, as a dense uniform polyline.
+
+    Memoized on (route geometry, nominal profile) - see _SOLVE_CACHE:
+    the solve is a property of the CURVE, not of any car, so every car
+    sharing a route window reuses one solution. Returns fresh copies.
+    """
+    key = _solve_cache_key(rounded, ds, base_offset, auto_base,
+                           merge_from_m, merge_s0, merge_s1)
+    hit = _SOLVE_CACHE.get(key)
+    if hit is not None:
+        _solve_stats['hits'] += 1
+        P, N, offsets, cum = hit
+        return list(P), list(N), list(offsets), list(cum)
+    P, N, offsets, cum = _solve_line_impl(
+        network, rounded, route_seg_idx, ds=ds,
+        base_offset=base_offset, auto_base=auto_base,
+        merge_from_m=merge_from_m, merge_s0=merge_s0, merge_s1=merge_s1)
+    _solve_stats['misses'] += 1
+    if len(_SOLVE_CACHE) >= _SOLVE_CACHE_MAX:
+        _SOLVE_CACHE.pop(next(iter(_SOLVE_CACHE)))   # FIFO eviction
+    _SOLVE_CACHE[key] = (P, N, offsets, cum)
+    return list(P), list(N), list(offsets), list(cum)
+
+
+def _solve_line_impl(network, rounded, route_seg_idx, ds=SAMPLE_M,
+                     base_offset: float | None = None,
+                     auto_base: bool = False,
+                     merge_from_m: float | None = None,
+                     merge_s0: float = 0.0, merge_s1: float = 0.0):
     """The fastest legal line for a route, as a dense uniform polyline.
 
     `base_offset` overrides the nominal lane offset used to pin straight

@@ -628,14 +628,19 @@ class TurnTester:
         requests.post(f"{API_URL}/label", json={'text': text})
 
     # --- Multi-car stress scenario (fig8_stress, docs/MULTI_CAR_PLAN.md) ---
-    # Phases of 2/6/10/14/18 cars (+4 each) drive the figure-8 loop for
-    # 30 s. Cars pass through each other (no car-car collisions), so any
-    # count is legal - the metric is how often a car gets displaced
-    # JERKILY: per poll, movement beyond the suite's teleport/jump bound
-    # max(speed, 50 km/h)*dt*1.5 + 1 m counts one jitter ("Ruckler"). The
-    # sum over all cars is stored per phase in turning_results.json as
-    # "jitters" - it shows at how many cars the sim starts stuttering.
-    STRESS_PHASE_CARS = (2, 6, 10, 14, 18)
+    # Phases of 18..576 cars (x2 each) drive the figure-8 loop for
+    # STRESS_PHASE_SECONDS of SIM time. Cars pass through each other (no
+    # car-car collisions), so any count is legal - the metric is how often
+    # a car gets displaced JERKILY: per poll, movement beyond the suite's
+    # teleport/jump bound max(speed, 50 km/h)*dt*1.5 + 1 m counts one
+    # jitter ("Ruckler"). The sum over all cars is stored per phase in
+    # turning_results.json as "jitters" - it shows at how many cars the
+    # sim starts stuttering.
+    # At high car counts the sim may fall behind wall clock (its
+    # accumulator caps substeps -> slow motion, never a leap); the phase
+    # duration is therefore measured in SIM time so every phase covers the
+    # same driving distance no matter how slow the wall clock gets.
+    STRESS_PHASE_CARS = (18, 36, 72, 144, 288, 576)
     STRESS_PHASE_SECONDS = 30.0
     STRESS_POLL_S = 0.1
     # Positional indices into network.segments - fragile if the map
@@ -649,19 +654,27 @@ class TurnTester:
 
         Returns False on timeout. Uses the keep-alive session so the clear
         can't be reordered against other in-flight requests (see
-        __init__)."""
+        __init__). Transient /state timeouts under load are retried; only
+        a sustained unresponsive sim (~15 s) counts as failure.
+        """
         try:
             self._api_session.post(f"{API_URL}/cars",
                                    json={'action': 'clear'}, timeout=5)
         except requests.exceptions.RequestException:
             return False
         deadline = time.time() + 10.0
+        bad_streak = 0
         while time.time() < deadline:
             try:
                 st = self._api_session.get(f"{API_URL}/state",
                                            timeout=2).json()
+                bad_streak = 0
             except (requests.exceptions.RequestException, ValueError):
-                return False
+                bad_streak += 1
+                if bad_streak >= 5:      # ~10 s of no answer -> give up
+                    return False
+                time.sleep(0.5)
+                continue
             if len(st.get('cars', [])) == 0:
                 return True
             time.sleep(0.05)
@@ -692,27 +705,59 @@ class TurnTester:
             'stress_phases': phases,
         }
 
+    @staticmethod
+    def _stress_phases_from_argv() -> "tuple | None":
+        """Optional CLI override of the stress phases (like --tests):
+
+            --stress-cars 576          only the 576-car phase
+            --stress-cars 288,576      those two
+
+        No flag -> None = run all STRESS_PHASE_CARS. Read from sys.argv
+        here (not in main()) so every entry point that reaches this runner
+        - CLI suite, /run_test subprocess, `--tests fig8_stress` - honours
+        it without threading a parameter through.
+        """
+        if '--stress-cars' not in sys.argv:
+            return None
+        idx = sys.argv.index('--stress-cars')
+        raw = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ''
+        try:
+            vals = sorted({int(p) for p in raw.split(',') if p.strip()})
+        except ValueError:
+            vals = []
+        if not vals or any(v < 1 for v in vals):
+            print("--stress-cars needs a comma list of positive counts, "
+                  "e.g. --stress-cars 576 or --stress-cars 288,576")
+            sys.exit(2)
+        return tuple(vals)
+
     def run_multi_car_stress_test(self, results: dict | None = None,
                                   abort_check: "callable | None" = None,
-                                  label: str | None = None) -> dict:
-        """Run the multi-car figure-8 stress scenario (all phases).
+                                  label: str | None = None,
+                                  phases: "tuple | None" = None) -> dict:
+        """Run the multi-car figure-8 stress scenario.
 
         Returns a result dict in monitor_turn's shape (so print_summary
         keeps working) with the per-phase breakdown in 'stress_phases'.
         Each phase is ALSO recorded in the results file under its own key
         (fig8_stress|2cars, ...), carrying that phase's jitter sum.
+
+        phases: which car counts to run. None = the --stress-cars CLI
+        override if present, else all STRESS_PHASE_CARS.
         """
         if results is None:
             results = load_results()
-        phases: dict = {}
+        if phases is None:
+            phases = self._stress_phases_from_argv() or self.STRESS_PHASE_CARS
+        phase_results: dict = {}
         overall_passed = True
         crashed = False
 
-        for n_cars in self.STRESS_PHASE_CARS:
+        for n_cars in phases:
             key = f"fig8_stress|{n_cars}cars"
             print(f"\n{'-'*60}")
             print(f"STRESS PHASE: {n_cars} cars on the figure-8 "
-                  f"for {self.STRESS_PHASE_SECONDS:.0f} s")
+                  f"for {self.STRESS_PHASE_SECONDS:.0f} s of sim time")
             print(f"{'-'*60}")
 
             # 1. Clean slate (also drops any car a previous scenario left).
@@ -721,7 +766,7 @@ class TurnTester:
             if not self._clear_all_cars():
                 print("   ❌ Could not clear the map - phase fails")
                 return self._stress_scenario_result(
-                    phases, overall_passed=False, crashed=True,
+                    phase_results, overall_passed=False, crashed=True,
                     aborted=False)
 
             # 2. Spawn n_cars evenly around the loop (rolling start, no
@@ -735,15 +780,26 @@ class TurnTester:
                     'segment': seg, 'progress': 0.5,
                     'speed': spawn_speed_mps, 'add': True}, timeout=5)
             # Wait until all cars actually exist (queued teleports land
-            # one per sim frame - ~17 ms each).
-            deadline = time.time() + 15.0
+            # one per sim frame - ~17 ms each). Proportional budget: at
+            # hundreds of cars a fixed 15 s would time out spuriously if
+            # the tick degrades under load.
+            deadline = time.time() + max(15.0, n_cars * 0.03)
             uids: list[int] = []
+            bad_streak = 0
             while time.time() < deadline:
                 try:
                     st = self._api_session.get(f"{API_URL}/state",
                                                timeout=2).json()
+                    bad_streak = 0
                 except (requests.exceptions.RequestException, ValueError):
-                    break
+                    # A single slow /state under load is NOT a crash -
+                    # retry until the budget runs out (sustained silence
+                    # then just means "not all spawned" -> phase fails).
+                    bad_streak += 1
+                    if bad_streak >= 5:      # ~10 s of no answer
+                        break
+                    time.sleep(0.5)
+                    continue
                 uids = [c['car_uid'] for c in st.get('cars', [])]
                 if len(uids) == n_cars:
                     break
@@ -756,16 +812,12 @@ class TurnTester:
             # 3. Hold the throttle for every car (BICYCLE mode: without
             #    accelerate the nav's target speed is 0 and it brakes -
             #    the input persists in the sim's control bucket until the
-            #    phase's /cars clear removes the cars) + short per-car
-            #    labels so the Godot window shows who is who.
-            for pos, uid in enumerate(uids):
+            #    phase's /cars clear removes the cars).
+            for uid in uids:
                 try:
                     self._api_session.post(
                         f"{API_URL}/control", timeout=5,
                         json={'uid': uid, 'accelerate': True})
-                    self._api_session.post(
-                        f"{API_URL}/label", timeout=5,
-                        json={'uid': uid, 'text': str(pos + 1)})
                 except requests.exceptions.RequestException:
                     pass
 
@@ -778,8 +830,17 @@ class TurnTester:
             max_cars_seen = 0
             phase_crashed = False
             aborted = False
-            deadline = time.time() + self.STRESS_PHASE_SECONDS
-            while time.time() < deadline:
+            # Phase duration in SIM time (the /state 'time' field, total
+            # physics substeps x dt_fixed): under load the sim runs slow
+            # motion (accumulator cap), so a fixed wall-clock window would
+            # cover less driving at high car counts. The wall deadline is
+            # only a hang guard for a wedged sim - 20x budget, because at
+            # 576 cars a full phase legitimately takes ~400 s of wall time
+            # (~8% pace); a truly wedged sim shows ratio -> 0 long before.
+            t0_sim = None
+            wall_start = time.time()
+            wall_deadline = wall_start + self.STRESS_PHASE_SECONDS * 20.0
+            while True:
                 if abort_check is not None and abort_check():
                     aborted = True
                     break
@@ -820,6 +881,23 @@ class TurnTester:
                                       f"(max plausible {max_plausible_m:.2f} m, "
                                       f"{c['speed_kmh']:.0f} km/h)")
                     prev[uid] = (now, x, y)
+                sim_t = st.get('time')
+                if t0_sim is None and isinstance(sim_t, (int, float)):
+                    t0_sim = sim_t
+                if t0_sim is not None:
+                    elapsed = sim_t - t0_sim
+                else:
+                    # Sim without a 'time' field (pre clock-fix): fall back
+                    # to the old wall-clock window.
+                    elapsed = now - wall_start
+                if elapsed >= self.STRESS_PHASE_SECONDS:
+                    break
+                if now > wall_deadline:
+                    print(f"   ⚠️  Wall-clock hang guard hit "
+                          f"({self.STRESS_PHASE_SECONDS * 20:.0f} s) with only "
+                          f"{elapsed:.1f} s of sim time elapsed - "
+                          f"ending the phase early")
+                    break
                 time.sleep(self.STRESS_POLL_S)
 
             # 5. Tear the phase down before the next one - and WAIT for it,
@@ -840,7 +918,7 @@ class TurnTester:
                 print("   ⏭️  Phase aborted (user interrupt)")
             overall_passed = overall_passed and passed and not phase_crashed
             crashed = crashed or phase_crashed
-            phases[key] = {
+            phase_results[key] = {
                 'passed': passed,
                 'jitters': jitters,
                 'worst_jump_m': round(worst_jump_m, 2),
@@ -876,8 +954,8 @@ class TurnTester:
                 break
 
         # The scenario-level result (what print_summary consumes).
-        return self._stress_scenario_result(phases, overall_passed, crashed,
-                                            aborted)
+        return self._stress_scenario_result(phase_results, overall_passed,
+                                            crashed, aborted)
 
     
     def _right_side_kerb_gaps_m(self, state: dict, start_point: str):
@@ -2089,7 +2167,8 @@ class TurnTester:
 
             if start_point == 'fig8_stress':
                 # Multi-car stress scenario: its own runner (phases of
-                # 2/6/10/14/18 cars on the figure-8), not monitor_turn.
+                # 18..576 cars on the figure-8, see run_multi_car_stress_
+                # test), not monitor_turn.
                 # The per-phase results are already recorded in the
                 # results file inside the runner; append the scenario-level
                 # result here (monitor_turn normally does this itself).
@@ -2247,6 +2326,14 @@ def main():
     By default, runs the DETERMINISTIC suite against the synthetic
     'basic' test map (start the game with: --map basic --api).
     
+    Pass --tests <spec> to run a subset by number/name (see select_tests),
+    e.g. `--tests fig8_stress` for just the multi-car stress scenario.
+
+    The stress scenario additionally honours --stress-cars N[,N...] to run
+    only specific car counts (e.g. `--stress-cars 576`); each phase then
+    covers STRESS_PHASE_SECONDS of sim time, so a slow-motion sim simply
+    takes longer in wall clock.
+
     Pass --random to instead teleport to random locations on whatever
     map is currently loaded (real OSM data or a test map).
     

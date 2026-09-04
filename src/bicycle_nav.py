@@ -246,23 +246,21 @@ class RefLine:
 
     def point_at(self, s: float) -> tuple[float, float]:
         s = max(0.0, min(self.total, s))
-        for i in range(len(self.seglen)):
-            if s <= self.cum[i + 1]:
-                t = (s - self.cum[i]) / self.seglen[i] if self.seglen[i] > 0 else 0.0
-                x = self.pts[i][0] + t * (self.pts[i + 1][0] - self.pts[i][0])
-                y = self.pts[i][1] + t * (self.pts[i + 1][1] - self.pts[i][1])
-                return x, y
-        return self.pts[-1]
+        # Bisect over the monotone cumulative lengths (O(log n)): this is
+        # called ~60x per car per substep from project_s, and the old
+        # linear scan dominated multi-car frame time at hundreds of cars.
+        i = max(0, min(bisect.bisect_right(self.cum, s) - 1,
+                       len(self.seglen) - 1))
+        t = (s - self.cum[i]) / self.seglen[i] if self.seglen[i] > 0 else 0.0
+        return (self.pts[i][0] + t * (self.pts[i + 1][0] - self.pts[i][0]),
+                self.pts[i][1] + t * (self.pts[i + 1][1] - self.pts[i][1]))
 
     def heading_at(self, s: float) -> float:
         s = max(0.0, min(self.total - 1e-6, s))
-        for i in range(len(self.seglen)):
-            if s <= self.cum[i + 1]:
-                dx = self.pts[i + 1][0] - self.pts[i][0]
-                dy = self.pts[i + 1][1] - self.pts[i][1]
-                return math.degrees(math.atan2(dx, dy))
-        dx = self.pts[-1][0] - self.pts[-2][0]
-        dy = self.pts[-1][1] - self.pts[-2][1]
+        i = max(0, min(bisect.bisect_right(self.cum, s) - 1,
+                       len(self.seglen) - 1))
+        dx = self.pts[i + 1][0] - self.pts[i][0]
+        dy = self.pts[i + 1][1] - self.pts[i][1]
         return math.degrees(math.atan2(dx, dy))
 
     def curvature_at(self, s: float) -> float:
@@ -366,6 +364,25 @@ def _park_ease_slope(t: float) -> float:
     return 6.0 * t * (1.0 - t)
 
 
+def _refine_project(ref: RefLine, x: float, y: float,
+                    a: float, b: float) -> float:
+    """Trisect [a, b] down to ~1 cm for the closest point on the line."""
+    for _ in range(24):
+        if b - a < 0.01:
+            break
+        m1 = a + (b - a) / 3.0
+        m2 = b - (b - a) / 3.0
+        p1 = ref.point_at(m1)
+        p2 = ref.point_at(m2)
+        d1 = (p1[0] - x) ** 2 + (p1[1] - y) ** 2
+        dd2 = (p2[0] - x) ** 2 + (p2[1] - y) ** 2
+        if d1 < dd2:
+            b = m2
+        else:
+            a = m1
+    return 0.5 * (a + b)
+
+
 def project_s(ref: RefLine, x: float, y: float, s_hint: float,
               window: float = 30.0, global_fallback: bool = True,
               refine: bool = False) -> float:
@@ -375,6 +392,13 @@ def project_s(ref: RefLine, x: float, y: float, s_hint: float,
     plain route that is generous; on a folded line (U-turn) the window must
     be tight, because the spatially nearest point can belong to a DIFFERENT
     branch of the line than the one the car is actually driving on.
+
+    NOTE on a tempting fast path (rejected): skipping the coarse scan when
+    the hint point is "close" does NOT track continuous motion - _s would
+    lag the car by up to the gate distance in a sawtooth until the gate
+    trips, degrading pursuit precision. With bisect-based point_at the full
+    61-point scan only costs ~10 us, so there is nothing left worth that
+    risk.
     """
     best_s = s_hint
     best_d2 = float("inf")
@@ -408,22 +432,8 @@ def project_s(ref: RefLine, x: float, y: float, s_hint: float,
     # the steering projection on purpose - that is a behaviour change for
     # every manoeuvre on the map and is not part of this fix.
     if refine and step > 0.0:
-        a = max(0.0, best_s - step)
-        b = min(ref.total, best_s + step)
-        for _ in range(24):
-            if b - a < 0.01:
-                break
-            m1 = a + (b - a) / 3.0
-            m2 = b - (b - a) / 3.0
-            p1 = ref.point_at(m1)
-            p2 = ref.point_at(m2)
-            d1 = (p1[0] - x) ** 2 + (p1[1] - y) ** 2
-            dd2 = (p2[0] - x) ** 2 + (p2[1] - y) ** 2
-            if d1 < dd2:
-                b = m2
-            else:
-                a = m1
-        best_s = 0.5 * (a + b)
+        best_s = _refine_project(ref, x, y, max(0.0, best_s - step),
+                                 min(ref.total, best_s + step))
     return best_s
 
 

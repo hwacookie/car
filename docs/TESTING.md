@@ -374,16 +374,25 @@ the primary car.
 ### The multi-car stress scenario (`fig8_stress`)
 
 `python tests/test_turning.py --tests fig8_stress` runs a performance
-probe (not a driving-correctness scenario): phases of **2 → 6 → 10 → 14 →
-18 cars** on the figure-8, 30 s each. Cars are spawned evenly around the
-loop via `POST /teleport {"segment": N, "progress": 0.5, "speed": 8.3,
-"add": true}`, hold the throttle (`/control accelerate` per uid), then
-coast. Between phases the map is cleared and waited-for-empty.
+probe (not a driving-correctness scenario): phases of **18 → 36 → 72 →
+144 → 288 → 576 cars** on the figure-8, 30 s of SIM time each. Add
+`--stress-cars N[,N...]` to run only specific counts (e.g.
+`--tests fig8_stress --stress-cars 576`). Cars are spawned evenly around
+the loop via `POST /teleport {"segment": N, "progress": 0.5, "speed":
+8.3, "add": true}`, hold the throttle (`/control accelerate` per uid),
+then coast. Between phases the map is cleared and waited-for-empty.
+
+The phase duration is measured in sim time (the `/state` `time` field),
+NOT wall clock: at high car counts the sim may fall behind real time
+(its accumulator caps substeps -> slow motion, never a leap), and a
+wall-clock window would then cover less driving. A 20x wall-clock hang
+guard ends a wedged phase early (at 576 cars a full phase legitimately
+needs ~400 s of wall time at ~8% pace).
 
 Per phase it stores in `tests/turning_results.json` (key
 `fig8_stress|<N>cars`) the **jitter sum** (`jitters`, "Anzahl Ruckler pro
 Szenario") - position jumps beyond what the car's speed can cover between
-10 Hz polls, plus margin - and `worst_jump_m`. Pass criteria: all cars
+polls, plus margin - and `worst_jump_m`. Pass criteria: all cars
 spawned, no crash, no off-road. Wrong-side is reported but not failing
 (the lane guard has no in-turn suppression on the junction-free figure-8,
 so even a perfect single car trips it occasionally).
