@@ -498,7 +498,7 @@ DETERMINISTIC_TESTS = [
      "slide into the oncoming lane and trigger the wrong-side detection",
      0.8, False, 0.5, True),
     # MULTI-CAR STRESS (docs/MULTI_CAR_PLAN.md): N cars drive the figure-8
-    # loop at once for 30 s, growing by 4 each phase (2/6/10/14/18). No end
+    # loop at once for 30 s (default phases 100/150/200 - the real-time range). No
     # flags - the metric is how often a car gets displaced jerkily (a
     # "ruckler"): per poll, any car that moves more than the suite's
     # teleport/jump bound max(speed, 50 km/h)*dt*1.5 + 1 m counts one
@@ -509,7 +509,7 @@ DETERMINISTIC_TESTS = [
     # starts stuttering. Dispatched by start_point name, not through
     # monitor_turn (see run_deterministic_test).
     ('fig8_stress', 'straight', 0, None, 170.0,
-     "Multi-car stress: 2/6/10/14/18 cars on the figure-8, 30 s each"),
+     "Multi-car stress: 100/150/200 cars on the figure-8, 30 s each (default phases)"),
 ]
 
 
