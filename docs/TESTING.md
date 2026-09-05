@@ -374,10 +374,12 @@ the primary car.
 ### The multi-car stress scenario (`fig8_stress`)
 
 `python tests/test_turning.py --tests fig8_stress` runs a performance
-probe (not a driving-correctness scenario): phases of **18 → 36 → 72 →
-144 → 288 → 576 cars** on the figure-8, 30 s of SIM time each. Add
-`--stress-cars N[,N...]` to run only specific counts (e.g.
-`--tests fig8_stress --stress-cars 576`). Cars are spawned evenly around
+probe (not a driving-correctness scenario): phases of **100 → 150 →
+200 cars** on the figure-8, 30 s of SIM time each. The defaults cover the
+real-time range of the sim (capacity sweep 2026-09-05: C# ceiling ~170,
+Python ~90 cars - above that the sim runs in slow motion and only stretches
+wall time). Add `--stress-cars N[,N...]` to run specific counts instead
+(e.g. `--tests fig8_stress --stress-cars 576`). Cars are spawned evenly around
 the loop via `POST /teleport {"segment": N, "progress": 0.5, "speed":
 8.3, "add": true}`, hold the throttle (`/control accelerate` per uid),
 then coast. Between phases the map is cleared and waited-for-empty.

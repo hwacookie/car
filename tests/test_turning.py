@@ -628,7 +628,11 @@ class TurnTester:
         requests.post(f"{API_URL}/label", json={'text': text})
 
     # --- Multi-car stress scenario (fig8_stress, docs/MULTI_CAR_PLAN.md) ---
-    # Phases of 18..576 cars (x2 each) drive the figure-8 loop for
+    # Default phases are 100/150/200 cars: the real-time range of the sim
+    # (capacity sweep 2026-09-05 - C# ceiling ~170, Python ~90; anything
+    # above 200 runs in slow motion and just stretches wall time). Higher
+    # counts stay available via --stress-cars. Each phase drives the
+    # figure-8 loop for
     # STRESS_PHASE_SECONDS of SIM time. Cars pass through each other (no
     # car-car collisions), so any count is legal - the metric is how often
     # a car gets displaced JERKILY: per poll, movement beyond the suite's
@@ -640,7 +644,7 @@ class TurnTester:
     # accumulator caps substeps -> slow motion, never a leap); the phase
     # duration is therefore measured in SIM time so every phase covers the
     # same driving distance no matter how slow the wall clock gets.
-    STRESS_PHASE_CARS = (18, 36, 72, 144, 288, 576)
+    STRESS_PHASE_CARS = (100, 150, 200)
     STRESS_PHASE_SECONDS = 30.0
     STRESS_POLL_S = 0.1
     # Positional indices into network.segments - fragile if the map
